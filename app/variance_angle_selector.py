@@ -21,6 +21,8 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
     "RIGHT_KNEE": {"type": "angle_3_point", "landmarks": [12, 14, 16]},
     "LEFT_ELBOW": {"type": "angle_3_point", "landmarks": [5, 7, 9]},
     "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10]},
+    "LEFT_SHOULDER": {"type": "angle_3_point", "landmarks": [11, 5, 7]},
+    "RIGHT_SHOULDER": {"type": "angle_3_point", "landmarks": [12, 6, 8]},
     "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13]},
     "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14]},
 }
