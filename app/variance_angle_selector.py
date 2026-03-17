@@ -23,16 +23,13 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
     "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10]},
     "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13]},
     "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14]},
-    "LEFT_BODY_LINE": {"type": "angle_vertical_axis", "landmarks": [5, 11]},
-    "RIGHT_BODY_LINE": {"type": "angle_vertical_axis", "landmarks": [6, 12]},
-    "TORSO_VERTICAL": {"type": "angle_vertical_axis", "landmarks": [5, 11]},
 }
 
 MIN_VARIANCE_THRESHOLD_SELECTOR = 5.0
 LOW_CONFIDENCE_THRESHOLD = 0.5
 FRAME_MIN_CONFIDENCE = 0.5
 MIN_ACTIVE_WINDOWS = 2
-ISOMETRIC_FALLBACK_ANGLE = "LEFT_BODY_LINE"
+ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
 
 
 def _calculate_all_variances(frame_buffer: list[list[dict]]) -> dict[str, dict[str, Any]]:
