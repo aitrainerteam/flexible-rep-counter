@@ -1,5 +1,7 @@
 """Send frames to YOLO VM and return COCO 17-keypoint landmarks."""
+import json
 import logging
+import time
 from typing import Any, Optional
 
 import cv2
@@ -8,6 +10,33 @@ import requests
 from app.config import YOLO_VM_TARGET_URL, VM_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
+
+# #region agent log
+_AGENT_LOG_PATH = "/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-548a82.log"
+
+
+def agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+) -> None:
+    try:
+        payload = {
+            "sessionId": "548a82",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+
+
+# #endregion
 
 # COCO 17 keypoint order (matches yolo-deploy / Ultralytics pose)
 COCO_KEYPOINT_NAMES = [
@@ -129,10 +158,41 @@ def send_frame(frame_bgr) -> Optional[list[dict]]:
         return None
 
     parsed = _parse_keypoints(body)
-    if parsed is not None:
-        return parsed
-    if isinstance(body, dict):
+    if parsed is None and isinstance(body, dict):
         parsed = _parse_keypoints(body.get("keypoints") or body.get("data"))
     if parsed is None:
         logger.debug("VM predict parse failed, keys=%s", list(body.keys()) if isinstance(body, dict) else type(body).__name__)
+        return None
+
+    # #region agent log
+    try:
+        xs = [float(p.get("x", 0)) for p in parsed]
+        ys = [float(p.get("y", 0)) for p in parsed]
+        fh, fw = frame_bgr.shape[:2]
+        mx, my = max(xs), max(ys)
+        agent_debug_log(
+            "H1",
+            "vm_client.py:send_frame",
+            "VM keypoint coordinate range",
+            {
+                "predict_url": predict_url,
+                "frame_w": int(fw),
+                "frame_h": int(fh),
+                "max_x": mx,
+                "max_y": my,
+                "min_x": min(xs),
+                "min_y": min(ys),
+                "likely_normalized": bool(mx <= 1.5 and my <= 1.5),
+            },
+        )
+        agent_debug_log(
+            "H3",
+            "vm_client.py:send_frame",
+            "Resolved VM base URL",
+            {"YOLO_VM_TARGET_URL": YOLO_VM_TARGET_URL, "predict_url": predict_url},
+        )
+    except Exception:
+        pass
+    # #endregion
+
     return parsed

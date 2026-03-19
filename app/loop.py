@@ -7,7 +7,8 @@ import time
 from queue import Empty, Full, Queue
 from typing import Any, Optional
 
-from app.config import VM_TIMEOUT_SEC, get_default_tuning_params
+from app.config import VM_POSE_MAX_AGE_SEC, VM_TIMEOUT_SEC, get_default_tuning_params
+from app.vm_client import agent_debug_log
 from app.debug_console import (
     ensure_console_window,
     get_logger,
@@ -169,7 +170,7 @@ def _pose_worker(
     result_holder: list,
     stop_event: threading.Event,
 ) -> None:
-    """Background thread: send frames from queue to VM, store latest landmarks in result_holder[0]."""
+    """Background thread: send frames to VM; store {landmarks, received_mono} per completed /predict."""
     from app.vm_client import send_frame
     while not stop_event.is_set():
         try:
@@ -178,7 +179,25 @@ def _pose_worker(
             continue
         if frame is None:
             break
-        result_holder[0] = send_frame(frame)
+        parsed = send_frame(frame)
+        result_holder[0] = {
+            "landmarks": parsed,
+            "received_mono": time.monotonic(),
+        }
+        # #region agent log
+        try:
+            agent_debug_log(
+                "H2",
+                "loop.py:_pose_worker",
+                "worker finished send_frame",
+                {
+                    "landmarks_present": parsed is not None,
+                    "worker_ts_ms": int(time.time() * 1000),
+                },
+            )
+        except Exception:
+            pass
+        # #endregion
 
 
 def _draw_overlay(
@@ -244,15 +263,16 @@ def run_webcam_loop() -> None:
 
     # Background thread sends frames to VM so main loop stays responsive
     frame_queue: Queue = Queue(maxsize=1)
-    latest_landmarks: list = [None]
+    latest_pose: list = [{"landmarks": None, "received_mono": 0.0}]
     stop_worker = threading.Event()
     worker = threading.Thread(
         target=_pose_worker,
-        args=(frame_queue, latest_landmarks, stop_worker),
+        args=(frame_queue, latest_pose, stop_worker),
         daemon=True,
     )
     worker.start()
 
+    _dbg_overlay_samples = 0
     try:
         while True:
             ret, frame_bgr = cap.read()
@@ -281,10 +301,39 @@ def run_webcam_loop() -> None:
                 frame_queue.put_nowait(frame_bgr.copy())
             except Full:
                 pass
-            landmarks = latest_landmarks[0]
-            logger.debug("frame sent, got landmarks=%s", landmarks is not None)
+            snap = latest_pose[0]
+            raw_landmarks = snap.get("landmarks")
+            received_mono = float(snap.get("received_mono", 0.0))
+            pose_fresh = (
+                raw_landmarks is not None
+                and (time.monotonic() - received_mono) <= VM_POSE_MAX_AGE_SEC
+            )
+            logger.debug(
+                "frame sent, got landmarks=%s fresh_cloud=%s",
+                raw_landmarks is not None,
+                pose_fresh,
+            )
 
-            if landmarks is None:
+            if raw_landmarks is not None:
+                _dbg_overlay_samples += 1
+                if _dbg_overlay_samples <= 25:
+                    # #region agent log
+                    try:
+                        agent_debug_log(
+                            "H2",
+                            "loop.py:run_webcam_loop",
+                            "main thread read landmarks for overlay",
+                            {
+                                "sample_i": _dbg_overlay_samples,
+                                "main_ts_ms": int(time.time() * 1000),
+                                "frame_hw": [int(frame_bgr.shape[0]), int(frame_bgr.shape[1])],
+                            },
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+
+            if raw_landmarks is None:
                 status = "No pose"
                 _draw_overlay(
                     frame_bgr, run_state["selected_angle"], None, 0, "—", status
@@ -297,8 +346,9 @@ def run_webcam_loop() -> None:
                 continue
 
             timestamp_ms = time.time() * 1000.0
-            landmarks = pose_pipeline.process(landmarks, timestamp_ms)
-            draw_skeleton(frame_bgr, landmarks)
+            landmarks = pose_pipeline.process(raw_landmarks, timestamp_ms)
+            if pose_fresh:
+                draw_skeleton(frame_bgr, landmarks)
 
             frame_buffer = run_state["frame_buffer"]
             selected_angle = run_state["selected_angle"]
@@ -329,6 +379,8 @@ def run_webcam_loop() -> None:
                         run_state["selected_config"] = None
                         frame_buffer.clear()
                 status = f"Calibrating... {len(frame_buffer)}/{CALIBRATION_FRAMES}"
+                if not pose_fresh:
+                    status = f"{status} | waiting for /predict"
                 _draw_overlay(frame_bgr, None, None, 0, "—", status)
                 cv2.imshow("Rep Counter", frame_bgr)
                 update_console_window()
@@ -354,6 +406,8 @@ def run_webcam_loop() -> None:
                 smoothed_value = out.get("smoothedValue")
 
             status = "Tracking"
+            if not pose_fresh:
+                status = f"{status} | waiting for /predict"
             _draw_overlay(
                 frame_bgr, selected_angle, smoothed_value, rep_count, state_str, status
             )
