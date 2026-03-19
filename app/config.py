@@ -29,8 +29,6 @@ if not YOLO_VM_TARGET_URL:
         "Set YOLO_VM_DIRECT_URL or YOLO_VM_TARGET_URL in .env (e.g. http://host:8000)"
     )
 VM_TIMEOUT_SEC = float(os.environ.get("VM_TIMEOUT_SEC", "5.0"))
-# Hide skeleton if no new /predict response within this window (main loop is faster than the worker).
-VM_POSE_MAX_AGE_SEC = float(os.environ.get("VM_POSE_MAX_AGE_SEC", "0.5"))
 
 # Debug console (second window); LOG_LEVEL=DEBUG for dev (default), set LOG_LEVEL=INFO to disable
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()

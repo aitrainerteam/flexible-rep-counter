@@ -108,9 +108,11 @@ def _parse_keypoints(data: Any) -> Optional[list[dict]]:
             if parsed is not None:
                 return parsed
         elif isinstance(data, dict) and key == "keypoints":
-            parsed = _person_keypoints_to_list(data["keypoints"])
-            if parsed is not None:
-                return parsed
+            nested = data.get("keypoints")
+            if nested is not None:
+                parsed = _person_keypoints_to_list(nested) if isinstance(nested, dict) else _parse_keypoints(nested)
+                if parsed is not None:
+                    return parsed
 
     # Single object with keypoints key (dict format)
     if isinstance(data, dict) and "keypoints" in data:
