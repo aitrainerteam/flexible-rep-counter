@@ -1,21 +1,29 @@
 """Webcam capture loop: calibration buffer, angle selection, peak detector, skeleton overlay."""
 from __future__ import annotations
 
+import sys
 import cv2
 import threading
 import time
 from queue import Empty, Full, Queue
 from typing import Any, Optional
 
-from app.config import VM_TIMEOUT_SEC, get_default_tuning_params
-from app.vm_client import agent_debug_log
+from app.config import (
+    PREDICT_JPEG_QUALITY,
+    PREDICT_RESIZE_WIDTH,
+    PREDICT_VALIDATE_RESPONSE,
+    VM_HEALTH_TIMEOUT_SEC,
+    VM_TIMEOUT_SEC,
+    get_default_tuning_params,
+)
+from app.vm_client import agent_debug_log, check_vm_health
 from app.debug_console import (
     ensure_console_window,
     get_logger,
     setup_logging,
     update_console_window,
 )
-from app.math_engine import PeakDetector, calculate_from_type, create_peak_detector
+from app.math_engine import calculate_from_type, create_peak_detector
 from app.pose_filters import PoseFilterPipeline
 from app.skeleton_overlay import draw_skeleton
 from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
@@ -165,13 +173,128 @@ def _put_text_readable(frame: Any, text: str, pos: tuple[int, int], font: int, s
     cv2.putText(frame, text, (x, y), font, scale, color, thickness)
 
 
+def _merge_benchmark_peaks(peaks: dict[str, float | None], b: dict[str, Any]) -> None:
+    """Session maxima for timing fields (yolo-deploy camera_pose_client style)."""
+    for key in ("roundtrip_ms", "upload_ms", "encode_ms"):
+        v = b.get(key)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        prev = peaks.get(key)
+        peaks[key] = fv if prev is None else max(prev, fv)
+    inf = b.get("inference_ms")
+    if isinstance(inf, (int, float)):
+        fi = float(inf)
+        prev_i = peaks.get("inference_ms")
+        peaks["inference_ms"] = fi if prev_i is None else max(prev_i, fi)
+
+
+def _scale_landmarks_to_display(
+    landmarks: list[dict],
+    sent_hw: tuple[int, int] | None,
+    display_hw: tuple[int, int],
+) -> list[dict]:
+    """Scale keypoints from encoded image size to the current display frame."""
+    if not landmarks or not sent_hw:
+        return landmarks
+    sh, sw = sent_hw[0], sent_hw[1]
+    dh, dw = display_hw[0], display_hw[1]
+    if sw <= 0 or sh <= 0:
+        return landmarks
+    if (sh, sw) == (dh, dw):
+        return landmarks
+    sx, sy = dw / sw, dh / sh
+    out: list[dict] = []
+    for p in landmarks:
+        out.append(
+            {
+                "x": float(p["x"]) * sx,
+                "y": float(p["y"]) * sy,
+                "confidence": float(p.get("confidence", 0.0)),
+            }
+        )
+    return out
+
+
+def _draw_vm_benchmark_hud(
+    frame: Any,
+    benchmark: Optional[dict[str, Any]],
+    peaks: dict[str, float | None],
+    cam_fps: float,
+    inf_fps: float,
+    validation_issues: Optional[list[str]],
+) -> None:
+    """Bottom-right overlay: roundtrip, upload, encode, server inference, payload, FPS peaks."""
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.45
+    thick = 1
+    lines: list[tuple[str, tuple[int, int, int]]] = []
+    if benchmark:
+        rt = float(benchmark.get("roundtrip_ms") or 0)
+        max_inf = (1000.0 / rt) if rt > 0 else 0.0
+        srv = benchmark.get("inference_ms")
+        line1 = f"rt {rt:.0f}ms  up {float(benchmark.get('upload_ms') or 0):.0f}ms  enc {float(benchmark.get('encode_ms') or 0):.0f}ms"
+        lines.append((line1, (220, 220, 220)))
+        if srv is not None:
+            try:
+                sm = float(srv)
+                lines.append((f"server {sm:.0f}ms  ~max {max_inf:.1f} inf/s", (180, 255, 180)))
+            except (TypeError, ValueError):
+                lines.append((f"server {srv!s}", (180, 255, 180)))
+        lines.append((f"payload {float(benchmark.get('payload_kb') or 0):.1f} KB", (200, 200, 200)))
+    lines.append((f"cam {cam_fps:.0f} fps   infer {inf_fps:.1f} /s", (200, 200, 255)))
+    prt, pinf = peaks.get("roundtrip_ms"), peaks.get("inference_ms")
+    peak_bits = []
+    if prt is not None:
+        peak_bits.append(f"rt_peak {prt:.0f}")
+    if pinf is not None:
+        peak_bits.append(f"srv_peak {pinf:.0f}")
+    if peak_bits:
+        lines.append(("  ".join(peak_bits), (180, 180, 255)))
+    if validation_issues:
+        msg = "API: " + "; ".join(validation_issues[:3])
+        if len(validation_issues) > 3:
+            msg += "…"
+        lines.append((msg, (60, 60, 255)))
+
+    line_h = 18
+    max_tw = 0
+    for txt, _c in lines:
+        tw, _th = cv2.getTextSize(txt, font, scale, thick)[0]
+        max_tw = max(max_tw, tw)
+    margin = 8
+    box_w = min(w - 2 * margin, max_tw + 2 * margin)
+    box_h = len(lines) * line_h + margin
+    x1 = w - box_w - margin
+    y1 = h - box_h - margin
+    x2, y2 = w - margin, h - margin
+    _draw_transparent_box(frame, x1, y1, x2, y2)
+    y = y1 + line_h
+    for txt, col in lines:
+        cv2.putText(frame, txt, (x1 + 6, y), font, scale, (40, 40, 40), thick + 1, cv2.LINE_AA)
+        cv2.putText(frame, txt, (x1 + 6, y), font, scale, col, thick, cv2.LINE_AA)
+        y += line_h
+
+
 def _pose_worker(
     frame_queue: Queue,
     result_holder: list,
     stop_event: threading.Event,
+    pose_options: dict[str, Any],
 ) -> None:
-    """Background thread: send frames to VM; store latest {landmarks} per completed /predict."""
+    """Background thread: send frames to VM; store latest landmarks + benchmark per /predict."""
+    import requests
+
     from app.vm_client import send_frame
+
+    session = requests.Session()
+    resize_width = int(pose_options.get("resize_width", 0))
+    jpeg_quality = int(pose_options.get("jpeg_quality", 85))
+    validate = bool(pose_options.get("validate", True))
     while not stop_event.is_set():
         try:
             frame = frame_queue.get(timeout=0.1)
@@ -179,8 +302,19 @@ def _pose_worker(
             continue
         if frame is None:
             break
-        parsed = send_frame(frame)
-        result_holder[0] = {"landmarks": parsed}
+        outcome = send_frame(
+            frame,
+            session=session,
+            resize_width=resize_width,
+            jpeg_quality=jpeg_quality,
+            validate=validate,
+        )
+        result_holder[0] = {
+            "landmarks": outcome.landmarks,
+            "benchmark": outcome.benchmark,
+            "sent_hw": outcome.sent_hw,
+            "validation_issues": outcome.validation_issues,
+        }
         # #region agent log
         try:
             agent_debug_log(
@@ -188,7 +322,7 @@ def _pose_worker(
                 "loop.py:_pose_worker",
                 "worker finished send_frame",
                 {
-                    "landmarks_present": parsed is not None,
+                    "landmarks_present": outcome.landmarks is not None,
                     "worker_ts_ms": int(time.time() * 1000),
                 },
             )
@@ -236,11 +370,35 @@ def _draw_overlay(
     _put_text_readable(frame, status, (margin, y), OVERLAY_FONT, 0.6, OVERLAY_COLOR_STATUS, 2)
 
 
-def run_webcam_loop() -> None:
+def run_webcam_loop(
+    *,
+    skip_health_check: bool = False,
+    benchmark_log_path: Optional[str] = None,
+    resize_width: Optional[int] = None,
+    jpeg_quality: Optional[int] = None,
+    validate_response: Optional[bool] = None,
+) -> None:
     setup_logging()
-    cap = cv2.VideoCapture(0)
+
+    rw = PREDICT_RESIZE_WIDTH if resize_width is None else int(resize_width)
+    jq = PREDICT_JPEG_QUALITY if jpeg_quality is None else int(jpeg_quality)
+    val = PREDICT_VALIDATE_RESPONSE if validate_response is None else bool(validate_response)
+
+    if not skip_health_check:
+        ok, info = check_vm_health(timeout=VM_HEALTH_TIMEOUT_SEC)
+        if not ok:
+            raise RuntimeError(f"VM health check failed: {info}")
+
+    if sys.platform == "darwin":
+        cap = cv2.VideoCapture(0, getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY))
+    else:
+        cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam (index 0).")
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     run_state: dict[str, Any] = {
         "started": False,
@@ -256,25 +414,95 @@ def run_webcam_loop() -> None:
     cv2.setMouseCallback("Rep Counter", _on_mouse, run_state)
     ensure_console_window()
     pose_pipeline = PoseFilterPipeline(use_one_euro=True)
-    logger.debug("webcam opened, loop started")
+    logger.debug(
+        "webcam opened, VM predict resize_width=%s jpeg_q=%s validate=%s",
+        rw,
+        jq,
+        val,
+    )
+    if benchmark_log_path:
+        logger.info("Benchmark log: appending inference/roundtrip to %s", benchmark_log_path)
 
-    # Background thread sends frames to VM so main loop stays responsive
+    pose_options: dict[str, Any] = {
+        "resize_width": rw,
+        "jpeg_quality": jq,
+        "validate": val,
+    }
     frame_queue: Queue = Queue(maxsize=1)
-    latest_pose: list = [{"landmarks": None}]
+    latest_pose: list = [
+        {
+            "landmarks": None,
+            "benchmark": None,
+            "sent_hw": None,
+            "validation_issues": [],
+        }
+    ]
     stop_worker = threading.Event()
     worker = threading.Thread(
         target=_pose_worker,
-        args=(frame_queue, latest_pose, stop_worker),
+        args=(frame_queue, latest_pose, stop_worker, pose_options),
         daemon=True,
     )
     worker.start()
 
     _dbg_overlay_samples = 0
+    fps_times: list[float] = []
+    fps_window = 30
+    inference_response_times: list[float] = []
+    inference_fps_window = 20
+    last_benchmark: Optional[dict[str, Any]] = None
+    prev_resp_t: Any = None
+    benchmark_peaks: dict[str, float | None] = {
+        "roundtrip_ms": None,
+        "upload_ms": None,
+        "encode_ms": None,
+        "inference_ms": None,
+    }
+
+    def _update_vm_metrics(snap: dict[str, Any]) -> tuple[dict[str, Any] | None, float, list[str]]:
+        """Merge timing peaks, optional benchmark log line; return (display_benchmark, inf_fps, issues)."""
+        nonlocal last_benchmark, prev_resp_t
+        b = snap.get("benchmark")
+        issues = list(snap.get("validation_issues") or [])
+        if b:
+            last_benchmark = b
+            _merge_benchmark_peaks(benchmark_peaks, b)
+            rt_key = b.get("response_time")
+            if rt_key is not None and rt_key != prev_resp_t:
+                prev_resp_t = rt_key
+                inference_response_times.append(float(rt_key))
+                if len(inference_response_times) > inference_fps_window:
+                    inference_response_times.pop(0)
+                if benchmark_log_path and b.get("inference_ms") is not None:
+                    try:
+                        with open(benchmark_log_path, "a", encoding="utf-8") as f:
+                            f.write(
+                                f"{time.time():.3f}\t{float(b['inference_ms']):.2f}\t{float(b['roundtrip_ms']):.2f}\t{float(b['upload_ms']):.2f}\n"
+                            )
+                    except OSError as e:
+                        logger.debug("benchmark log write failed: %s", e)
+        inf_fps = 0.0
+        if len(inference_response_times) > 1:
+            dt = inference_response_times[-1] - inference_response_times[0]
+            if dt > 0:
+                inf_fps = (len(inference_response_times) - 1) / dt
+        return (b or last_benchmark), inf_fps, issues
+
     try:
         while True:
             ret, frame_bgr = cap.read()
             if not ret or frame_bgr is None:
                 continue
+
+            t_now = time.perf_counter()
+            fps_times.append(t_now)
+            if len(fps_times) > fps_window:
+                fps_times.pop(0)
+            cam_fps = (
+                (len(fps_times) - 1) / (fps_times[-1] - fps_times[0])
+                if len(fps_times) > 1 and fps_times[-1] > fps_times[0]
+                else 0.0
+            )
 
             _draw_start_button(frame_bgr, run_state)
 
@@ -293,13 +521,14 @@ def run_webcam_loop() -> None:
                     break
                 continue
 
-            # Non-blocking: feed latest frame to worker, use last received landmarks
             try:
                 frame_queue.put_nowait(frame_bgr.copy())
             except Full:
                 pass
             snap = latest_pose[0]
+            disp_b, inf_fps, val_issues = _update_vm_metrics(snap)
             raw_landmarks = snap.get("landmarks")
+            sent_hw = snap.get("sent_hw")
             logger.debug("frame sent, got landmarks=%s", raw_landmarks is not None)
 
             if raw_landmarks is not None:
@@ -326,6 +555,9 @@ def run_webcam_loop() -> None:
                 _draw_overlay(
                     frame_bgr, run_state["selected_angle"], None, 0, "—", status
                 )
+                _draw_vm_benchmark_hud(
+                    frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
+                )
                 cv2.imshow("Rep Counter", frame_bgr)
                 update_console_window()
                 key = cv2.waitKey(1) & 0xFF
@@ -333,8 +565,14 @@ def run_webcam_loop() -> None:
                     break
                 continue
 
+            disp_h, disp_w = frame_bgr.shape[0], frame_bgr.shape[1]
+            raw_scaled = _scale_landmarks_to_display(
+                raw_landmarks,
+                sent_hw if isinstance(sent_hw, tuple) else None,
+                (disp_h, disp_w),
+            )
             timestamp_ms = time.time() * 1000.0
-            landmarks = pose_pipeline.process(raw_landmarks, timestamp_ms)
+            landmarks = pose_pipeline.process(raw_scaled, timestamp_ms)
             draw_skeleton(frame_bgr, landmarks)
 
             frame_buffer = run_state["frame_buffer"]
@@ -367,6 +605,9 @@ def run_webcam_loop() -> None:
                         frame_buffer.clear()
                 status = f"Calibrating... {len(frame_buffer)}/{CALIBRATION_FRAMES}"
                 _draw_overlay(frame_bgr, None, None, 0, "—", status)
+                _draw_vm_benchmark_hud(
+                    frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
+                )
                 cv2.imshow("Rep Counter", frame_bgr)
                 update_console_window()
                 key = cv2.waitKey(1) & 0xFF
@@ -394,6 +635,9 @@ def run_webcam_loop() -> None:
             _draw_overlay(
                 frame_bgr, selected_angle, smoothed_value, rep_count, state_str, status
             )
+            _draw_vm_benchmark_hud(
+                frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
+            )
             logger.debug("angle=%s smoothed=%.1f reps=%d state=%s", selected_angle, smoothed_value or 0, rep_count, state_str)
             cv2.imshow("Rep Counter", frame_bgr)
             update_console_window()
@@ -410,3 +654,19 @@ def run_webcam_loop() -> None:
         worker.join(timeout=VM_TIMEOUT_SEC + 1.0)
         cap.release()
         cv2.destroyAllWindows()
+        if last_benchmark:
+            print("\nLast VM request (benchmark):")
+            print(
+                f"  roundtrip: {last_benchmark.get('roundtrip_ms', 0):.0f} ms  "
+                f"upload: {last_benchmark.get('upload_ms', 0):.0f} ms  "
+                f"encode: {last_benchmark.get('encode_ms', 0):.0f} ms"
+            )
+            if last_benchmark.get("inference_ms") is not None:
+                print(f"  server inference: {last_benchmark['inference_ms']}")
+            print(f"  payload: {last_benchmark.get('payload_kb', 0):.1f} KB")
+        if any(v is not None for v in benchmark_peaks.values()):
+            print("\nSession VM peaks (ms):")
+            for k in ("roundtrip_ms", "upload_ms", "encode_ms", "inference_ms"):
+                v = benchmark_peaks.get(k)
+                if v is not None:
+                    print(f"  {k}: {v:.1f}")

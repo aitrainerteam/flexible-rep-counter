@@ -29,6 +29,15 @@ if not YOLO_VM_TARGET_URL:
         "Set YOLO_VM_DIRECT_URL or YOLO_VM_TARGET_URL in .env (e.g. http://host:8000)"
     )
 VM_TIMEOUT_SEC = float(os.environ.get("VM_TIMEOUT_SEC", "5.0"))
+VM_HEALTH_TIMEOUT_SEC = float(os.environ.get("VM_HEALTH_TIMEOUT_SEC", "5.0"))
+# Optional: resize before upload (0 = full frame; same idea as yolo-deploy camera_pose_client)
+PREDICT_RESIZE_WIDTH = int(os.environ.get("PREDICT_RESIZE_WIDTH", "0"))
+PREDICT_JPEG_QUALITY = int(os.environ.get("PREDICT_JPEG_QUALITY", "85"))
+PREDICT_VALIDATE_RESPONSE = os.environ.get("PREDICT_VALIDATE_RESPONSE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 # Debug console (second window); LOG_LEVEL=DEBUG for dev (default), set LOG_LEVEL=INFO to disable
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
