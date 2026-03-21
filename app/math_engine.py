@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+import time
+from collections import deque
+from typing import Any, Optional, Sequence
+
+import numpy as np
 
 MIN_VARIANCE_THRESHOLD = 5.0
 RULE_EVALUATION_MIN_CONFIDENCE = 0.3
@@ -119,10 +123,27 @@ PEAK_STATE_GOING_DOWN = "going_down"
 PEAK_STATE_GOING_UP = "going_up"
 
 
+def _rolling_spread_percentile(
+    values: Sequence[float],
+    low_pct: float,
+    high_pct: float,
+) -> float:
+    """Spread of smoothed angle in the rolling window (robust to single-frame spikes)."""
+    if len(values) < 2:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.percentile(arr, high_pct) - np.percentile(arr, low_pct))
+
+
 class PeakDetector:
     """State machine: NEUTRAL -> GOING_UP/GOING_DOWN; peaks/valleys with hysteresis and min distance.
-    Only counts a rep when the angle reaches within peak_margin/valley_margin of the average
-    observed max/min (full range), so micro-movements do not register as reps."""
+    First `calibration_reps` reps record peaks/valleys without margin checks; then averages are locked
+    and subsequent peaks/valleys must fall within peak_margin/valley_margin of those baselines.
+    Optional rolling-window range gate: reps are not recorded until recent p95–p5 spread exceeds
+    min_range_gate_degrees (avoids false reps from tiny oscillations; window is not monotonic global min/max).
+    Optional per-frame delta deadband: if |angle - last_passed| is below the threshold, the previous
+    passed value is reused before EMA smoothing (suppresses sub-threshold jitter from entering the smoother).
+    Optional min_rep_interval_ms: suppresses rep increments when two reps would be counted too close in time."""
 
     def __init__(
         self,
@@ -131,12 +152,31 @@ class PeakDetector:
         min_peak_distance: int = 10,
         peak_margin: float = 15.0,
         valley_margin: float = 15.0,
+        min_range_gate_degrees: float = 15.0,
+        range_window_frames: int = 90,
+        range_min_samples: int = 12,
+        range_percentile_low: float = 5.0,
+        range_percentile_high: float = 95.0,
+        delta_deadband_degrees: float = 0.0,
+        calibration_reps: int = 3,
+        min_rep_interval_ms: float = 400.0,
     ):
         self.smoothing_factor = smoothing_factor
         self.hysteresis = hysteresis
         self.min_peak_distance = min_peak_distance
         self.peak_margin = peak_margin
         self.valley_margin = valley_margin
+        self.calibration_reps = max(1, int(calibration_reps))
+        self.min_rep_interval_ms = max(0.0, float(min_rep_interval_ms))
+        self.min_range_gate_degrees = min_range_gate_degrees
+        self.delta_deadband_degrees = max(0.0, float(delta_deadband_degrees))
+        self.range_window_frames = max(1, int(range_window_frames))
+        self.range_min_samples = max(2, min(int(range_min_samples), self.range_window_frames))
+        self.range_percentile_low = float(range_percentile_low)
+        self.range_percentile_high = float(range_percentile_high)
+        self._value_window: deque[float] = deque(maxlen=self.range_window_frames)
+        self._last_rolling_range: float = 0.0
+        self._last_range_gate_open: bool = True
         self.state = PEAK_STATE_NEUTRAL
         self.smoothed_value: Optional[float] = None
         self.last_peak_frame = -min_peak_distance
@@ -147,9 +187,59 @@ class PeakDetector:
         self.valleys: list[float] = []
         self.current_peak_value: Optional[float] = None
         self.current_valley_value: Optional[float] = None
+        self._last_debanded_pass: Optional[float] = None
+        # True after calibration_reps reps: locked baselines for strict margin checks
+        self._calibrated: bool = False
+        self._calibrated_avg_peak: Optional[float] = None
+        self._calibrated_avg_valley: Optional[float] = None
+        self._last_rep_time_ms: Optional[float] = None
+
+    def _maybe_lock_calibration(self) -> None:
+        if self._calibrated:
+            return
+        if self.rep_count >= self.calibration_reps:
+            self._calibrated = True
+            self._calibrated_avg_peak = sum(self.peaks) / len(self.peaks) if self.peaks else None
+            self._calibrated_avg_valley = sum(self.valleys) / len(self.valleys) if self.valleys else None
+
+    def _pass_through_deadband(self, raw_value: float) -> float:
+        """Hold previous angle when frame-to-frame change is below threshold; else accept new sample."""
+        if self.delta_deadband_degrees <= 0:
+            self._last_debanded_pass = raw_value
+            return raw_value
+        if self._last_debanded_pass is None:
+            self._last_debanded_pass = raw_value
+            return raw_value
+        if abs(raw_value - self._last_debanded_pass) < self.delta_deadband_degrees:
+            return self._last_debanded_pass
+        self._last_debanded_pass = raw_value
+        return raw_value
+
+    def _update_rolling_range(self) -> None:
+        if self.smoothed_value is None:
+            self._last_rolling_range = 0.0
+            self._last_range_gate_open = self.min_range_gate_degrees <= 0
+            return
+        self._value_window.append(self.smoothed_value)
+        spread = _rolling_spread_percentile(
+            self._value_window,
+            self.range_percentile_low,
+            self.range_percentile_high,
+        )
+        self._last_rolling_range = spread
+        if self.min_range_gate_degrees <= 0:
+            self._last_range_gate_open = True
+        elif len(self._value_window) < self.range_min_samples:
+            self._last_range_gate_open = False
+        else:
+            self._last_range_gate_open = spread >= self.min_range_gate_degrees
+
+    def _range_gate_allows_rep_recording(self) -> bool:
+        return self._last_range_gate_open
 
     def update(self, raw_value: Optional[float]) -> dict[str, Any]:
         if raw_value is None:
+            self._last_debanded_pass = None
             return {
                 "repCompleted": False,
                 "peak": None,
@@ -157,16 +247,22 @@ class PeakDetector:
                 "smoothedValue": self.smoothed_value,
                 "state": self.state,
                 "repCount": self.rep_count,
+                "rollingRange": self._last_rolling_range,
+                "rangeGateOpen": self._last_range_gate_open,
+                "calibrationComplete": self._calibrated,
+                "calibrationTargetReps": self.calibration_reps,
             }
 
+        feed = self._pass_through_deadband(raw_value)
         self.frame_count += 1
         if self.smoothed_value is None:
-            self.smoothed_value = raw_value
+            self.smoothed_value = feed
         else:
             self.smoothed_value = (
-                self.smoothing_factor * raw_value
+                self.smoothing_factor * feed
                 + (1 - self.smoothing_factor) * self.smoothed_value
             )
+        self._update_rolling_range()
 
         rep_completed = False
         detected_peak = None
@@ -195,19 +291,33 @@ class PeakDetector:
                 self.current_peak_value = self.smoothed_value
             elif self.smoothed_value < self.current_peak_value - self.hysteresis:
                 if self.frame_count - self.last_peak_frame >= self.min_peak_distance:
-                    avg_peak = sum(self.peaks) / len(self.peaks) if self.peaks else self.current_peak_value
-                    within_margin = (
-                        not self.peaks
-                        or self.current_peak_value >= avg_peak - self.peak_margin
-                    )
-                    if within_margin:
-                        detected_peak = self.current_peak_value
-                        self.peaks.append(self.current_peak_value)
-                        self.last_peak_frame = self.frame_count
-                        new_rep_count = min(len(self.peaks), len(self.valleys))
-                        if new_rep_count > self.rep_count:
-                            self.rep_count = new_rep_count
-                            rep_completed = True
+                    if not self._calibrated:
+                        within_margin = True
+                    else:
+                        within_margin = (
+                            self._calibrated_avg_peak is not None
+                            and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin
+                        )
+                    if within_margin and self._range_gate_allows_rep_recording():
+                        new_rep_count_if = min(len(self.peaks) + 1, len(self.valleys))
+                        rep_would_increment = new_rep_count_if > self.rep_count
+                        now_ms = time.time() * 1000.0
+                        interval_ok = True
+                        if rep_would_increment and self.min_rep_interval_ms > 0:
+                            if self._last_rep_time_ms is not None and (
+                                now_ms - self._last_rep_time_ms
+                            ) < self.min_rep_interval_ms:
+                                interval_ok = False
+                        if interval_ok:
+                            detected_peak = self.current_peak_value
+                            self.peaks.append(self.current_peak_value)
+                            self.last_peak_frame = self.frame_count
+                            new_rep_count = min(len(self.peaks), len(self.valleys))
+                            if new_rep_count > self.rep_count:
+                                self.rep_count = new_rep_count
+                                rep_completed = True
+                                self._last_rep_time_ms = now_ms
+                            self._maybe_lock_calibration()
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
 
@@ -216,19 +326,33 @@ class PeakDetector:
                 self.current_valley_value = self.smoothed_value
             elif self.smoothed_value > self.current_valley_value + self.hysteresis:
                 if self.frame_count - self.last_peak_frame >= self.min_peak_distance:
-                    avg_valley = sum(self.valleys) / len(self.valleys) if self.valleys else self.current_valley_value
-                    within_margin = (
-                        not self.valleys
-                        or self.current_valley_value <= avg_valley + self.valley_margin
-                    )
-                    if within_margin:
-                        detected_valley = self.current_valley_value
-                        self.valleys.append(self.current_valley_value)
-                        self.last_peak_frame = self.frame_count
-                        new_rep_count = min(len(self.peaks), len(self.valleys))
-                        if new_rep_count > self.rep_count:
-                            self.rep_count = new_rep_count
-                            rep_completed = True
+                    if not self._calibrated:
+                        within_margin = True
+                    else:
+                        within_margin = (
+                            self._calibrated_avg_valley is not None
+                            and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin
+                        )
+                    if within_margin and self._range_gate_allows_rep_recording():
+                        new_rep_count_if = min(len(self.peaks), len(self.valleys) + 1)
+                        rep_would_increment = new_rep_count_if > self.rep_count
+                        now_ms = time.time() * 1000.0
+                        interval_ok = True
+                        if rep_would_increment and self.min_rep_interval_ms > 0:
+                            if self._last_rep_time_ms is not None and (
+                                now_ms - self._last_rep_time_ms
+                            ) < self.min_rep_interval_ms:
+                                interval_ok = False
+                        if interval_ok:
+                            detected_valley = self.current_valley_value
+                            self.valleys.append(self.current_valley_value)
+                            self.last_peak_frame = self.frame_count
+                            new_rep_count = min(len(self.peaks), len(self.valleys))
+                            if new_rep_count > self.rep_count:
+                                self.rep_count = new_rep_count
+                                rep_completed = True
+                                self._last_rep_time_ms = now_ms
+                            self._maybe_lock_calibration()
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 
@@ -239,6 +363,10 @@ class PeakDetector:
             "smoothedValue": self.smoothed_value,
             "state": self.state,
             "repCount": self.rep_count,
+            "rollingRange": self._last_rolling_range,
+            "rangeGateOpen": self._last_range_gate_open,
+            "calibrationComplete": self._calibrated,
+            "calibrationTargetReps": self.calibration_reps,
         }
 
     def get_rep_count(self) -> int:
@@ -269,6 +397,14 @@ class PeakDetector:
         self.valleys.clear()
         self.current_peak_value = None
         self.current_valley_value = None
+        self._value_window.clear()
+        self._last_rolling_range = 0.0
+        self._last_range_gate_open = self.min_range_gate_degrees <= 0
+        self._last_debanded_pass = None
+        self._calibrated = False
+        self._calibrated_avg_peak = None
+        self._calibrated_avg_valley = None
+        self._last_rep_time_ms = None
 
     def get_state(self) -> dict[str, Any]:
         return {
@@ -278,6 +414,10 @@ class PeakDetector:
             "repCount": self.rep_count,
             "currentPeakValue": self.current_peak_value,
             "currentValleyValue": self.current_valley_value,
+            "calibrationComplete": self._calibrated,
+            "calibrationTargetReps": self.calibration_reps,
+            "calibratedAvgPeak": self._calibrated_avg_peak,
+            "calibratedAvgValley": self._calibrated_avg_valley,
         }
 
 
@@ -287,6 +427,14 @@ def create_peak_detector(
     min_peak_distance: int = 10,
     peak_margin: float = 15.0,
     valley_margin: float = 15.0,
+    min_range_gate_degrees: float = 15.0,
+    range_window_frames: int = 90,
+    range_min_samples: int = 12,
+    range_percentile_low: float = 5.0,
+    range_percentile_high: float = 95.0,
+    delta_deadband_degrees: float = 0.0,
+    calibration_reps: int = 3,
+    min_rep_interval_ms: float = 400.0,
 ) -> PeakDetector:
     return PeakDetector(
         smoothing_factor=smoothing_factor,
@@ -294,6 +442,14 @@ def create_peak_detector(
         min_peak_distance=min_peak_distance,
         peak_margin=peak_margin,
         valley_margin=valley_margin,
+        min_range_gate_degrees=min_range_gate_degrees,
+        range_window_frames=range_window_frames,
+        range_min_samples=range_min_samples,
+        range_percentile_low=range_percentile_low,
+        range_percentile_high=range_percentile_high,
+        delta_deadband_degrees=delta_deadband_degrees,
+        calibration_reps=calibration_reps,
+        min_rep_interval_ms=min_rep_interval_ms,
     )
 
 

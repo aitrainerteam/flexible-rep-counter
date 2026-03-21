@@ -31,6 +31,26 @@ from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
 logger = get_logger(__name__)
 
 CALIBRATION_FRAMES = 60
+
+
+def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
+    d = get_default_tuning_params()
+    tp = tuning_params or {}
+    return create_peak_detector(
+        smoothing_factor=float(tp.get("smoothingFactor", d["smoothingFactor"])),
+        hysteresis=float(tp.get("hysteresis", d["hysteresis"])),
+        min_peak_distance=int(tp.get("minPeakDistance", d["minPeakDistance"])),
+        peak_margin=float(tp.get("peakMargin", d["peakMargin"])),
+        valley_margin=float(tp.get("valleyMargin", d["valleyMargin"])),
+        min_range_gate_degrees=float(tp.get("minRangeGate", d["minRangeGate"])),
+        range_window_frames=int(tp.get("rangeWindowFrames", d["rangeWindowFrames"])),
+        range_min_samples=int(tp.get("rangeMinSamples", d["rangeMinSamples"])),
+        delta_deadband_degrees=float(tp.get("angleDeltaDeadband", d["angleDeltaDeadband"])),
+        calibration_reps=int(tp.get("calibrationReps", d["calibrationReps"])),
+        min_rep_interval_ms=float(tp.get("minRepIntervalMs", d["minRepIntervalMs"])),
+    )
+
+
 OVERLAY_FONT = cv2.FONT_HERSHEY_DUPLEX  # Bold, readable
 OVERLAY_SCALE = 0.7
 OVERLAY_THICKNESS = 2
@@ -55,6 +75,26 @@ BUTTON_COLOR = (60, 180, 80)
 BUTTON_COLOR_JUST_CLICKED = (0, 255, 255)  # Yellow (BGR) for a few seconds after click
 BUTTON_TEXT_COLOR = (0, 0, 0)  # Black, caps, bold
 BUTTON_YELLOW_SECONDS = 2.5
+
+
+def _counterpart_angle_key(angle_key: str) -> Optional[str]:
+    """Return mirrored LEFT/RIGHT angle key for the same joint when available."""
+    if angle_key.startswith("LEFT_"):
+        candidate = "RIGHT_" + angle_key[len("LEFT_") :]
+    elif angle_key.startswith("RIGHT_"):
+        candidate = "LEFT_" + angle_key[len("RIGHT_") :]
+    else:
+        return None
+    return candidate if candidate in COMMON_ANGLES else None
+
+
+def _get_tracked_angle_keys(primary_angle_key: str) -> list[str]:
+    """Track the calibrated landmark set plus its mirrored counterpart (if defined)."""
+    keys = [primary_angle_key]
+    counterpart = _counterpart_angle_key(primary_angle_key)
+    if counterpart and counterpart not in keys:
+        keys.append(counterpart)
+    return keys
 
 
 def _draw_start_button(frame: Any, run_state: dict[str, Any]) -> None:
@@ -150,6 +190,9 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) ->
         state["selected_angle"] = None
         state["selected_config"] = None
         state["peak_detector"] = None
+        state["tracked_angles"] = []
+        state["detectors_by_angle"] = {}
+        state["rep_counts_by_angle"] = {}
         state["frame_buffer"] = []
 
 
@@ -406,6 +449,9 @@ def run_webcam_loop(
         "selected_angle": None,
         "selected_config": None,
         "peak_detector": None,
+        "tracked_angles": [],
+        "detectors_by_angle": {},
+        "rep_counts_by_angle": {},
         "tuning_params": get_default_tuning_params(),
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
@@ -579,6 +625,9 @@ def run_webcam_loop(
             selected_angle = run_state["selected_angle"]
             selected_config = run_state["selected_config"]
             peak_detector = run_state["peak_detector"]
+            tracked_angles: list[str] = list(run_state.get("tracked_angles") or [])
+            detectors_by_angle: dict[str, Any] = dict(run_state.get("detectors_by_angle") or {})
+            rep_counts_by_angle: dict[str, int] = dict(run_state.get("rep_counts_by_angle") or {})
             tuning_params = run_state["tuning_params"]
 
             if selected_angle is None:
@@ -591,17 +640,21 @@ def run_webcam_loop(
                     if selected_angle and selected_angle in COMMON_ANGLES:
                         run_state["selected_angle"] = selected_angle
                         run_state["selected_config"] = COMMON_ANGLES[selected_angle]
-                        run_state["peak_detector"] = create_peak_detector(
-                            smoothing_factor=float(tuning_params.get("smoothingFactor", 0.45)),
-                            hysteresis=float(tuning_params.get("hysteresis", 5)),
-                            min_peak_distance=int(tuning_params.get("minPeakDistance", 5)),
-                            peak_margin=float(tuning_params.get("peakMargin", 15)),
-                            valley_margin=float(tuning_params.get("valleyMargin", 15)),
-                        )
+                        run_state["peak_detector"] = _peak_detector_from_tuning(tuning_params)
+                        tracked = _get_tracked_angle_keys(selected_angle)
+                        run_state["tracked_angles"] = tracked
+                        run_state["detectors_by_angle"] = {
+                            angle_key: _peak_detector_from_tuning(tuning_params)
+                            for angle_key in tracked
+                        }
+                        run_state["rep_counts_by_angle"] = {angle_key: 0 for angle_key in tracked}
                         frame_buffer.clear()
                     else:
                         run_state["selected_angle"] = None
                         run_state["selected_config"] = None
+                        run_state["tracked_angles"] = []
+                        run_state["detectors_by_angle"] = {}
+                        run_state["rep_counts_by_angle"] = {}
                         frame_buffer.clear()
                 status = f"Calibrating... {len(frame_buffer)}/{CALIBRATION_FRAMES}"
                 _draw_overlay(frame_bgr, None, None, 0, "—", status)
@@ -625,13 +678,63 @@ def run_webcam_loop(
             rep_count = 0
             state_str = "—"
             smoothed_value = None
-            if peak_detector is not None:
+            range_gate_open = True
+            rolling_range: Optional[float] = None
+            d_tuning = get_default_tuning_params()
+            calibration_complete = True
+            cal_target = int(tuning_params.get("calibrationReps", d_tuning["calibrationReps"]))
+            primary_rep_count = 0
+            if detectors_by_angle:
+                primary_angle = selected_angle
+                total_reps = 0
+                for angle_key in tracked_angles:
+                    detector = detectors_by_angle.get(angle_key)
+                    config = COMMON_ANGLES.get(angle_key)
+                    if detector is None or not config:
+                        continue
+                    value = calculate_from_type(
+                        config["type"],
+                        config["landmarks"],
+                        landmarks,
+                    )
+                    out = detector.update(value)
+                    reps_for_angle = int(out.get("repCount", 0) or 0)
+                    rep_counts_by_angle[angle_key] = reps_for_angle
+                    total_reps += reps_for_angle
+                    if primary_angle == angle_key:
+                        state_str = out.get("state", "—")
+                        smoothed_value = out.get("smoothedValue")
+                        range_gate_open = bool(out.get("rangeGateOpen", True))
+                        r = out.get("rollingRange")
+                        rolling_range = float(r) if r is not None else None
+                        calibration_complete = bool(out.get("calibrationComplete", False))
+                        cal_target = int(out.get("calibrationTargetReps", cal_target))
+                        primary_rep_count = reps_for_angle
+                rep_count = total_reps
+                run_state["detectors_by_angle"] = detectors_by_angle
+                run_state["rep_counts_by_angle"] = rep_counts_by_angle
+            elif peak_detector is not None:
                 out = peak_detector.update(angle_value)
-                rep_count = out.get("repCount", 0)
+                rep_count = int(out.get("repCount", 0) or 0)
+                primary_rep_count = rep_count
                 state_str = out.get("state", "—")
                 smoothed_value = out.get("smoothedValue")
+                range_gate_open = bool(out.get("rangeGateOpen", True))
+                r = out.get("rollingRange")
+                rolling_range = float(r) if r is not None else None
+                calibration_complete = bool(out.get("calibrationComplete", False))
+                cal_target = int(out.get("calibrationTargetReps", cal_target))
 
-            status = "Tracking"
+            if not calibration_complete:
+                status = f"Calibrating... rep {primary_rep_count + 1}/{cal_target}"
+            elif tracked_angles:
+                status = f"Tracking {len(tracked_angles)} limb(s)"
+            else:
+                status = "Tracking"
+            if rolling_range is not None and not range_gate_open:
+                need = float(tuning_params.get("minRangeGate", get_default_tuning_params()["minRangeGate"]))
+                if need > 0:
+                    status = f"{status} | span {rolling_range:.0f}° (need ≥{need:.0f}°)"
             _draw_overlay(
                 frame_bgr, selected_angle, smoothed_value, rep_count, state_str, status
             )

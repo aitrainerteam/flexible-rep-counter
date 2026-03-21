@@ -50,6 +50,17 @@ DEFAULT_SMOOTHING_FACTOR = float(os.environ.get("REP_SMOOTHING_FACTOR", "0.45"))
 # Only count peak/valley when within this many degrees of the average observed max/min (avoids counting micro-movements)
 DEFAULT_PEAK_MARGIN = float(os.environ.get("REP_PEAK_MARGIN", "15"))
 DEFAULT_VALLEY_MARGIN = float(os.environ.get("REP_VALLEY_MARGIN", "15"))
+# Rolling-window range gate: no reps until recent motion span exceeds this (degrees). 0 = disabled.
+DEFAULT_MIN_RANGE_GATE = float(os.environ.get("REP_MIN_RANGE_GATE", "15"))
+# Recent smoothed-angle samples for rolling spread (p95-p5). Not monotonic global min/max.
+DEFAULT_RANGE_WINDOW_FRAMES = int(os.environ.get("REP_RANGE_WINDOW_FRAMES", "90"))
+DEFAULT_RANGE_MIN_SAMPLES = int(os.environ.get("REP_RANGE_MIN_SAMPLES", "12"))
+# Per-frame angle delta deadband (degrees): hold previous sample if change is smaller; 0 = off.
+DEFAULT_ANGLE_DELTA_DEADBAND = float(os.environ.get("REP_ANGLE_DELTA_DEADBAND", "0"))
+# First N reps: record peaks/valleys without margin checks, then lock averages for strict counting.
+DEFAULT_CALIBRATION_REPS = int(os.environ.get("REP_CALIBRATION_REPS", "3"))
+# Minimum time between counted reps (ms). 0 = disabled.
+DEFAULT_MIN_REP_INTERVAL_MS = float(os.environ.get("REP_MIN_INTERVAL_MS", "400"))
 
 
 def get_default_tuning_params():
@@ -59,4 +70,10 @@ def get_default_tuning_params():
         "smoothingFactor": DEFAULT_SMOOTHING_FACTOR,
         "peakMargin": DEFAULT_PEAK_MARGIN,
         "valleyMargin": DEFAULT_VALLEY_MARGIN,
+        "minRangeGate": DEFAULT_MIN_RANGE_GATE,
+        "rangeWindowFrames": DEFAULT_RANGE_WINDOW_FRAMES,
+        "rangeMinSamples": DEFAULT_RANGE_MIN_SAMPLES,
+        "angleDeltaDeadband": DEFAULT_ANGLE_DELTA_DEADBAND,
+        "calibrationReps": DEFAULT_CALIBRATION_REPS,
+        "minRepIntervalMs": DEFAULT_MIN_REP_INTERVAL_MS,
     }

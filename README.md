@@ -31,8 +31,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
-- **Calibration**: First ~60 frames are used to choose the most consistently moving joint angle.
-- **Tracking**: Selected angle is tracked; reps increment on peak/valley pairs.
+- **Calibration**: First ~60 frames pick the most consistently moving joint angle; the next N reps (see `REP_CALIBRATION_REPS`) establish locked peak/valley baselines for counting.
+- **Tracking**: Selected angle is tracked; reps increment on peak/valley pairs with optional minimum spacing (`REP_MIN_INTERVAL_MS`).
 - **Quit**: Press `q` or Escape in the video window.
 
 ## Configuration
@@ -54,6 +54,12 @@ Create a `.env` file in the project root directory to configure the application:
 | `REP_SMOOTHING_FACTOR` | Exponential moving average alpha for angle smoothing (0–1) | `0.45` |
 | `REP_PEAK_MARGIN` | Only count a peak (e.g. arm extended) when within this many degrees of the average observed max | `15` |
 | `REP_VALLEY_MARGIN` | Only count a valley (e.g. arm flexed) when within this many degrees of the average observed min | `15` |
+| `REP_MIN_RANGE_GATE` | No rep is recorded until the rolling-window motion span (p95−p5 of smoothed angle) reaches at least this many degrees. Reduces false reps from tiny oscillations at set start. `0` disables. | `15` |
+| `REP_RANGE_WINDOW_FRAMES` | How many recent frames define the rolling span (not a monotonic session min/max) | `90` |
+| `REP_RANGE_MIN_SAMPLES` | Minimum samples in the window before the span is trusted (capped by window size) | `12` |
+| `REP_ANGLE_DELTA_DEADBAND` | If the raw joint angle changes by fewer than this many degrees from the last *passed* sample, reuse that sample before EMA smoothing (reduces pose jitter). `0` disables. | `0` |
+| `REP_CALIBRATION_REPS` | First N counted reps record peaks/valleys without margin checks; then session averages are locked and stricter margins apply (reduces false reps). | `3` |
+| `REP_MIN_INTERVAL_MS` | Minimum time between counted reps (milliseconds). `0` disables. | `400` |
 
 ### Debugging
 | Variable | Description | Default |
