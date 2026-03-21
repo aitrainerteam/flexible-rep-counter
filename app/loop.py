@@ -23,7 +23,7 @@ from app.debug_console import (
     setup_logging,
     update_console_window,
 )
-from app.math_engine import calculate_from_type, create_peak_detector
+from app.math_engine import calculate_from_type, create_peak_detector, replay_angle_series_on_peak_detector
 from app.pose_filters import PoseFilterPipeline
 from app.skeleton_overlay import draw_skeleton
 from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
@@ -640,14 +640,30 @@ def run_webcam_loop(
                     if selected_angle and selected_angle in COMMON_ANGLES:
                         run_state["selected_angle"] = selected_angle
                         run_state["selected_config"] = COMMON_ANGLES[selected_angle]
-                        run_state["peak_detector"] = _peak_detector_from_tuning(tuning_params)
                         tracked = _get_tracked_angle_keys(selected_angle)
                         run_state["tracked_angles"] = tracked
-                        run_state["detectors_by_angle"] = {
+                        detectors_by_angle = {
                             angle_key: _peak_detector_from_tuning(tuning_params)
                             for angle_key in tracked
                         }
-                        run_state["rep_counts_by_angle"] = {angle_key: 0 for angle_key in tracked}
+                        # Retroactive counting: replay calibration buffer through each PeakDetector
+                        # so reps already completed in the buffer are counted and peaks/valleys injected.
+                        cal_landmarks = list(frame_buffer)
+                        rep_counts_by_angle: dict[str, int] = {}
+                        for angle_key in tracked:
+                            cfg = COMMON_ANGLES.get(angle_key)
+                            det = detectors_by_angle.get(angle_key)
+                            if not cfg or det is None:
+                                continue
+                            series = [
+                                calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+                                for lm in cal_landmarks
+                            ]
+                            replay_angle_series_on_peak_detector(det, series)
+                            rep_counts_by_angle[angle_key] = det.get_rep_count()
+                        run_state["detectors_by_angle"] = detectors_by_angle
+                        run_state["rep_counts_by_angle"] = rep_counts_by_angle
+                        run_state["peak_detector"] = detectors_by_angle[selected_angle]
                         frame_buffer.clear()
                     else:
                         run_state["selected_angle"] = None
@@ -731,10 +747,20 @@ def run_webcam_loop(
                 status = f"Tracking {len(tracked_angles)} limb(s)"
             else:
                 status = "Tracking"
+            # OpenCV fonts often mangle Unicode (e.g. >= and degree); use plain ASCII.
             if rolling_range is not None and not range_gate_open:
                 need = float(tuning_params.get("minRangeGate", get_default_tuning_params()["minRangeGate"]))
                 if need > 0:
-                    status = f"{status} | span {rolling_range:.0f}° (need ≥{need:.0f}°)"
+                    if not calibration_complete:
+                        status = (
+                            f"{status} — Move more: ~{rolling_range:.0f} deg so far "
+                            f"(need at least {need:.0f} deg for a rep)"
+                        )
+                    else:
+                        status = (
+                            f"{status} — Range ~{rolling_range:.0f} deg, "
+                            f"need at least {need:.0f} deg"
+                        )
             _draw_overlay(
                 frame_bgr, selected_angle, smoothed_value, rep_count, state_str, status
             )

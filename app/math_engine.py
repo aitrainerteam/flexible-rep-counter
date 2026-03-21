@@ -453,6 +453,21 @@ def create_peak_detector(
     )
 
 
+def replay_angle_series_on_peak_detector(
+    detector: PeakDetector,
+    values: Sequence[Optional[float]],
+) -> dict[str, Any]:
+    """Feed a calibration-window angle series through the detector (same logic as live updates).
+
+    Includes None samples like the main loop so frame_count and deadband behavior match live.
+    Populates peaks, valleys, rep_count, and locks calibration when rep_count reaches calibration_reps.
+    """
+    last: dict[str, Any] = {}
+    for v in values:
+        last = detector.update(v)
+    return last
+
+
 # -----------------------------------------------------------------------------
 # Variance and robust stats
 # -----------------------------------------------------------------------------
