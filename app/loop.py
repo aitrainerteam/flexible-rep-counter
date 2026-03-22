@@ -5,10 +5,15 @@ import sys
 import cv2
 import threading
 import time
+from collections import deque
 from queue import Empty, Full, Queue
 from typing import Any, Optional
 
 from app.config import (
+    ANGLE_SELECTION_MAX_BUFFER_FRAMES,
+    ANGLE_SELECTION_MIN_FRAMES,
+    ANGLE_SELECTION_MIN_SEC,
+    ANGLE_SELECTION_RETRY_INTERVAL_SEC,
     PREDICT_JPEG_QUALITY,
     PREDICT_RESIZE_WIDTH,
     PREDICT_VALIDATE_RESPONSE,
@@ -28,14 +33,13 @@ from app.math_engine import (
     calculate_variance,
     create_peak_detector,
     replay_angle_series_on_peak_detector,
+    smooth_angle_series,
 )
 from app.pose_filters import PoseFilterPipeline
 from app.skeleton_overlay import draw_skeleton
 from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
 
 logger = get_logger(__name__)
-
-CALIBRATION_FRAMES = 60
 
 
 def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
@@ -111,10 +115,11 @@ def _compute_angle_series(frame_buffer: list[list[dict]], angle_key: str) -> lis
 
 def _series_activity_stats(values: list[Optional[float]]) -> dict[str, float]:
     valid = [float(v) for v in values if v is not None]
-    if len(valid) < 10:
+    if len(valid) < 15:
         return {"validSamples": float(len(valid)), "variance": 0.0, "range": 0.0}
-    var = float(calculate_variance(valid).get("variance") or 0.0)
-    rng = float(max(valid) - min(valid))
+    smoothed = smooth_angle_series(valid, window=5)
+    var = float(calculate_variance(smoothed).get("variance") or 0.0)
+    rng = float(max(smoothed) - min(smoothed))
     return {"validSamples": float(len(valid)), "variance": var, "range": rng}
 
 
@@ -133,16 +138,14 @@ def _select_tracking_mode(
     primary_stats = _series_activity_stats(primary_series)
     counterpart_stats = _series_activity_stats(counterpart_series)
     min_range_gate = float(tuning_params.get("minRangeGate", 15.0) or 0.0)
+    min_rom = max(14.0, min_range_gate * 0.85) if min_range_gate > 0 else 14.0
     counterpart_active = (
-        counterpart_stats["validSamples"] >= 10
-        and counterpart_stats["variance"] >= 5.0
-        and (
-            min_range_gate <= 0
-            or counterpart_stats["range"] >= (min_range_gate * 0.8)
-        )
+        counterpart_stats["validSamples"] >= 15
+        and counterpart_stats["variance"] >= 7.0
+        and counterpart_stats["range"] >= min_rom
         and (
             primary_stats["range"] <= 0
-            or counterpart_stats["range"] >= (primary_stats["range"] * 0.45)
+            or counterpart_stats["range"] >= (primary_stats["range"] * 0.52)
         )
     )
     if counterpart_active:
@@ -240,6 +243,7 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) ->
     if not state.get("started", False):
         state["started"] = True
         state["started_at"] = time.time()
+        state["selection_last_attempt"] = None
     else:
         state["selected_angle"] = None
         state["selected_config"] = None
@@ -248,7 +252,8 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) ->
         state["detectors_by_angle"] = {}
         state["rep_counts_by_angle"] = {}
         state["tracking_mode"] = "single"
-        state["frame_buffer"] = []
+        state["frame_buffer"] = deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES)
+        state["selection_last_attempt"] = None
 
 
 def _draw_transparent_box(frame: Any, x1: int, y1: int, x2: int, y2: int) -> None:
@@ -525,7 +530,8 @@ def run_webcam_loop(
 
     run_state: dict[str, Any] = {
         "started": False,
-        "frame_buffer": [],
+        "frame_buffer": deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES),
+        "selection_last_attempt": None,
         "selected_angle": None,
         "selected_config": None,
         "peak_detector": None,
@@ -714,7 +720,18 @@ def run_webcam_loop(
 
             if selected_angle is None:
                 frame_buffer.append(landmarks)
-                if len(frame_buffer) >= CALIBRATION_FRAMES:
+                started_at = float(run_state.get("started_at") or 0.0)
+                elapsed = time.time() - started_at
+                ready = (
+                    len(frame_buffer) >= ANGLE_SELECTION_MIN_FRAMES
+                    and elapsed >= ANGLE_SELECTION_MIN_SEC
+                )
+                last_att = run_state.get("selection_last_attempt")
+                can_try = ready and (
+                    last_att is None
+                    or (time.time() - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
+                )
+                if can_try:
                     result = determine_best_angle(frame_buffer, exercise=None)
                     selected_angle = result.get("selectedAngle")
                     tuning_params = result.get("tuningParams") or get_default_tuning_params()
@@ -722,6 +739,7 @@ def run_webcam_loop(
                     if selected_angle and selected_angle in COMMON_ANGLES:
                         run_state["selected_angle"] = selected_angle
                         run_state["selected_config"] = COMMON_ANGLES[selected_angle]
+                        run_state["selection_last_attempt"] = None
                         tracked, tracking_mode = _select_tracking_mode(
                             selected_angle,
                             frame_buffer,
@@ -759,8 +777,22 @@ def run_webcam_loop(
                         run_state["detectors_by_angle"] = {}
                         run_state["rep_counts_by_angle"] = {}
                         run_state["tracking_mode"] = "single"
-                        frame_buffer.clear()
-                status = f"Calibrating... {len(frame_buffer)}/{CALIBRATION_FRAMES}"
+                        run_state["selection_last_attempt"] = time.time()
+                retry_at = run_state.get("selection_last_attempt")
+                if not ready:
+                    status = (
+                        f"Observing movement... {len(frame_buffer)}/{ANGLE_SELECTION_MIN_FRAMES} frames, "
+                        f"{elapsed:.1f}s / {ANGLE_SELECTION_MIN_SEC:.0f}s min"
+                    )
+                elif retry_at is not None and (
+                    time.time() - float(retry_at) < ANGLE_SELECTION_RETRY_INTERVAL_SEC
+                ):
+                    rem = ANGLE_SELECTION_RETRY_INTERVAL_SEC - (time.time() - float(retry_at))
+                    status = f"Unclear motion — retry in {rem:.0f}s (full ROM, steady reps)"
+                elif selected_angle:
+                    status = "Locked joint — calibrating reps"
+                else:
+                    status = f"Analyzing... ({len(frame_buffer)} frames)"
                 _draw_overlay(frame_bgr, None, None, 0, "—", status)
                 _draw_vm_benchmark_hud(
                     frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues

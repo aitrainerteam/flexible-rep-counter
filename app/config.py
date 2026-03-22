@@ -67,6 +67,12 @@ DEFAULT_CALIBRATION_FORCE_EXTRA_REPS = int(os.environ.get("REP_CALIBRATION_FORCE
 # Minimum time between counted reps (ms). 0 = disabled.
 DEFAULT_MIN_REP_INTERVAL_MS = float(os.environ.get("REP_MIN_INTERVAL_MS", "400"))
 
+# Angle / limb selection (before rep calibration): wall time + samples so the user can move through real reps.
+ANGLE_SELECTION_MIN_SEC = float(os.environ.get("ANGLE_SELECTION_MIN_SEC", "5.0"))
+ANGLE_SELECTION_MIN_FRAMES = int(os.environ.get("ANGLE_SELECTION_MIN_FRAMES", "50"))
+ANGLE_SELECTION_MAX_BUFFER_FRAMES = int(os.environ.get("ANGLE_SELECTION_MAX_BUFFER_FRAMES", "400"))
+ANGLE_SELECTION_RETRY_INTERVAL_SEC = float(os.environ.get("ANGLE_SELECTION_RETRY_INTERVAL_SEC", "2.0"))
+
 
 def get_default_tuning_params():
     return {

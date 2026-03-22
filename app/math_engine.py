@@ -541,6 +541,24 @@ def replay_angle_series_on_peak_detector(
 # -----------------------------------------------------------------------------
 
 
+def smooth_angle_series(values: list[float], window: int = 5) -> list[float]:
+    """Light moving average on angle samples to suppress single-frame jitter before variance/range stats."""
+    if not values:
+        return []
+    if len(values) < 2 or window <= 1:
+        return list(values)
+    w = min(window, len(values))
+    half = w // 2
+    out: list[float] = []
+    for i in range(len(values)):
+        lo = max(0, i - half)
+        hi = min(len(values), lo + w)
+        lo = max(0, hi - w)
+        chunk = values[lo:hi]
+        out.append(sum(chunk) / len(chunk))
+    return out
+
+
 def calculate_variance(values: list[float]) -> dict[str, float]:
     if not values:
         return {"mean": 0.0, "variance": 0.0, "stdDev": 0.0}

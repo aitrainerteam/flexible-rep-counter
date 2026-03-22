@@ -1,6 +1,7 @@
 """Variance-based angle selection: pick the angle with most consistent movement (median window variance)."""
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 from app.config import get_default_tuning_params
@@ -12,6 +13,7 @@ from app.math_engine import (
     compute_robust_variance,
     get_average_confidence_for_landmarks,
     get_min_confidence_for_landmarks,
+    smooth_angle_series,
 )
 
 # COCO indices: 0 Nose, 1-4 eyes/ears, 5-6 shoulders, 7-8 elbows, 9-10 wrists, 11-12 hips, 13-14 knees, 15-16 ankles
@@ -27,10 +29,16 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
     "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14]},
 }
 
-MIN_VARIANCE_THRESHOLD_SELECTOR = 5.0
+MIN_VARIANCE_THRESHOLD_SELECTOR = 6.0
 LOW_CONFIDENCE_THRESHOLD = 0.5
 FRAME_MIN_CONFIDENCE = 0.5
-MIN_ACTIVE_WINDOWS = 2
+# Require several time segments with real variance (not one accidental spike or jitter).
+MIN_ACTIVE_WINDOWS = 3
+# Smoothed angle span (degrees): rejects pure camera/pose jitter without a real ROM.
+MIN_SMOOTHED_RANGE_DEG = float(os.environ.get("ANGLE_SELECTION_MIN_RANGE_DEG", "16.0"))
+# Top candidate must lead the runner-up by this ratio on median window variance (ambiguous = keep observing).
+SECOND_BEST_SCORE_RATIO = float(os.environ.get("ANGLE_SELECTION_SECOND_BEST_RATIO", "1.15"))
+SMOOTH_WINDOW = int(os.environ.get("ANGLE_SELECTION_SMOOTH_WINDOW", "5"))
 ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
 
 
@@ -50,15 +58,19 @@ def _calculate_all_variances(frame_buffer: list[list[dict]]) -> dict[str, dict[s
             if value is not None and not (isinstance(value, float) and value != value):
                 history.append(value)
         if len(history) >= 10:
-            stats = calculate_variance(history)
-            robust = compute_robust_variance(history)
-            consistent = compute_consistent_variance_score(history)
+            smoothed = smooth_angle_series(history, window=SMOOTH_WINDOW)
+            min_ws = 15 if len(smoothed) >= 90 else 12
+            stats = calculate_variance(smoothed)
+            robust = compute_robust_variance(smoothed)
+            consistent = compute_consistent_variance_score(smoothed, min_window_size=min_ws)
+            span_deg = max(smoothed) - min(smoothed) if len(smoothed) >= 2 else 0.0
             variances[angle_key] = {
                 **stats,
                 "robustVariance": robust["variance"],
                 "medianWindowVariance": consistent["medianWindowVariance"],
                 "activeWindowCount": consistent["activeWindowCount"],
                 "windowVariances": consistent["windowVariances"],
+                "smoothedRangeDeg": span_deg,
                 "history": history,
                 "config": config,
             }
@@ -66,19 +78,28 @@ def _calculate_all_variances(frame_buffer: list[list[dict]]) -> dict[str, dict[s
 
 
 def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
-    best_score = 0.0
-    top = None
+    """Pick the clearest winner: multi-window activity, meaningful ROM, and margin over the runner-up."""
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
     for key, data in variances.items():
-        consistent_var = data.get("medianWindowVariance") or 0.0
-        active_windows = data.get("activeWindowCount") or 0
+        consistent_var = float(data.get("medianWindowVariance") or 0.0)
+        active_windows = int(data.get("activeWindowCount") or 0)
+        span_deg = float(data.get("smoothedRangeDeg") or 0.0)
         if active_windows < MIN_ACTIVE_WINDOWS:
             continue
         if consistent_var < MIN_VARIANCE_THRESHOLD_SELECTOR:
             continue
-        if consistent_var > best_score:
-            best_score = consistent_var
-            top = {"key": key, **data}
-    return top
+        if span_deg < MIN_SMOOTHED_RANGE_DEG:
+            continue
+        ranked.append((consistent_var, key, data))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if not ranked:
+        return None
+    top_score, top_key, top_data = ranked[0]
+    if len(ranked) >= 2:
+        second_score = ranked[1][0]
+        if second_score > 0 and top_score < second_score * SECOND_BEST_SCORE_RATIO:
+            return None
+    return {"key": top_key, **top_data}
 
 
 def _get_angle_confidence(frame_buffer: list[list[dict]], angle_config: Optional[dict]) -> float:
@@ -108,7 +129,7 @@ def determine_best_angle(
         "debug": debug,
     }
 
-    if not frame_buffer or len(frame_buffer) < 10:
+    if not frame_buffer or len(frame_buffer) < 40:
         return default_result
 
     is_isometric = bool(
@@ -130,6 +151,7 @@ def determine_best_angle(
             "robustVariance": v.get("robustVariance"),
             "medianWindowVariance": v.get("medianWindowVariance"),
             "activeWindowCount": v.get("activeWindowCount"),
+            "smoothedRangeDeg": v.get("smoothedRangeDeg"),
             "mean": v.get("mean"),
         }
         for k, v in variances.items()
