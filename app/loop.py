@@ -23,7 +23,12 @@ from app.debug_console import (
     setup_logging,
     update_console_window,
 )
-from app.math_engine import calculate_from_type, create_peak_detector, replay_angle_series_on_peak_detector
+from app.math_engine import (
+    calculate_from_type,
+    calculate_variance,
+    create_peak_detector,
+    replay_angle_series_on_peak_detector,
+)
 from app.pose_filters import PoseFilterPipeline
 from app.skeleton_overlay import draw_skeleton
 from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
@@ -90,13 +95,60 @@ def _counterpart_angle_key(angle_key: str) -> Optional[str]:
     return candidate if candidate in COMMON_ANGLES else None
 
 
-def _get_tracked_angle_keys(primary_angle_key: str) -> list[str]:
-    """Track the calibrated landmark set plus its mirrored counterpart (if defined)."""
-    keys = [primary_angle_key]
+def _format_angle_label(angle_key: str) -> str:
+    return angle_key.replace("_", " ").title()
+
+
+def _compute_angle_series(frame_buffer: list[list[dict]], angle_key: str) -> list[Optional[float]]:
+    cfg = COMMON_ANGLES.get(angle_key)
+    if not cfg:
+        return []
+    return [
+        calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+        for lm in frame_buffer
+    ]
+
+
+def _series_activity_stats(values: list[Optional[float]]) -> dict[str, float]:
+    valid = [float(v) for v in values if v is not None]
+    if len(valid) < 10:
+        return {"validSamples": float(len(valid)), "variance": 0.0, "range": 0.0}
+    var = float(calculate_variance(valid).get("variance") or 0.0)
+    rng = float(max(valid) - min(valid))
+    return {"validSamples": float(len(valid)), "variance": var, "range": rng}
+
+
+def _select_tracking_mode(
+    primary_angle_key: str,
+    frame_buffer: list[list[dict]],
+    tuning_params: dict[str, Any],
+) -> tuple[list[str], str]:
+    tracked = [primary_angle_key]
     counterpart = _counterpart_angle_key(primary_angle_key)
-    if counterpart and counterpart not in keys:
-        keys.append(counterpart)
-    return keys
+    if not counterpart:
+        return tracked, "single"
+
+    primary_series = _compute_angle_series(frame_buffer, primary_angle_key)
+    counterpart_series = _compute_angle_series(frame_buffer, counterpart)
+    primary_stats = _series_activity_stats(primary_series)
+    counterpart_stats = _series_activity_stats(counterpart_series)
+    min_range_gate = float(tuning_params.get("minRangeGate", 15.0) or 0.0)
+    counterpart_active = (
+        counterpart_stats["validSamples"] >= 10
+        and counterpart_stats["variance"] >= 5.0
+        and (
+            min_range_gate <= 0
+            or counterpart_stats["range"] >= (min_range_gate * 0.8)
+        )
+        and (
+            primary_stats["range"] <= 0
+            or counterpart_stats["range"] >= (primary_stats["range"] * 0.45)
+        )
+    )
+    if counterpart_active:
+        tracked.append(counterpart)
+        return tracked, "dual"
+    return tracked, "single"
 
 
 def _draw_start_button(frame: Any, run_state: dict[str, Any]) -> None:
@@ -195,6 +247,7 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) ->
         state["tracked_angles"] = []
         state["detectors_by_angle"] = {}
         state["rep_counts_by_angle"] = {}
+        state["tracking_mode"] = "single"
         state["frame_buffer"] = []
 
 
@@ -383,6 +436,8 @@ def _draw_overlay(
     rep_count: int,
     state: str,
     status: str,
+    rep_counts_by_angle: Optional[dict[str, int]] = None,
+    tracking_mode: str = "single",
 ) -> None:
     margin = 10
     y = 30
@@ -395,7 +450,9 @@ def _draw_overlay(
         lines += 1
     if smoothed_value is not None:
         lines += 1
-    box_x2 = min(frame.shape[1] - margin, 320)
+    if rep_counts_by_angle:
+        lines += len(rep_counts_by_angle)
+    box_x2 = min(frame.shape[1] - margin, 560)
     box_y2 = box_y1 + lines * line_height + 8
     _draw_transparent_box(frame, box_x1, box_y1, box_x2, box_y2)
     if selected_angle:
@@ -408,8 +465,29 @@ def _draw_overlay(
             frame, f"Value: {smoothed_value:.1f}", (margin, y), OVERLAY_FONT, OVERLAY_SCALE, OVERLAY_COLOR_DIM, OVERLAY_THICKNESS
         )
         y += line_height
-    _put_text_readable(frame, f"Reps: {rep_count}", (margin, y), OVERLAY_FONT, OVERLAY_SCALE, OVERLAY_COLOR, OVERLAY_THICKNESS)
+    rep_label = "Matched Reps" if tracking_mode == "dual" else "Reps"
+    _put_text_readable(
+        frame,
+        f"{rep_label}: {rep_count}",
+        (margin, y),
+        OVERLAY_FONT,
+        OVERLAY_SCALE,
+        OVERLAY_COLOR,
+        OVERLAY_THICKNESS,
+    )
     y += line_height
+    if rep_counts_by_angle:
+        for angle_key, count in rep_counts_by_angle.items():
+            _put_text_readable(
+                frame,
+                f"{_format_angle_label(angle_key)}: {count}",
+                (margin, y),
+                OVERLAY_FONT,
+                0.6,
+                OVERLAY_COLOR_DIM,
+                2,
+            )
+            y += line_height
     _put_text_readable(frame, f"State: {state}", (margin, y), OVERLAY_FONT, 0.6, OVERLAY_COLOR_DIM, 2)
     y += line_height
     _put_text_readable(frame, status, (margin, y), OVERLAY_FONT, 0.6, OVERLAY_COLOR_STATUS, 2)
@@ -454,6 +532,7 @@ def run_webcam_loop(
         "tracked_angles": [],
         "detectors_by_angle": {},
         "rep_counts_by_angle": {},
+        "tracking_mode": "single",
         "tuning_params": get_default_tuning_params(),
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
@@ -630,6 +709,7 @@ def run_webcam_loop(
             tracked_angles: list[str] = list(run_state.get("tracked_angles") or [])
             detectors_by_angle: dict[str, Any] = dict(run_state.get("detectors_by_angle") or {})
             rep_counts_by_angle: dict[str, int] = dict(run_state.get("rep_counts_by_angle") or {})
+            tracking_mode: str = str(run_state.get("tracking_mode") or "single")
             tuning_params = run_state["tuning_params"]
 
             if selected_angle is None:
@@ -642,8 +722,13 @@ def run_webcam_loop(
                     if selected_angle and selected_angle in COMMON_ANGLES:
                         run_state["selected_angle"] = selected_angle
                         run_state["selected_config"] = COMMON_ANGLES[selected_angle]
-                        tracked = _get_tracked_angle_keys(selected_angle)
+                        tracked, tracking_mode = _select_tracking_mode(
+                            selected_angle,
+                            frame_buffer,
+                            tuning_params,
+                        )
                         run_state["tracked_angles"] = tracked
+                        run_state["tracking_mode"] = tracking_mode
                         detectors_by_angle = {
                             angle_key: _peak_detector_from_tuning(tuning_params)
                             for angle_key in tracked
@@ -673,6 +758,7 @@ def run_webcam_loop(
                         run_state["tracked_angles"] = []
                         run_state["detectors_by_angle"] = {}
                         run_state["rep_counts_by_angle"] = {}
+                        run_state["tracking_mode"] = "single"
                         frame_buffer.clear()
                 status = f"Calibrating... {len(frame_buffer)}/{CALIBRATION_FRAMES}"
                 _draw_overlay(frame_bgr, None, None, 0, "—", status)
@@ -708,7 +794,6 @@ def run_webcam_loop(
             primary_rep_count = 0
             if detectors_by_angle:
                 primary_angle = selected_angle
-                total_reps = 0
                 for angle_key in tracked_angles:
                     detector = detectors_by_angle.get(angle_key)
                     config = COMMON_ANGLES.get(angle_key)
@@ -722,7 +807,6 @@ def run_webcam_loop(
                     out = detector.update(value)
                     reps_for_angle = int(out.get("repCount", 0) or 0)
                     rep_counts_by_angle[angle_key] = reps_for_angle
-                    total_reps += reps_for_angle
                     if primary_angle == angle_key:
                         state_str = out.get("state", "—")
                         smoothed_value = out.get("smoothedValue")
@@ -736,7 +820,11 @@ def run_webcam_loop(
                             out.get("calibrationCertaintyTarget", cal_certainty_target)
                         )
                         primary_rep_count = reps_for_angle
-                rep_count = total_reps
+                counts = [int(rep_counts_by_angle.get(k, 0) or 0) for k in tracked_angles]
+                if tracking_mode == "dual" and len(counts) >= 2:
+                    rep_count = min(counts)
+                else:
+                    rep_count = primary_rep_count
                 run_state["detectors_by_angle"] = detectors_by_angle
                 run_state["rep_counts_by_angle"] = rep_counts_by_angle
             elif peak_detector is not None:
@@ -761,10 +849,26 @@ def run_webcam_loop(
                     f"Calibrating... reps {primary_rep_count}/{cal_target}  "
                     f"certainty {cal_certainty * 100:.0f}%/{cal_certainty_target * 100:.0f}%"
                 )
-            elif tracked_angles:
-                status = f"Tracking {len(tracked_angles)} limb(s)"
+            elif tracked_angles and tracking_mode == "dual":
+                status = "Tracking dual limbs (counting only matched reps)"
             else:
-                status = "Tracking"
+                status = "Tracking single limb (locked to calibrated side)"
+            if tracking_mode == "dual" and len(tracked_angles) >= 2:
+                ordered = sorted(
+                    [
+                        (k, int(rep_counts_by_angle.get(k, 0) or 0))
+                        for k in tracked_angles
+                    ],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                if ordered and ordered[0][1] != ordered[-1][1]:
+                    lead_key, lead_reps = ordered[0]
+                    lag_key, lag_reps = ordered[-1]
+                    status = (
+                        f"{status} - WARNING: {_format_angle_label(lag_key)} "
+                        f"is behind ({lag_reps} vs {lead_reps}); no extra matched rep counted"
+                    )
             # OpenCV fonts often mangle Unicode (e.g. >= and degree); use plain ASCII.
             if rolling_range is not None and not range_gate_open:
                 need = float(tuning_params.get("minRangeGate", get_default_tuning_params()["minRangeGate"]))
@@ -780,7 +884,17 @@ def run_webcam_loop(
                             f"need at least {need:.0f} deg"
                         )
             _draw_overlay(
-                frame_bgr, selected_angle, smoothed_value, shown_rep_count, state_str, status
+                frame_bgr,
+                selected_angle,
+                smoothed_value,
+                shown_rep_count,
+                state_str,
+                status,
+                {
+                    k: int(rep_counts_by_angle.get(k, 0) or 0)
+                    for k in tracked_angles
+                } if tracked_angles else None,
+                tracking_mode,
             )
             _draw_vm_benchmark_hud(
                 frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
