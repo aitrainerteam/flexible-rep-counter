@@ -30,14 +30,17 @@ from app.debug_console import (
 )
 from app.math_engine import (
     calculate_from_type,
-    calculate_variance,
     create_peak_detector,
     replay_angle_series_on_peak_detector,
-    smooth_angle_series,
 )
 from app.pose_filters import PoseFilterPipeline
 from app.skeleton_overlay import draw_skeleton
-from app.variance_angle_selector import COMMON_ANGLES, determine_best_angle
+from app.variance_angle_selector import (
+    COMMON_ANGLES,
+    compute_angle_variances_from_buffer,
+    determine_best_angle,
+    passes_consistent_variance_gate,
+)
 
 logger = get_logger(__name__)
 
@@ -103,52 +106,20 @@ def _format_angle_label(angle_key: str) -> str:
     return angle_key.replace("_", " ").title()
 
 
-def _compute_angle_series(frame_buffer: list[list[dict]], angle_key: str) -> list[Optional[float]]:
-    cfg = COMMON_ANGLES.get(angle_key)
-    if not cfg:
-        return []
-    return [
-        calculate_from_type(cfg["type"], cfg["landmarks"], lm)
-        for lm in frame_buffer
-    ]
-
-
-def _series_activity_stats(values: list[Optional[float]]) -> dict[str, float]:
-    valid = [float(v) for v in values if v is not None]
-    if len(valid) < 15:
-        return {"validSamples": float(len(valid)), "variance": 0.0, "range": 0.0}
-    smoothed = smooth_angle_series(valid, window=5)
-    var = float(calculate_variance(smoothed).get("variance") or 0.0)
-    rng = float(max(smoothed) - min(smoothed))
-    return {"validSamples": float(len(valid)), "variance": var, "range": rng}
-
-
 def _select_tracking_mode(
     primary_angle_key: str,
     frame_buffer: list[list[dict]],
-    tuning_params: dict[str, Any],
+    _tuning_params: dict[str, Any],
 ) -> tuple[list[str], str]:
     tracked = [primary_angle_key]
     counterpart = _counterpart_angle_key(primary_angle_key)
     if not counterpart:
         return tracked, "single"
 
-    primary_series = _compute_angle_series(frame_buffer, primary_angle_key)
-    counterpart_series = _compute_angle_series(frame_buffer, counterpart)
-    primary_stats = _series_activity_stats(primary_series)
-    counterpart_stats = _series_activity_stats(counterpart_series)
-    min_range_gate = float(tuning_params.get("minRangeGate", 15.0) or 0.0)
-    min_rom = max(14.0, min_range_gate * 0.85) if min_range_gate > 0 else 14.0
-    counterpart_active = (
-        counterpart_stats["validSamples"] >= 15
-        and counterpart_stats["variance"] >= 7.0
-        and counterpart_stats["range"] >= min_rom
-        and (
-            primary_stats["range"] <= 0
-            or counterpart_stats["range"] >= (primary_stats["range"] * 0.52)
-        )
-    )
-    if counterpart_active:
+    variances = compute_angle_variances_from_buffer(frame_buffer)
+    if passes_consistent_variance_gate(
+        variances, primary_angle_key
+    ) and passes_consistent_variance_gate(variances, counterpart):
         tracked.append(counterpart)
         return tracked, "dual"
     return tracked, "single"
@@ -922,10 +893,14 @@ def run_webcam_loop(
                 shown_rep_count,
                 state_str,
                 status,
-                {
-                    k: int(rep_counts_by_angle.get(k, 0) or 0)
-                    for k in tracked_angles
-                } if tracked_angles else None,
+                (
+                    {
+                        k: int(rep_counts_by_angle.get(k, 0) or 0)
+                        for k in tracked_angles
+                    }
+                    if tracked_angles and tracking_mode == "dual"
+                    else None
+                ),
                 tracking_mode,
             )
             _draw_vm_benchmark_hud(

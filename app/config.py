@@ -72,6 +72,10 @@ ANGLE_SELECTION_MIN_SEC = float(os.environ.get("ANGLE_SELECTION_MIN_SEC", "5.0")
 ANGLE_SELECTION_MIN_FRAMES = int(os.environ.get("ANGLE_SELECTION_MIN_FRAMES", "50"))
 ANGLE_SELECTION_MAX_BUFFER_FRAMES = int(os.environ.get("ANGLE_SELECTION_MAX_BUFFER_FRAMES", "400"))
 ANGLE_SELECTION_RETRY_INTERVAL_SEC = float(os.environ.get("ANGLE_SELECTION_RETRY_INTERVAL_SEC", "2.0"))
+# Variance selector gates (defaults; per-joint overrides: same name + _LEFT_ELBOW, _RIGHT_KNEE, etc.)
+ANGLE_SELECTION_MIN_VARIANCE = float(os.environ.get("ANGLE_SELECTION_MIN_VARIANCE", "6.0"))
+ANGLE_SELECTION_MIN_RANGE_DEG = float(os.environ.get("ANGLE_SELECTION_MIN_RANGE_DEG", "16.0"))
+ANGLE_SELECTION_SECOND_BEST_RATIO = float(os.environ.get("ANGLE_SELECTION_SECOND_BEST_RATIO", "1.15"))
 
 
 def get_default_tuning_params():
