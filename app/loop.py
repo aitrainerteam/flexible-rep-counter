@@ -47,6 +47,8 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
         range_min_samples=int(tp.get("rangeMinSamples", d["rangeMinSamples"])),
         delta_deadband_degrees=float(tp.get("angleDeltaDeadband", d["angleDeltaDeadband"])),
         calibration_reps=int(tp.get("calibrationReps", d["calibrationReps"])),
+        calibration_certainty=float(tp.get("calibrationCertainty", d["calibrationCertainty"])),
+        calibration_force_extra_reps=int(tp.get("calibrationForceExtraReps", d["calibrationForceExtraReps"])),
         min_rep_interval_ms=float(tp.get("minRepIntervalMs", d["minRepIntervalMs"])),
     )
 
@@ -699,6 +701,10 @@ def run_webcam_loop(
             d_tuning = get_default_tuning_params()
             calibration_complete = True
             cal_target = int(tuning_params.get("calibrationReps", d_tuning["calibrationReps"]))
+            cal_certainty_target = float(
+                tuning_params.get("calibrationCertainty", d_tuning["calibrationCertainty"])
+            )
+            cal_certainty = 0.0
             primary_rep_count = 0
             if detectors_by_angle:
                 primary_angle = selected_angle
@@ -725,6 +731,10 @@ def run_webcam_loop(
                         rolling_range = float(r) if r is not None else None
                         calibration_complete = bool(out.get("calibrationComplete", False))
                         cal_target = int(out.get("calibrationTargetReps", cal_target))
+                        cal_certainty = float(out.get("calibrationCertainty", 0.0) or 0.0)
+                        cal_certainty_target = float(
+                            out.get("calibrationCertaintyTarget", cal_certainty_target)
+                        )
                         primary_rep_count = reps_for_angle
                 rep_count = total_reps
                 run_state["detectors_by_angle"] = detectors_by_angle
@@ -740,9 +750,17 @@ def run_webcam_loop(
                 rolling_range = float(r) if r is not None else None
                 calibration_complete = bool(out.get("calibrationComplete", False))
                 cal_target = int(out.get("calibrationTargetReps", cal_target))
+                cal_certainty = float(out.get("calibrationCertainty", 0.0) or 0.0)
+                cal_certainty_target = float(
+                    out.get("calibrationCertaintyTarget", cal_certainty_target)
+                )
 
+            shown_rep_count = rep_count if calibration_complete else 0
             if not calibration_complete:
-                status = f"Calibrating... rep {primary_rep_count + 1}/{cal_target}"
+                status = (
+                    f"Calibrating... reps {primary_rep_count}/{cal_target}  "
+                    f"certainty {cal_certainty * 100:.0f}%/{cal_certainty_target * 100:.0f}%"
+                )
             elif tracked_angles:
                 status = f"Tracking {len(tracked_angles)} limb(s)"
             else:
@@ -762,7 +780,7 @@ def run_webcam_loop(
                             f"need at least {need:.0f} deg"
                         )
             _draw_overlay(
-                frame_bgr, selected_angle, smoothed_value, rep_count, state_str, status
+                frame_bgr, selected_angle, smoothed_value, shown_rep_count, state_str, status
             )
             _draw_vm_benchmark_hud(
                 frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues

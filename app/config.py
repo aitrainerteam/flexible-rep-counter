@@ -59,6 +59,11 @@ DEFAULT_RANGE_MIN_SAMPLES = int(os.environ.get("REP_RANGE_MIN_SAMPLES", "12"))
 DEFAULT_ANGLE_DELTA_DEADBAND = float(os.environ.get("REP_ANGLE_DELTA_DEADBAND", "0"))
 # First N reps: record peaks/valleys without margin checks, then lock averages for strict counting.
 DEFAULT_CALIBRATION_REPS = int(os.environ.get("REP_CALIBRATION_REPS", "3"))
+# Certainty threshold for locking calibrated peak/valley baselines (0..1).
+# Set to 0 to lock after min reps only (ignore certainty).
+DEFAULT_CALIBRATION_CERTAINTY = float(os.environ.get("REP_CALIBRATION_CERTAINTY", "0.5"))
+# After min reps, if certainty is still below threshold, lock after this many extra counted reps.
+DEFAULT_CALIBRATION_FORCE_EXTRA_REPS = int(os.environ.get("REP_CALIBRATION_FORCE_EXTRA_REPS", "2"))
 # Minimum time between counted reps (ms). 0 = disabled.
 DEFAULT_MIN_REP_INTERVAL_MS = float(os.environ.get("REP_MIN_INTERVAL_MS", "400"))
 
@@ -75,5 +80,7 @@ def get_default_tuning_params():
         "rangeMinSamples": DEFAULT_RANGE_MIN_SAMPLES,
         "angleDeltaDeadband": DEFAULT_ANGLE_DELTA_DEADBAND,
         "calibrationReps": DEFAULT_CALIBRATION_REPS,
+        "calibrationCertainty": DEFAULT_CALIBRATION_CERTAINTY,
+        "calibrationForceExtraReps": DEFAULT_CALIBRATION_FORCE_EXTRA_REPS,
         "minRepIntervalMs": DEFAULT_MIN_REP_INTERVAL_MS,
     }

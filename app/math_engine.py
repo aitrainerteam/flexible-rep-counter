@@ -135,6 +135,13 @@ def _rolling_spread_percentile(
     return float(np.percentile(arr, high_pct) - np.percentile(arr, low_pct))
 
 
+def _stddev(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.std(arr))
+
+
 class PeakDetector:
     """State machine: NEUTRAL -> GOING_UP/GOING_DOWN; peaks/valleys with hysteresis and min distance.
     First `calibration_reps` reps record peaks/valleys without margin checks; then averages are locked
@@ -159,6 +166,8 @@ class PeakDetector:
         range_percentile_high: float = 95.0,
         delta_deadband_degrees: float = 0.0,
         calibration_reps: int = 3,
+        calibration_certainty: float = 0.65,
+        calibration_force_extra_reps: int = 2,
         min_rep_interval_ms: float = 400.0,
     ):
         self.smoothing_factor = smoothing_factor
@@ -167,6 +176,8 @@ class PeakDetector:
         self.peak_margin = peak_margin
         self.valley_margin = valley_margin
         self.calibration_reps = max(1, int(calibration_reps))
+        self.calibration_certainty = max(0.0, min(1.0, float(calibration_certainty)))
+        self.calibration_force_extra_reps = max(0, int(calibration_force_extra_reps))
         self.min_rep_interval_ms = max(0.0, float(min_rep_interval_ms))
         self.min_range_gate_degrees = min_range_gate_degrees
         self.delta_deadband_degrees = max(0.0, float(delta_deadband_degrees))
@@ -194,13 +205,58 @@ class PeakDetector:
         self._calibrated_avg_valley: Optional[float] = None
         self._last_rep_time_ms: Optional[float] = None
 
+    def _calibration_stats(self) -> dict[str, float | None]:
+        if not self.peaks or not self.valleys:
+            return {
+                "avgPeak": None,
+                "avgValley": None,
+                "peakStd": None,
+                "valleyStd": None,
+                "certainty": 0.0,
+                "amplitude": None,
+            }
+        avg_peak = sum(self.peaks) / len(self.peaks)
+        avg_valley = sum(self.valleys) / len(self.valleys)
+        amplitude = avg_peak - avg_valley
+        if amplitude <= 0:
+            return {
+                "avgPeak": avg_peak,
+                "avgValley": avg_valley,
+                "peakStd": None,
+                "valleyStd": None,
+                "certainty": 0.0,
+                "amplitude": amplitude,
+            }
+        peak_std = _stddev(self.peaks)
+        valley_std = _stddev(self.valleys)
+        combined_jitter_ratio = (peak_std + valley_std) / max(amplitude, 1e-6)
+        # certainty=1 when extrema are very consistent relative to movement amplitude.
+        # Denominator 1.0 is more forgiving than 0.5 (small ROM / few samples still usable).
+        certainty = max(0.0, min(1.0, 1.0 - (combined_jitter_ratio / 1.0)))
+        return {
+            "avgPeak": avg_peak,
+            "avgValley": avg_valley,
+            "peakStd": peak_std,
+            "valleyStd": valley_std,
+            "certainty": certainty,
+            "amplitude": amplitude,
+        }
+
     def _maybe_lock_calibration(self) -> None:
         if self._calibrated:
             return
-        if self.rep_count >= self.calibration_reps:
+        if self.rep_count < self.calibration_reps:
+            return
+        stats = self._calibration_stats()
+        certainty = float(stats.get("certainty") or 0.0)
+        force_at = self.calibration_reps + self.calibration_force_extra_reps
+        # REP_CALIBRATION_CERTAINTY=0 disables certainty gate (lock on min reps only).
+        certainty_ok = self.calibration_certainty <= 0 or certainty >= self.calibration_certainty
+        force_ok = self.rep_count >= force_at
+        if certainty_ok or force_ok:
             self._calibrated = True
-            self._calibrated_avg_peak = sum(self.peaks) / len(self.peaks) if self.peaks else None
-            self._calibrated_avg_valley = sum(self.valleys) / len(self.valleys) if self.valleys else None
+            self._calibrated_avg_peak = float(stats["avgPeak"]) if stats.get("avgPeak") is not None else None
+            self._calibrated_avg_valley = float(stats["avgValley"]) if stats.get("avgValley") is not None else None
 
     def _pass_through_deadband(self, raw_value: float) -> float:
         """Hold previous angle when frame-to-frame change is below threshold; else accept new sample."""
@@ -240,6 +296,7 @@ class PeakDetector:
     def update(self, raw_value: Optional[float]) -> dict[str, Any]:
         if raw_value is None:
             self._last_debanded_pass = None
+            stats = self._calibration_stats()
             return {
                 "repCompleted": False,
                 "peak": None,
@@ -251,6 +308,8 @@ class PeakDetector:
                 "rangeGateOpen": self._last_range_gate_open,
                 "calibrationComplete": self._calibrated,
                 "calibrationTargetReps": self.calibration_reps,
+                "calibrationCertainty": float(stats.get("certainty") or 0.0),
+                "calibrationCertaintyTarget": self.calibration_certainty,
             }
 
         feed = self._pass_through_deadband(raw_value)
@@ -356,6 +415,7 @@ class PeakDetector:
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 
+        stats = self._calibration_stats()
         return {
             "repCompleted": rep_completed,
             "peak": detected_peak,
@@ -367,6 +427,8 @@ class PeakDetector:
             "rangeGateOpen": self._last_range_gate_open,
             "calibrationComplete": self._calibrated,
             "calibrationTargetReps": self.calibration_reps,
+            "calibrationCertainty": float(stats.get("certainty") or 0.0),
+            "calibrationCertaintyTarget": self.calibration_certainty,
         }
 
     def get_rep_count(self) -> int:
@@ -416,6 +478,8 @@ class PeakDetector:
             "currentValleyValue": self.current_valley_value,
             "calibrationComplete": self._calibrated,
             "calibrationTargetReps": self.calibration_reps,
+            "calibrationCertainty": float(self._calibration_stats().get("certainty") or 0.0),
+            "calibrationCertaintyTarget": self.calibration_certainty,
             "calibratedAvgPeak": self._calibrated_avg_peak,
             "calibratedAvgValley": self._calibrated_avg_valley,
         }
@@ -434,6 +498,8 @@ def create_peak_detector(
     range_percentile_high: float = 95.0,
     delta_deadband_degrees: float = 0.0,
     calibration_reps: int = 3,
+    calibration_certainty: float = 0.65,
+    calibration_force_extra_reps: int = 2,
     min_rep_interval_ms: float = 400.0,
 ) -> PeakDetector:
     return PeakDetector(
@@ -449,6 +515,8 @@ def create_peak_detector(
         range_percentile_high=range_percentile_high,
         delta_deadband_degrees=delta_deadband_degrees,
         calibration_reps=calibration_reps,
+        calibration_certainty=calibration_certainty,
+        calibration_force_extra_reps=calibration_force_extra_reps,
         min_rep_interval_ms=min_rep_interval_ms,
     )
 
