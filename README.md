@@ -1,15 +1,17 @@
 # Flexible Rep Counter
 
-AI-powered fitness rep counter using computer vision pose estimation. During startup it analyzes joint-angle motion to pick the limb that best matches your movement, then counts repetitions with peak/valley detection—no exercise name or preset required.
+AI-powered fitness rep counter using computer vision pose estimation. It analyzes joint-angle motion to pick the limb that best matches your movement, then counts repetitions with peak/valley detection—no exercise name or preset required.
 
 ## Architecture overview
 
-- **Webcam capture**: OpenCV frames, optional resize/JPEG tuning before upload.
-- **Pose inference**: YOLO pose on a remote VM; client in `app/vm_client.py` (health check, `/predict`-style endpoints, benchmarking hooks).
-- **Angle selection**: Variance-based scoring over a calibration window (`app/variance_angle_selector.py`), with smoothed angle series (`smooth_angle_series` in `app/math_engine.py`), minimum wall time and frame counts, retries, and per-joint variance/range gates so the chosen angle stays stable.
-- **Tracking mode**: Single- or dual-angle tracking from angle activity; overlay can show matched reps and per-angle counts.
-- **Rep counting**: `PeakDetector` in `app/math_engine.py` with hysteresis, margins, rolling range gate, calibration reps, **retroactive replay** of calibration angles through the detector, and **certainty-based locking** (with optional extra reps if certainty is low).
-- **UI**: OpenCV overlay for reps, state, calibration feedback, and debug info; optional debug console when `LOG_LEVEL=DEBUG`.
+- **Webcam capture**: OpenCV frames; optional resize/JPEG tuning before upload.
+- **Pose inference**: YOLO pose on a remote VM; client in [`app/vm_client.py`](app/vm_client.py) (`GET /health`, `POST /predict` multipart JPEG, benchmarking hooks).
+- **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
+- **Angle selection**: [`app/variance_angle_selector.py`](app/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` it may lock using the variance winner **only if** that winner matches the rep leader when any reps exist (so the idle arm does not get locked).
+- **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.
+- **Rep counting**: `PeakDetector` in [`app/math_engine.py`](app/math_engine.py)—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
+- **Docs**: See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full pipeline, call order, and math/selection details.
+- **UI**: OpenCV overlay; logs go to stderr when `LOG_LEVEL=DEBUG`.
 
 ## Python local app (webcam + VM)
 
@@ -30,17 +32,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (see `main.py`).
+Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (see [`main.py`](main.py)).
 
 ### Session flow
 
-- **Angle selection**: Collects motion for at least `ANGLE_SELECTION_MIN_SEC` and `ANGLE_SELECTION_MIN_FRAMES` (up to `ANGLE_SELECTION_MAX_BUFFER_FRAMES`), uses smoothed angles and variance/range gates; may retry on `ANGLE_SELECTION_RETRY_INTERVAL_SEC` if nothing passes.
-- **Calibration**: First reps establish peak/valley baselines; calibration data can be **replayed** through the peak detector so counts stay consistent with locked logic. Locking respects `REP_CALIBRATION_CERTAINTY` and, if needed, `REP_CALIBRATION_FORCE_EXTRA_REPS` after the minimum calibration reps.
-- **Tracking**: Counts peaks/valleys with margins, range gate, and `REP_MIN_INTERVAL_MS`; quit with `q` or Escape in the video window.
+1. **Angle selection**: Buffer frames (cap `ANGLE_SELECTION_MAX_BUFFER_FRAMES`) until `ANGLE_SELECTION_MIN_SEC` and `ANGLE_SELECTION_MIN_FRAMES` are met. Per-frame, lightweight peak detectors on all candidate angles feed **rep dominance** stats; variance/ROM gates pick a stable joint. Lock when dominance + variance agree for `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES`, or after `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` via pure variance selection if needed. Retries use `ANGLE_SELECTION_RETRY_INTERVAL_SEC`.
+2. **Calibration**: First reps establish peak/valley baselines; the buffer is **replayed** through the same detectors so displayed reps include motion from the selection window. Locking uses `REP_CALIBRATION_CERTAINTY` and optionally `REP_CALIBRATION_FORCE_EXTRA_REPS`.
+3. **Tracking**: Counts with margins, range gate, and `REP_MIN_INTERVAL_MS`. Quit with `q` or Escape in the video window.
 
 ## Configuration
 
-Create a `.env` in the project root. The app loads it automatically (`app/config.py`).
+Create a `.env` in the project root. The app loads it automatically ([`app/config.py`](app/config.py)).
 
 ### VM
 
@@ -78,33 +80,33 @@ At least one of `YOLO_VM_DIRECT_URL` or `YOLO_VM_TARGET_URL` must be set or the 
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ANGLE_SELECTION_MIN_SEC` | Minimum wall time for selection window | `5.0` |
-| `ANGLE_SELECTION_MIN_FRAMES` | Minimum frames in window | `50` |
+| `ANGLE_SELECTION_MIN_SEC` | Minimum wall time for selection window | `7.0` |
+| `ANGLE_SELECTION_MIN_FRAMES` | Minimum frames in window | `70` |
 | `ANGLE_SELECTION_MAX_BUFFER_FRAMES` | Cap on buffered frames | `400` |
 | `ANGLE_SELECTION_RETRY_INTERVAL_SEC` | Retry if gates not met | `2.0` |
-| `ANGLE_SELECTION_MIN_VARIANCE` | Min variance to accept a joint (global; per-joint overrides like `_LEFT_ELBOW` exist) | `6.0` |
+| `ANGLE_SELECTION_DOMINANCE_FRACTION` | Leader’s rep share must exceed this (strict `>` in code) | `~0.667` |
+| `ANGLE_SELECTION_MIN_LEADING_REPS` | Minimum reps on leader joint | `2` |
+| `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` | Frames dominance + variance must hold before lock | `36` |
+| `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` | After this many seconds, allow pure-variance lock | `14.0` |
+| `ANGLE_SELECTION_MIN_VARIANCE` | Min variance (global; per-joint: `_LEFT_ELBOW`, etc.) | `6.0` |
 | `ANGLE_SELECTION_MIN_RANGE_DEG` | Min observed range (°) for a candidate | `16.0` |
-| `ANGLE_SELECTION_SECOND_BEST_RATIO` | Second-best must be worse by this ratio | `1.15` |
+| `ANGLE_SELECTION_SECOND_BEST_RATIO` | Top candidate must beat runner-up by this ratio | `1.15` |
+| `ANGLE_SELECTION_MIN_ACTIVE_WINDOWS` | Active variance windows required (see code) | `4` |
+| `ANGLE_SELECTION_SMOOTH_WINDOW` | Smoothing window for selection series | `5` |
 
 ### Debugging
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `DEBUG` |
-| `DEBUG_CONSOLE_ENABLED` | Second debug window | on when `LOG_LEVEL=DEBUG` |
 
-### VM API
+When `LOG_LEVEL=DEBUG`, extra log lines are written to stderr (see [`app/debug_console.py`](app/debug_console.py)).
 
-The client POSTs JSON `{"image": "<base64-jpeg>"}`. It tries the base URL and paths `/predict`, `/infer`, `/pose`. Responses should include COCO-17-style keypoints (`x`, `y`, confidence or equivalent).
+### VM API (client contract)
 
----
+The client sends **`POST {base_url}/predict`** with multipart form field **`file`** = JPEG bytes (`image/jpeg`). The JSON response should include top-level `inference_ms` (optional) and either:
 
-## Recent commits (last 5)
+- `person_*` objects with `keypoints` as a dict of COCO-style names → `{x, y, conf|confidence}`, or  
+- a structure parseable by [`_parse_keypoints`](app/vm_client.py) (see that function for supported shapes).
 
-| Commit | Summary |
-|--------|---------|
-| `df37d11` | Angle selection: new variance/range thresholds in config; loop uses consistent variance gates; `variance_angle_selector` refactored with angle-specific thresholds and stronger variance logic. |
-| `a92f54a` | Angle selection timing and frame requirements; smoothed angle series in `math_engine`; loop uses retries and smoother series; variance selector uses smoothed data and tuned thresholds. |
-| `3b98c32` | Angle series and activity stats; `_select_tracking_mode` for single vs dual tracking; overlay shows matched reps and per-angle rep counts. |
-| `4aa610d` | `REP_CALIBRATION_CERTAINTY` and `REP_CALIBRATION_FORCE_EXTRA_REPS`; `PeakDetector` certainty and extra-rep locking; calibration status reflects certainty. |
-| `65e15b5` | Retroactive rep counting via `replay_angle_series_on_peak_detector`; calibration replay through peak detectors for consistent state. |
+Keypoints are converted to a list of 17 `{x, y, confidence}` entries in COCO order for local angle math.

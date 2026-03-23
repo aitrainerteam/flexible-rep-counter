@@ -39,7 +39,7 @@ PREDICT_VALIDATE_RESPONSE = os.environ.get("PREDICT_VALIDATE_RESPONSE", "1").str
     "no",
 )
 
-# Debug console (second window); LOG_LEVEL=DEBUG for dev (default), set LOG_LEVEL=INFO to disable
+# Logging: LOG_LEVEL=DEBUG adds verbose stderr output (default). Set LOG_LEVEL=INFO to reduce noise.
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
 DEBUG_CONSOLE_ENABLED = LOG_LEVEL == "DEBUG"
 
@@ -68,10 +68,18 @@ DEFAULT_CALIBRATION_FORCE_EXTRA_REPS = int(os.environ.get("REP_CALIBRATION_FORCE
 DEFAULT_MIN_REP_INTERVAL_MS = float(os.environ.get("REP_MIN_INTERVAL_MS", "400"))
 
 # Angle / limb selection (before rep calibration): wall time + samples so the user can move through real reps.
-ANGLE_SELECTION_MIN_SEC = float(os.environ.get("ANGLE_SELECTION_MIN_SEC", "5.0"))
-ANGLE_SELECTION_MIN_FRAMES = int(os.environ.get("ANGLE_SELECTION_MIN_FRAMES", "50"))
+ANGLE_SELECTION_MIN_SEC = float(os.environ.get("ANGLE_SELECTION_MIN_SEC", "7.0"))
+ANGLE_SELECTION_MIN_FRAMES = int(os.environ.get("ANGLE_SELECTION_MIN_FRAMES", "70"))
 ANGLE_SELECTION_MAX_BUFFER_FRAMES = int(os.environ.get("ANGLE_SELECTION_MAX_BUFFER_FRAMES", "400"))
 ANGLE_SELECTION_RETRY_INTERVAL_SEC = float(os.environ.get("ANGLE_SELECTION_RETRY_INTERVAL_SEC", "2.0"))
+# Leader must account for more than this fraction of counted reps across all joints (strict inequality in code).
+ANGLE_SELECTION_DOMINANCE_FRACTION = float(os.environ.get("ANGLE_SELECTION_DOMINANCE_FRACTION", str(2.0 / 3.0)))
+# Require at least this many counted reps on the leading joint (repeated movement, not a single blip).
+ANGLE_SELECTION_MIN_LEADING_REPS = int(os.environ.get("ANGLE_SELECTION_MIN_LEADING_REPS", "2"))
+# Consecutive frames the dominance + variance conditions must hold before locking (reduces abrupt switches).
+ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES = int(os.environ.get("ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES", "36"))
+# If rep-dominance never clears (e.g. symmetric motion), fall back to variance winner after this many seconds (with ready frames).
+ANGLE_SELECTION_VARIANCE_FALLBACK_SEC = float(os.environ.get("ANGLE_SELECTION_VARIANCE_FALLBACK_SEC", "14.0"))
 # Variance selector gates (defaults; per-joint overrides: same name + _LEFT_ELBOW, _RIGHT_KNEE, etc.)
 ANGLE_SELECTION_MIN_VARIANCE = float(os.environ.get("ANGLE_SELECTION_MIN_VARIANCE", "6.0"))
 ANGLE_SELECTION_MIN_RANGE_DEG = float(os.environ.get("ANGLE_SELECTION_MIN_RANGE_DEG", "16.0"))

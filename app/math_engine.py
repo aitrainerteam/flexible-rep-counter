@@ -13,7 +13,6 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 MIN_VARIANCE_THRESHOLD = 5.0
-RULE_EVALUATION_MIN_CONFIDENCE = 0.3
 
 # -----------------------------------------------------------------------------
 # Geometry

@@ -11,7 +11,6 @@ from app.config import (
     get_default_tuning_params,
 )
 from app.math_engine import (
-    MIN_VARIANCE_THRESHOLD,
     calculate_from_type,
     calculate_variance,
     compute_consistent_variance_score,
@@ -43,9 +42,54 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
 LOW_CONFIDENCE_THRESHOLD = 0.5
 FRAME_MIN_CONFIDENCE = 0.5
 # Require several time segments with real variance (not one accidental spike or jitter).
-MIN_ACTIVE_WINDOWS = 3
+MIN_ACTIVE_WINDOWS = int(os.environ.get("ANGLE_SELECTION_MIN_ACTIVE_WINDOWS", "4"))
 SMOOTH_WINDOW = int(os.environ.get("ANGLE_SELECTION_SMOOTH_WINDOW", "5"))
 ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
+
+
+def _angle_side(angle_key: str) -> str:
+    if angle_key.startswith("LEFT_"):
+        return "LEFT"
+    if angle_key.startswith("RIGHT_"):
+        return "RIGHT"
+    return ""
+
+
+def _angle_base(angle_key: str) -> str:
+    base = angle_key
+    if base.startswith("LEFT_"):
+        base = base[len("LEFT_") :]
+    elif base.startswith("RIGHT_"):
+        base = base[len("RIGHT_") :]
+    if base.endswith("_ACROSS"):
+        base = base[: -len("_ACROSS")]
+    return base
+
+
+def angle_keys_compatible(a: Optional[str], b: Optional[str]) -> bool:
+    """True when angle keys are the same logical limb/joint family."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    side_a, side_b = _angle_side(a), _angle_side(b)
+    if side_a and side_b and side_a != side_b:
+        return False
+    return _angle_base(a) == _angle_base(b)
+
+
+def _exercise_looks_isometric(exercise: Optional[dict[str, Any]]) -> bool:
+    """True when caller passed exercise metadata indicating a static hold (optional API)."""
+    if not exercise:
+        return False
+    if exercise.get("isIsometric") is True:
+        return True
+    if (exercise.get("category") or "").lower() == "core" and "isometric" in (
+        (exercise.get("description") or "").lower()
+    ):
+        return True
+    name = (exercise.get("name") or "").lower()
+    return any(x in name for x in ("plank", "hold", "isometric"))
 
 
 def _angle_selection_thresholds(angle_key: str) -> dict[str, float]:
@@ -109,6 +153,55 @@ def compute_angle_variances_from_buffer(
 
 # Backwards-compatible name for internal use
 _calculate_all_variances = compute_angle_variances_from_buffer
+
+
+def summarize_rep_dominance(rep_counts: dict[str, int]) -> dict[str, Any]:
+    """Rep distribution across joints during selection (only joints with rep_count > 0)."""
+    positive = {k: int(v) for k, v in rep_counts.items() if int(v) > 0}
+    total = sum(positive.values())
+    if total <= 0 or not positive:
+        return {
+            "totalReps": 0,
+            "leaderKey": None,
+            "leaderReps": 0,
+            "leaderShare": 0.0,
+        }
+    leader_key = max(positive.keys(), key=lambda k: positive[k])
+    leader_reps = positive[leader_key]
+    return {
+        "totalReps": total,
+        "leaderKey": leader_key,
+        "leaderReps": leader_reps,
+        "leaderShare": leader_reps / total,
+    }
+
+
+def dominance_conditions_met(
+    variances: dict[str, dict[str, Any]],
+    rep_dom: dict[str, Any],
+    *,
+    dominance_fraction: float,
+    min_leading_reps: int,
+) -> bool:
+    """
+    True when one joint leads rep count by more than `dominance_fraction` of total reps, has at least
+    `min_leading_reps` reps, passes the same variance/ROM gate used for selection, and matches the
+    variance top candidate when one exists (avoids locking to rep noise on the wrong limb).
+    """
+    leader_key = rep_dom.get("leaderKey")
+    if not leader_key or rep_dom.get("totalReps", 0) <= 0:
+        return False
+    share = float(rep_dom.get("leaderShare") or 0.0)
+    if share <= dominance_fraction:
+        return False
+    if int(rep_dom.get("leaderReps") or 0) < min_leading_reps:
+        return False
+    if not passes_consistent_variance_gate(variances, leader_key):
+        return False
+    top = _get_top_candidate(variances)
+    if top is not None and not angle_keys_compatible(str(top.get("key")), str(leader_key)):
+        return False
+    return True
 
 
 def passes_consistent_variance_gate(
@@ -192,17 +285,7 @@ def determine_best_angle(
     if not frame_buffer or len(frame_buffer) < 40:
         return default_result
 
-    is_isometric = bool(
-        (exercise or {}).get("isIsometric") is True
-        or (
-            (exercise or {}).get("category", "").lower() == "core"
-            and "isometric" in ((exercise or {}).get("description") or "").lower()
-        )
-        or any(
-            x in ((exercise or {}).get("name") or "").lower()
-            for x in ("plank", "hold", "isometric")
-        )
-    )
+    is_isometric = _exercise_looks_isometric(exercise)
 
     variances = _calculate_all_variances(frame_buffer)
     debug["variances"] = {

@@ -23,12 +23,17 @@ DEFAULT_LINE_THICKNESS = 2
 DEFAULT_POINT_RADIUS = 4
 
 
-def _get_xy(kp: dict, frame_shape: Optional[tuple] = None) -> Optional[tuple[int, int]]:
+def _get_xy(
+    kp: dict,
+    frame_shape: Optional[tuple] = None,
+    *,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> Optional[tuple[int, int]]:
     """Return (x, y) as integers; optionally clamp to frame. Returns None if low confidence."""
     x = kp.get("x")
     y = kp.get("y")
     conf = kp.get("confidence", 0.0)
-    if x is None or y is None or conf < DEFAULT_CONFIDENCE_THRESHOLD:
+    if x is None or y is None or conf < confidence_threshold:
         return None
     ix, iy = int(round(x)), int(round(y))
     if frame_shape and len(frame_shape) >= 2:
@@ -54,15 +59,15 @@ def draw_skeleton(
     """
     if not landmarks or len(landmarks) < 17:
         return
-    h, w = frame.shape[:2]
+    fs = frame.shape
 
     for (i, j) in SKELETON_CONNECTIONS:
-        pt1 = _get_xy(landmarks[i], frame.shape)
-        pt2 = _get_xy(landmarks[j], frame.shape)
+        pt1 = _get_xy(landmarks[i], fs, confidence_threshold=confidence_threshold)
+        pt2 = _get_xy(landmarks[j], fs, confidence_threshold=confidence_threshold)
         if pt1 and pt2:
             cv2.line(frame, pt1, pt2, line_color, line_thickness, cv2.LINE_AA)
 
     for kp in landmarks:
-        pt = _get_xy(kp, frame.shape)
+        pt = _get_xy(kp, fs, confidence_threshold=confidence_threshold)
         if pt:
             cv2.circle(frame, pt, point_radius, point_color, -1, cv2.LINE_AA)
