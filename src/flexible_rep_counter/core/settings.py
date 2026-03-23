@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from ipaddress import ip_address
 from typing import Any, Optional
+from urllib.parse import urlparse, urlunparse
 
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _env_path = _ROOT / ".env"
@@ -114,16 +116,54 @@ def _pick_int(env_key: str, toml_path: tuple[str, ...], default: int) -> int:
     return default
 
 
+def _vm_netloc_host_port(hostname: str, port: int) -> str:
+    """netloc as host:port or [ipv6]:port for urllib."""
+    try:
+        if ip_address(hostname).version == 6:
+            return f"[{hostname}]:{port}"
+    except ValueError:
+        pass
+    return f"{hostname}:{port}"
+
+
+def _normalize_vm_base_url(url: str) -> str:
+    """
+    requests-compatible base URL for yolo-deploy (HTTP on 8000 by default).
+    - Bare host or host:port → http://…; if no port, use 8000.
+    - http://host with no port → http://host:8000 (http default 80 is wrong for this stack).
+    https:// without port is unchanged (443).
+    """
+    s = url.strip().rstrip("/")
+    if not s:
+        return s
+    p = urlparse(s)
+    if p.scheme:
+        if p.scheme == "http" and p.hostname is not None and p.port is None:
+            netloc = _vm_netloc_host_port(p.hostname, 8000)
+            out = urlunparse(("http", netloc, p.path, p.params, p.query, p.fragment))
+            return out.rstrip("/") or out
+        return s
+    synthetic = f"http://{s}"
+    p2 = urlparse(synthetic)
+    if p2.port is not None:
+        return synthetic
+    if p2.hostname is None:
+        return synthetic
+    netloc = _vm_netloc_host_port(p2.hostname, 8000)
+    out = urlunparse(("http", netloc, p2.path, p2.params, p2.query, p2.fragment))
+    return out.rstrip("/") or out
+
+
 def _pick_vm_url() -> Optional[str]:
     for k in ("YOLO_VM_DIRECT_URL", "YOLO_VM_TARGET_URL"):
         e = _env_val(k)
         if e is not None:
-            return e
+            return _normalize_vm_base_url(e)
     t = _toml_val("vm", "direct_url")
     if isinstance(t, str):
         s = t.strip()
         if s:
-            return s
+            return _normalize_vm_base_url(s)
     return None
 
 

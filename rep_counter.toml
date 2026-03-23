@@ -4,7 +4,8 @@
 
 [vm]
 # YOLO pose API base URL (same as YOLO_VM_DIRECT_URL / YOLO_VM_TARGET_URL).
-direct_url = "http://127.0.0.1:8000"
+# Production VM (GCE): fixed external NAT; yolo-deploy listens on 8000.
+direct_url = "http://34.95.128.222:8000"
 
 [rep]
 # Wider margins = reps still count if later ROM is a bit shy of calibration peaks/valleys.
@@ -12,7 +13,7 @@ peak_margin = 18
 valley_margin = 16
 hysteresis = 8
 calibration_reps = 3
-min_interval_ms = 300
+min_interval_ms = 600
 
 # Per joint: keys match COMMON_ANGLES (e.g. LEFT_ELBOW). Omitted fields use global angle_selection.* defaults.
 [angle_selection.joints.LEFT_ELBOW]

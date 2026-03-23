@@ -25,7 +25,6 @@ from flexible_rep_counter.core.settings import (
 )
 from flexible_rep_counter.core.variance_angle_selector import (
     COMMON_ANGLES,
-    angle_keys_compatible,
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
@@ -359,18 +358,15 @@ class RepCounterSession:
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
                 src = str(result.get("source") or "")
-                total_rep_events = int(rep_dom.get("totalReps") or 0)
-                limb_aligned = (
-                    total_rep_events == 0
-                    or leader_key is None
-                    or angle_keys_compatible(sel, leader_key)
-                )
+                # Variance fallback must not be gated on rep-dominance leader: selection-phase
+                # PeakDetectors often spike on the wrong joint (e.g. RIGHT_KNEE noise) while
+                # median-window variance still picks the moving limb. Requiring
+                # angle_keys_compatible(sel, leader_key) caused permanent "selecting" deadlock.
                 variance_ok = (
                     sel
                     and sel in COMMON_ANGLES
                     and src == "variance"
                     and variance_fallback_ready
-                    and limb_aligned
                 )
                 if variance_ok:
                     _apply_locked_tracking(
