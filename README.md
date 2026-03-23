@@ -9,9 +9,27 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 - **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
 - **Angle selection**: [`app/variance_angle_selector.py`](app/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` it may lock using the variance winner **only if** that winner matches the rep leader when any reps exist (so the idle arm does not get locked).
 - **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.
-- **Rep counting**: `PeakDetector` in [`app/math_engine.py`](app/math_engine.py)—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
+- **Rep counting**: `PeakDetector` in [`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py) (also re-exported from [`app/math_engine.py`](app/math_engine.py))—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
+- **Importable package**: Core logic lives under [`src/flexible_rep_counter/`](src/flexible_rep_counter/). OpenCV UI is in [`visualizer/opencv_runtime.py`](visualizer/opencv_runtime.py) (repo-only; run via [`main.py`](main.py)).
 - **Docs**: See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full pipeline, call order, and math/selection details.
 - **UI**: OpenCV overlay; logs go to stderr when `LOG_LEVEL=DEBUG`.
+
+## Use as a library (other projects)
+
+```bash
+pip install -e ".[viz]"   # from this repo root; [viz] adds OpenCV + requests for the demo app
+```
+
+```python
+from flexible_rep_counter import RepCounterSession, keypoints_numpy_to_landmarks
+
+session = RepCounterSession(auto_started=True, use_pose_filter=False)
+landmarks = keypoints_numpy_to_landmarks(keypoints_np)  # (17, 3) float array
+step = session.step_landmarks(landmarks, timestamp_ms=...)
+# step.reps, step.tracked_joint, step.angle_3_point_value, step.avg_peak, step.avg_valley, ...
+```
+
+**ai-personal-trainer** (sibling checkout): `pyproject.toml` includes an editable `flexible-rep-counter` path dependency; run `uv sync` or `pip install -e ../flexible-rep-counter` if needed.
 
 ## Python local app (webcam + VM)
 
@@ -24,6 +42,7 @@ cd /path/to/flexible-rep-counter
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e .          # register the flexible_rep_counter package (needed for app shims)
 ```
 
 ### Run

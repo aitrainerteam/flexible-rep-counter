@@ -31,7 +31,7 @@ Only one frame is queued at a time (`Queue(maxsize=1)`), so the VM always sees a
 
 ## Entry and runtime setup
 
-1. **`main.main()`** ([`main.py`](main.py)) parses CLI args and calls **`run_webcam_loop`** ([`app/loop.py`](app/loop.py)).
+1. **`main.main()`** ([`main.py`](main.py)) parses CLI args and calls **`run_webcam_loop`** ([`visualizer/opencv_runtime.py`](visualizer/opencv_runtime.py)).
 2. **`run_webcam_loop`**
    - Loads tuning via **`get_default_tuning_params()`** ([`app/config.py`](app/config.py)).
    - Optionally **`check_vm_health`** ([`app/vm_client.py`](app/vm_client.py)) → `GET {base}/health`.

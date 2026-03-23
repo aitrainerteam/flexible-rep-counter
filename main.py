@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """Entrypoint for local rep counter: webcam -> VM pose -> rep count overlay."""
+from __future__ import annotations
+
 import argparse
 import sys
+from pathlib import Path
+
+# Repo dev layout: allow `python main.py` without a prior `pip install -e .`
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.is_dir():
+    sp = str(_SRC)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
 
 from app.config import YOLO_VM_TARGET_URL
-from app.loop import run_webcam_loop
+from visualizer.opencv_runtime import run_webcam_loop
 
 
 def main() -> None:
