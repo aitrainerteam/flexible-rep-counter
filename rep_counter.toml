@@ -1,0 +1,40 @@
+# Rep counter tuning (tracked). Edit here instead of .env for these keys.
+# Precedence: environment variables > this file > built-in defaults.
+# Optional: set FLEXIBLE_REP_COUNTER_CONFIG to an absolute path to use another file.
+
+[vm]
+# YOLO pose API base URL (same as YOLO_VM_DIRECT_URL / YOLO_VM_TARGET_URL).
+direct_url = "http://127.0.0.1:8000"
+
+[rep]
+# Wider margins = reps still count if later ROM is a bit shy of calibration peaks/valleys.
+peak_margin = 18
+valley_margin = 16
+hysteresis = 8
+calibration_reps = 3
+min_interval_ms = 300
+
+# Per joint: keys match COMMON_ANGLES (e.g. LEFT_ELBOW). Omitted fields use global angle_selection.* defaults.
+[angle_selection.joints.LEFT_ELBOW]
+min_variance = 4
+min_range_deg = 10
+
+[angle_selection.joints.RIGHT_ELBOW]
+min_variance = 4
+min_range_deg = 10
+
+[angle_selection.joints.LEFT_KNEE]
+min_variance = 6
+min_range_deg = 15
+
+[angle_selection.joints.RIGHT_KNEE]
+min_variance = 6
+min_range_deg = 15
+
+[angle_selection.joints.LEFT_HIP]
+min_variance = 6
+min_range_deg = 15
+
+[angle_selection.joints.RIGHT_HIP]
+min_variance = 6
+min_range_deg = 15

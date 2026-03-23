@@ -35,6 +35,30 @@ from app.skeleton_overlay import draw_skeleton
 
 logger = get_logger(__name__)
 
+# #region agent log
+_AGENT_DEBUG_LOG = "/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-0f69d6.log"
+
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    import json
+
+    payload = {
+        "sessionId": "0f69d6",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _df:
+            _df.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
+
+
+# #endregion
+
 OVERLAY_FONT = cv2.FONT_HERSHEY_DUPLEX  # Bold, readable
 OVERLAY_SCALE = 0.7
 OVERLAY_THICKNESS = 2
@@ -50,11 +74,13 @@ OVERLAY_BOX_ALPHA = 0.6
 
 # Start button: green when idle, yellow for a few seconds after click
 # Min size so button stays clickable when window is small; scale up on large frames
-BUTTON_W_MIN = 80
-BUTTON_H_MIN = 36
-BUTTON_W = 120
-BUTTON_H = 44
-BUTTON_MARGIN = 12
+BUTTON_W_MIN = 120
+BUTTON_H_MIN = 48
+BUTTON_W = 168
+BUTTON_H = 56
+BUTTON_MARGIN = 14
+# Extra hit slop in image pixels (HighGUI backends differ on mouse coordinate space)
+START_HIT_PAD = 18
 BUTTON_COLOR = (60, 180, 80)
 BUTTON_COLOR_JUST_CLICKED = (0, 255, 255)  # Yellow (BGR) for a few seconds after click
 BUTTON_TEXT_COLOR = (0, 0, 0)  # Black, caps, bold
@@ -140,37 +166,110 @@ def _window_to_image_coords(state: dict[str, Any], win_x: int, win_y: int) -> tu
     return (max(0, min(frame_w - 1, img_x)), max(0, min(frame_h - 1, img_y)))
 
 
+def _hit_in_rect(x: int, y: int, rx: int, ry: int, rw: int, rh: int) -> bool:
+    return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+
+def _padded_button_rect(
+    rx: int, ry: int, rw: int, rh: int, frame_h: int, frame_w: int
+) -> tuple[int, int, int, int]:
+    pad = START_HIT_PAD
+    x1 = max(0, rx - pad)
+    y1 = max(0, ry - pad)
+    x2 = min(frame_w - 1, rx + rw + pad)
+    y2 = min(frame_h - 1, ry + rh + pad)
+    return (x1, y1, max(0, x2 - x1), max(0, y2 - y1))
+
+
+def _start_button_hit(state: dict[str, Any], x: int, y: int) -> bool:
+    """True if (x,y) hits the Start button. Tries image-space, scaled window-space, and mapped rect."""
+    rect = state.get("button_rect", (0, 0, 0, 0))
+    rx, ry, rw, rh = rect
+    fs = state.get("frame_shape", (0, 0))
+    if len(fs) < 2 or fs[0] <= 0 or fs[1] <= 0:
+        return False
+    fh, fw = int(fs[0]), int(fs[1])
+    px, py, pw, ph = _padded_button_rect(rx, ry, rw, rh, fh, fw)
+    # 0) Some backends pass mouse coords already in image space (matches drawn button)
+    if _hit_in_rect(x, y, px, py, pw, ph):
+        return True
+    img_x, img_y = _window_to_image_coords(state, x, y)
+    if _hit_in_rect(img_x, img_y, px, py, pw, ph):
+        return True
+    display = _get_display_scale_and_offset(state)
+    if display is not None:
+        scale, offset_x, offset_y, _ = display
+        bx1 = offset_x + px * scale
+        by1 = offset_y + py * scale
+        bx2 = offset_x + (px + pw) * scale
+        by2 = offset_y + (py + ph) * scale
+        if bx1 <= x <= bx2 and by1 <= y <= by2:
+            return True
+    return False
+
+
+def _trigger_start_toggle(run_state: dict[str, Any]) -> None:
+    rs = run_state.get("rep_session")
+    if not isinstance(rs, RepCounterSession):
+        return
+    if not run_state.get("started", False):
+        run_state["started"] = True
+        run_state["started_at"] = time.time()
+        rs.set_started(run_state["started_at"])
+    else:
+        rs.clear_tracking_keep_started()
+
+
 def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) -> None:
     if event != cv2.EVENT_LBUTTONDOWN:
         return
     state = param
     rect = state.get("button_rect", (0, 0, 0, 0))
     rx, ry, rw, rh = rect
-    in_rect = False
-    # 1) Hit-test in image coordinates (window-relative conversion)
     img_x, img_y = _window_to_image_coords(state, x, y)
-    in_rect = rx <= img_x <= rx + rw and ry <= img_y <= ry + rh
-    if not in_rect:
-        # 2) Hit-test in window coordinates: map button rect to display rect
-        display = _get_display_scale_and_offset(state)
-        if display is not None:
-            scale, offset_x, offset_y, _ = display
-            bx1 = offset_x + rx * scale
-            by1 = offset_y + ry * scale
-            bx2 = offset_x + (rx + rw) * scale
-            by2 = offset_y + (ry + rh) * scale
-            in_rect = bx1 <= x <= bx2 and by1 <= y <= by2
+    fs = state.get("frame_shape", (0, 0))
+    fh, fw = (int(fs[0]), int(fs[1])) if len(fs) >= 2 else (0, 0)
+    px, py, pw, ph = _padded_button_rect(rx, ry, rw, rh, fh, fw) if fw > 0 and fh > 0 else (0, 0, 0, 0)
+    in_direct = _hit_in_rect(x, y, px, py, pw, ph) if pw > 0 else False
+    in_mapped_img = _hit_in_rect(img_x, img_y, px, py, pw, ph) if pw > 0 else False
+    display = _get_display_scale_and_offset(state)
+    in_rect_win = False
+    if display is not None and pw > 0:
+        sc, ox, oy, _ = display
+        bx1, bx2 = ox + px * sc, ox + (px + pw) * sc
+        by1, by2 = oy + py * sc, oy + (py + ph) * sc
+        in_rect_win = bx1 <= x <= bx2 and by1 <= y <= by2
+    in_rect = _start_button_hit(state, x, y)
+    # #region agent log
+    _rect_dbg = None
+    try:
+        _rect_dbg = list(cv2.getWindowImageRect("Rep Counter"))
+    except Exception:
+        _rect_dbg = None
+    _agent_dbg(
+        "H1",
+        "opencv_runtime.py:_on_mouse",
+        "lbutton_down",
+        {
+            "win_xy": [x, y],
+            "img_xy": [img_x, img_y],
+            "button_rect": [rx, ry, rw, rh],
+            "hit_pad_rect": [px, py, pw, ph],
+            "frame_shape": list(state.get("frame_shape", ())),
+            "display_is_none": display is None,
+            "display": list(display) if display is not None else None,
+            "in_direct": in_direct,
+            "in_rect_img": in_mapped_img,
+            "in_rect_win": in_rect_win,
+            "in_rect_final": in_rect,
+            "win_image_rect": _rect_dbg,
+            "started": bool(state.get("started")),
+        },
+    )
+    # #endregion
     if not in_rect:
         return
-    rs = state.get("rep_session")
-    if not isinstance(rs, RepCounterSession):
-        return
-    if not state.get("started", False):
-        state["started"] = True
-        state["started_at"] = time.time()
-        rs.set_started(state["started_at"])
-    else:
-        rs.clear_tracking_keep_started()
+    _trigger_start_toggle(state)
 
 
 def _draw_transparent_box(frame: Any, x1: int, y1: int, x2: int, y2: int) -> None:
@@ -342,6 +441,9 @@ def _draw_overlay(frame: Any, step: StepResult) -> None:
     )
     td = (step.tracking_detail_message or "").strip()
     show_td = bool(td and td != step.status_message)
+    sel_dbg = step.selection_debug or {}
+    rep_dom_sel = sel_dbg.get("rep_dom") if isinstance(sel_dbg, dict) else None
+    show_sel_pulses = step.phase == "selecting" and isinstance(rep_dom_sel, dict)
     lines = 4
     if step.tracked_joint:
         lines += 1
@@ -350,6 +452,8 @@ def _draw_overlay(frame: Any, step: StepResult) -> None:
     if show_rom:
         lines += 1
     if show_td:
+        lines += 1
+    if show_sel_pulses:
         lines += 1
     box_x2 = min(frame.shape[1] - margin, 620)
     box_y2 = box_y1 + lines * line_height + 8
@@ -389,6 +493,8 @@ def _draw_overlay(frame: Any, step: StepResult) -> None:
     rep_line = f"Reps: {step.reps}"
     if not step.calibration_complete:
         rep_line += f"  (cal {step.reps_raw}/{step.calibration_target_reps})"
+    if show_sel_pulses:
+        rep_line += "  — locked reps after angle is chosen"
     _put_text_readable(
         frame,
         rep_line,
@@ -399,6 +505,20 @@ def _draw_overlay(frame: Any, step: StepResult) -> None:
         OVERLAY_THICKNESS,
     )
     y += line_height
+    if show_sel_pulses:
+        tr = int(rep_dom_sel.get("totalReps") or 0)
+        lk = rep_dom_sel.get("leaderKey")
+        lk_s = str(lk) if lk else "—"
+        _put_text_readable(
+            frame,
+            f"Motion pulses (all joints): {tr}  leader: {lk_s}",
+            (margin, y),
+            OVERLAY_FONT,
+            0.52,
+            OVERLAY_COLOR_DIM,
+            2,
+        )
+        y += line_height
     _put_text_readable(
         frame,
         f"State: {step.peak_detector_state}",
@@ -472,6 +592,7 @@ def run_webcam_loop(
         "rep_session": rep_session,
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
+        "debug_frame_i": 0,
     }
     cv2.namedWindow("Rep Counter", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Rep Counter", _on_mouse, run_state)
@@ -569,7 +690,7 @@ def run_webcam_loop(
                 cx, cy = 10, frame_bgr.shape[0] // 2
                 _draw_transparent_box(frame_bgr, cx - 4, cy - 28, cx + 280, cy + 12)
                 _put_text_readable(
-                    frame_bgr, "Click Start to begin",
+                    frame_bgr, "Click START or press Space to begin",
                     (cx, cy),
                     OVERLAY_FONT, 0.7, OVERLAY_COLOR, 2,
                 )
@@ -578,6 +699,8 @@ def run_webcam_loop(
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
                     break
+                if key == ord(" "):
+                    _trigger_start_toggle(run_state)
                 continue
 
             try:
@@ -604,15 +727,43 @@ def run_webcam_loop(
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
                     break
+                if key == ord(" "):
+                    _trigger_start_toggle(run_state)
                 continue
 
             disp_h, disp_w = frame_bgr.shape[0], frame_bgr.shape[1]
+            sent_ok = isinstance(sent_hw, tuple) and len(sent_hw) >= 2
             raw_scaled = scale_landmarks_to_display(
                 raw_landmarks,
-                sent_hw if isinstance(sent_hw, tuple) else None,
+                sent_hw if sent_ok else None,
                 (disp_h, disp_w),
             )
             step = rs_sess.step_landmarks(raw_scaled, timestamp_ms=timestamp_ms)
+            # #region agent log
+            run_state["debug_frame_i"] = int(run_state.get("debug_frame_i", 0)) + 1
+            _dfi = run_state["debug_frame_i"]
+            if _dfi % 45 == 0:
+                _lm0 = raw_scaled[0] if raw_scaled else None
+                _agent_dbg(
+                    "H3",
+                    "opencv_runtime.py:run_webcam_loop",
+                    "step_sample",
+                    {
+                        "frame_i": _dfi,
+                        "sent_hw": list(sent_hw) if isinstance(sent_hw, (tuple, list)) else type(sent_hw).__name__,
+                        "sent_hw_used": sent_ok,
+                        "disp_hw": [disp_h, disp_w],
+                        "phase": step.phase,
+                        "reps": step.reps,
+                        "reps_raw": step.reps_raw,
+                        "smoothed_value": step.smoothed_value,
+                        "peak_state": step.peak_detector_state,
+                        "tracked_joint": step.tracked_joint,
+                        "lm0": _lm0,
+                        "session_started": rs_sess.started,
+                    },
+                )
+            # #endregion
             sm = rs_sess.last_smoothed_landmarks
             if sm:
                 draw_skeleton(frame_bgr, sm)
@@ -634,6 +785,8 @@ def run_webcam_loop(
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
                 break
+            if key == ord(" "):
+                _trigger_start_toggle(run_state)
 
     finally:
         stop_worker.set()

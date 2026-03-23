@@ -61,13 +61,16 @@ Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`,
 
 ## Configuration
 
-Create a `.env` in the project root. The app loads it automatically ([`app/config.py`](app/config.py)).
+**Primary:** [`rep_counter.toml`](rep_counter.toml) in the repo root (or current working directory, or any parent directory). It is version-controlled. Keys under `[vm]`, `[rep]`, and `[angle_selection.joints.*]` replace the old `.env` entries for those settings.
+
+**Overrides:** Any environment variable (including from a root `.env`, loaded by [`flexible_rep_counter/core/settings.py`](src/flexible_rep_counter/core/settings.py)) still takes precedence over the TOML file. Set `FLEXIBLE_REP_COUNTER_CONFIG` to an absolute path to point at a different TOML file.
 
 ### VM
 
 | Variable | Description |
 |----------|-------------|
-| `YOLO_VM_DIRECT_URL` | Primary VM base URL (used if set) |
+| `[vm].direct_url` in `rep_counter.toml` | Default VM base URL when env vars are unset |
+| `YOLO_VM_DIRECT_URL` | Primary VM base URL (used if set; overrides TOML) |
 | `YOLO_VM_TARGET_URL` | Fallback VM base URL if `YOLO_VM_DIRECT_URL` is empty |
 | `VM_TIMEOUT_SEC` | Request timeout for pose calls (default `5.0`) |
 | `VM_HEALTH_TIMEOUT_SEC` | Health check timeout (default `5.0`) |
@@ -75,25 +78,25 @@ Create a `.env` in the project root. The app loads it automatically ([`app/confi
 | `PREDICT_JPEG_QUALITY` | JPEG quality `1`–`100` (default `85`) |
 | `PREDICT_VALIDATE_RESPONSE` | `1`/`0` — validate JSON shape on responses |
 
-At least one of `YOLO_VM_DIRECT_URL` or `YOLO_VM_TARGET_URL` must be set or the app exits on startup.
+The visualizer app requires a non-empty VM URL: set `[vm].direct_url` in `rep_counter.toml`, or set `YOLO_VM_DIRECT_URL` / `YOLO_VM_TARGET_URL`.
 
 ### Rep counting
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `REP_HYSTERESIS` | Min angle change (°) to register a direction change | `5` |
+| `REP_HYSTERESIS` | Min angle change (°) to register a direction change | `5` (or `[rep].hysteresis`) |
 | `REP_MIN_PEAK_DISTANCE` | Min frames between peak/valley events | `5` |
 | `REP_SMOOTHING_FACTOR` | EMA alpha for angle smoothing (0–1) | `0.45` |
-| `REP_PEAK_MARGIN` | Peak must be within this many ° of session max avg | `15` |
-| `REP_VALLEY_MARGIN` | Valley must be within this many ° of session min avg | `15` |
+| `REP_PEAK_MARGIN` | Peak must be within this many ° of session max avg | `15` (or `[rep].peak_margin` in TOML) |
+| `REP_VALLEY_MARGIN` | Valley must be within this many ° of session min avg | `15` (or `[rep].valley_margin`) |
 | `REP_MIN_RANGE_GATE` | Rolling motion span must exceed this (°) before reps count; `0` off | `15` |
 | `REP_RANGE_WINDOW_FRAMES` | Frames in rolling span window | `90` |
 | `REP_RANGE_MIN_SAMPLES` | Min samples before span is trusted | `12` |
 | `REP_ANGLE_DELTA_DEADBAND` | Ignore sub-threshold ° changes before EMA; `0` off | `0` |
-| `REP_CALIBRATION_REPS` | Reps without strict margins before lock | `3` |
+| `REP_CALIBRATION_REPS` | Reps without strict margins before lock | `3` (or `[rep].calibration_reps`) |
 | `REP_CALIBRATION_CERTAINTY` | Min certainty (0–1) to lock baselines; `0` = lock after min reps only | `0.5` |
 | `REP_CALIBRATION_FORCE_EXTRA_REPS` | Extra counted reps if certainty still low after min reps | `2` |
-| `REP_MIN_INTERVAL_MS` | Min time between reps; `0` off | `400` |
+| `REP_MIN_INTERVAL_MS` | Min time between reps; `0` off | `400` (or `[rep].min_interval_ms`) |
 
 ### Angle selection (before rep calibration)
 
@@ -107,7 +110,7 @@ At least one of `YOLO_VM_DIRECT_URL` or `YOLO_VM_TARGET_URL` must be set or the 
 | `ANGLE_SELECTION_MIN_LEADING_REPS` | Minimum reps on leader joint | `2` |
 | `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` | Frames dominance + variance must hold before lock | `36` |
 | `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` | After this many seconds, allow pure-variance lock | `14.0` |
-| `ANGLE_SELECTION_MIN_VARIANCE` | Min variance (global; per-joint: `_LEFT_ELBOW`, etc.) | `6.0` |
+| `ANGLE_SELECTION_MIN_VARIANCE` | Min variance (global; per-joint env suffix `_LEFT_ELBOW`, or TOML `[angle_selection.joints.LEFT_ELBOW]`) | `6.0` |
 | `ANGLE_SELECTION_MIN_RANGE_DEG` | Min observed range (°) for a candidate | `16.0` |
 | `ANGLE_SELECTION_SECOND_BEST_RATIO` | Top candidate must beat runner-up by this ratio | `1.15` |
 | `ANGLE_SELECTION_MIN_ACTIVE_WINDOWS` | Active variance windows required (see code) | `4` |

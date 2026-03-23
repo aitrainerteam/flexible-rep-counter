@@ -169,7 +169,7 @@ class RepCounterSession:
         auto_started: bool = False,
     ) -> None:
         self._use_filter = use_pose_filter
-        self._pose_pipeline = PoseFilterPipeline(use_one_euro=True) if use_pose_filter else None
+        self._pose_pipeline = PoseFilterPipeline() if use_pose_filter else None
         self._auto_started = auto_started
         self._run_state: dict[str, Any] = {}
         self._last_smoothed_landmarks: Optional[list[dict]] = None
@@ -194,7 +194,7 @@ class RepCounterSession:
             "tuning_params": dict(tp),
         }
         if self._pose_pipeline is not None:
-            self._pose_pipeline = PoseFilterPipeline(use_one_euro=True)
+            self._pose_pipeline = PoseFilterPipeline()
 
     def set_started(self, wall_time: Optional[float] = None) -> None:
         """Mark session as started (visualizer Start button)."""

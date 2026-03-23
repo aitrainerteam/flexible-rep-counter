@@ -5,9 +5,7 @@ import os
 from typing import Any, Optional
 
 from flexible_rep_counter.core.settings import (
-    ANGLE_SELECTION_MIN_RANGE_DEG,
-    ANGLE_SELECTION_MIN_VARIANCE,
-    ANGLE_SELECTION_SECOND_BEST_RATIO,
+    get_angle_selection_joint_thresholds,
     get_default_tuning_params,
 )
 from flexible_rep_counter.core.math_engine import (
@@ -94,24 +92,10 @@ def _exercise_looks_isometric(exercise: Optional[dict[str, Any]]) -> bool:
 
 def _angle_selection_thresholds(angle_key: str) -> dict[str, float]:
     """
-    Per-common-angle gates from env: ANGLE_SELECTION_<NAME>_<KEY>, e.g.
-    ANGLE_SELECTION_MIN_RANGE_DEG_LEFT_ELBOW, ANGLE_SELECTION_MIN_VARIANCE_RIGHT_KNEE.
-    Falls back to global ANGLE_SELECTION_* from config.
+    Per-common-angle gates from env, ``rep_counter.toml`` ``[angle_selection.joints.<KEY>]``,
+    then global defaults (see ``get_angle_selection_joint_thresholds``).
     """
-    suf = f"_{angle_key}"
-    return {
-        "min_variance": float(
-            os.environ.get(f"ANGLE_SELECTION_MIN_VARIANCE{suf}", str(ANGLE_SELECTION_MIN_VARIANCE))
-        ),
-        "min_range_deg": float(
-            os.environ.get(f"ANGLE_SELECTION_MIN_RANGE_DEG{suf}", str(ANGLE_SELECTION_MIN_RANGE_DEG))
-        ),
-        "second_best_ratio": float(
-            os.environ.get(
-                f"ANGLE_SELECTION_SECOND_BEST_RATIO{suf}", str(ANGLE_SELECTION_SECOND_BEST_RATIO)
-            )
-        ),
-    }
+    return get_angle_selection_joint_thresholds(angle_key)
 
 
 def compute_angle_variances_from_buffer(
