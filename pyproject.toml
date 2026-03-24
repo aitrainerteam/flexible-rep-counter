@@ -28,6 +28,3 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
-
-[tool.setuptools.package-data]
-flexible_rep_counter = ["default_rep_counter.toml"]

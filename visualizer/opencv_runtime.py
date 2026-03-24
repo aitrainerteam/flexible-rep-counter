@@ -35,30 +35,6 @@ from app.skeleton_overlay import draw_skeleton
 
 logger = get_logger(__name__)
 
-# #region agent log
-_AGENT_DEBUG_LOG = "/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-0f69d6.log"
-
-
-def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
-    import json
-
-    payload = {
-        "sessionId": "0f69d6",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as _df:
-            _df.write(json.dumps(payload) + "\n")
-    except OSError:
-        pass
-
-
-# #endregion
-
 OVERLAY_FONT = cv2.FONT_HERSHEY_DUPLEX  # Bold, readable
 OVERLAY_SCALE = 0.7
 OVERLAY_THICKNESS = 2
@@ -224,49 +200,7 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) ->
     if event != cv2.EVENT_LBUTTONDOWN:
         return
     state = param
-    rect = state.get("button_rect", (0, 0, 0, 0))
-    rx, ry, rw, rh = rect
-    img_x, img_y = _window_to_image_coords(state, x, y)
-    fs = state.get("frame_shape", (0, 0))
-    fh, fw = (int(fs[0]), int(fs[1])) if len(fs) >= 2 else (0, 0)
-    px, py, pw, ph = _padded_button_rect(rx, ry, rw, rh, fh, fw) if fw > 0 and fh > 0 else (0, 0, 0, 0)
-    in_direct = _hit_in_rect(x, y, px, py, pw, ph) if pw > 0 else False
-    in_mapped_img = _hit_in_rect(img_x, img_y, px, py, pw, ph) if pw > 0 else False
-    display = _get_display_scale_and_offset(state)
-    in_rect_win = False
-    if display is not None and pw > 0:
-        sc, ox, oy, _ = display
-        bx1, bx2 = ox + px * sc, ox + (px + pw) * sc
-        by1, by2 = oy + py * sc, oy + (py + ph) * sc
-        in_rect_win = bx1 <= x <= bx2 and by1 <= y <= by2
     in_rect = _start_button_hit(state, x, y)
-    # #region agent log
-    _rect_dbg = None
-    try:
-        _rect_dbg = list(cv2.getWindowImageRect("Rep Counter"))
-    except Exception:
-        _rect_dbg = None
-    _agent_dbg(
-        "H1",
-        "opencv_runtime.py:_on_mouse",
-        "lbutton_down",
-        {
-            "win_xy": [x, y],
-            "img_xy": [img_x, img_y],
-            "button_rect": [rx, ry, rw, rh],
-            "hit_pad_rect": [px, py, pw, ph],
-            "frame_shape": list(state.get("frame_shape", ())),
-            "display_is_none": display is None,
-            "display": list(display) if display is not None else None,
-            "in_direct": in_direct,
-            "in_rect_img": in_mapped_img,
-            "in_rect_win": in_rect_win,
-            "in_rect_final": in_rect,
-            "win_image_rect": _rect_dbg,
-            "started": bool(state.get("started")),
-        },
-    )
-    # #endregion
     if not in_rect:
         return
     _trigger_start_toggle(state)
@@ -592,7 +526,6 @@ def run_webcam_loop(
         "rep_session": rep_session,
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
-        "debug_frame_i": 0,
     }
     cv2.namedWindow("Rep Counter", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Rep Counter", _on_mouse, run_state)
@@ -739,31 +672,6 @@ def run_webcam_loop(
                 (disp_h, disp_w),
             )
             step = rs_sess.step_landmarks(raw_scaled, timestamp_ms=timestamp_ms)
-            # #region agent log
-            run_state["debug_frame_i"] = int(run_state.get("debug_frame_i", 0)) + 1
-            _dfi = run_state["debug_frame_i"]
-            if _dfi % 45 == 0:
-                _lm0 = raw_scaled[0] if raw_scaled else None
-                _agent_dbg(
-                    "H3",
-                    "opencv_runtime.py:run_webcam_loop",
-                    "step_sample",
-                    {
-                        "frame_i": _dfi,
-                        "sent_hw": list(sent_hw) if isinstance(sent_hw, (tuple, list)) else type(sent_hw).__name__,
-                        "sent_hw_used": sent_ok,
-                        "disp_hw": [disp_h, disp_w],
-                        "phase": step.phase,
-                        "reps": step.reps,
-                        "reps_raw": step.reps_raw,
-                        "smoothed_value": step.smoothed_value,
-                        "peak_state": step.peak_detector_state,
-                        "tracked_joint": step.tracked_joint,
-                        "lm0": _lm0,
-                        "session_started": rs_sess.started,
-                    },
-                )
-            # #endregion
             sm = rs_sess.last_smoothed_landmarks
             if sm:
                 draw_skeleton(frame_bgr, sm)

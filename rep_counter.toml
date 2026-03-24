@@ -1,28 +1,57 @@
-# Rep counter tuning (tracked). Edit here instead of .env for these keys.
-# Precedence: environment variables > this file > built-in defaults.
-# Optional: set FLEXIBLE_REP_COUNTER_CONFIG to an absolute path to use another file.
+# Rep counter tuning. Set FLEXIBLE_REP_COUNTER_CONFIG to use another file.
+
+[app]
+log_level = "DEBUG"
 
 [vm]
-# YOLO pose API base URL (same as YOLO_VM_DIRECT_URL / YOLO_VM_TARGET_URL).
-# Production VM (GCE): fixed external NAT; yolo-deploy listens on 8000.
+# YOLO pose API base URL (fixed; no env URL fallbacks).
 direct_url = "http://34.95.128.222:8000"
+timeout_sec = 5.0
+health_timeout_sec = 5.0
+
+[predict]
+resize_width = 0
+jpeg_quality = 85
+validate_response = true
 
 [rep]
-# Wider margins = reps still count if later ROM is a bit shy of calibration peaks/valleys.
-peak_margin = 18
-valley_margin = 16
-hysteresis = 8
+peak_margin = 30
+valley_margin = 32
+hysteresis = 12
+min_peak_distance = 5
+smoothing_factor = 0.45
+min_range_gate = 15
+range_window_frames = 90
+range_min_samples = 12
+angle_delta_deadband = 0
 calibration_reps = 3
-min_interval_ms = 600
+calibration_certainty = 0.5
+calibration_force_extra_reps = 2
+min_interval_ms = 900
 
-# Per joint: keys match COMMON_ANGLES (e.g. LEFT_ELBOW). Omitted fields use global angle_selection.* defaults.
+[angle_selection]
+min_sec = 7.0
+min_frames = 70
+max_buffer_frames = 400
+retry_interval_sec = 2.0
+dominance_fraction = 0.6666666666666666
+min_leading_reps = 2
+dominance_streak_frames = 36
+variance_fallback_sec = 14.0
+min_variance = 6.0
+min_range_deg = 16.0
+second_best_ratio = 1.15
+min_active_windows = 4
+smooth_window = 5
+
+# Per joint: keys match COMMON_ANGLES. Omitted fields use [angle_selection] globals above.
 [angle_selection.joints.LEFT_ELBOW]
-min_variance = 4
-min_range_deg = 10
+min_variance = 5
+min_range_deg = 12
 
 [angle_selection.joints.RIGHT_ELBOW]
-min_variance = 4
-min_range_deg = 10
+min_variance = 5
+min_range_deg = 12
 
 [angle_selection.joints.LEFT_KNEE]
 min_variance = 6

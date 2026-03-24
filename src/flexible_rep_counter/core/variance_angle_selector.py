@@ -1,10 +1,11 @@
 """Variance-based angle selection: pick the angle with most consistent movement (median window variance)."""
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 from flexible_rep_counter.core.settings import (
+    ANGLE_SELECTION_MIN_ACTIVE_WINDOWS,
+    ANGLE_SELECTION_SMOOTH_WINDOW,
     get_angle_selection_joint_thresholds,
     get_default_tuning_params,
 )
@@ -39,9 +40,8 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
 
 LOW_CONFIDENCE_THRESHOLD = 0.5
 FRAME_MIN_CONFIDENCE = 0.5
-# Require several time segments with real variance (not one accidental spike or jitter).
-MIN_ACTIVE_WINDOWS = int(os.environ.get("ANGLE_SELECTION_MIN_ACTIVE_WINDOWS", "4"))
-SMOOTH_WINDOW = int(os.environ.get("ANGLE_SELECTION_SMOOTH_WINDOW", "5"))
+MIN_ACTIVE_WINDOWS = ANGLE_SELECTION_MIN_ACTIVE_WINDOWS
+SMOOTH_WINDOW = ANGLE_SELECTION_SMOOTH_WINDOW
 ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
 
 

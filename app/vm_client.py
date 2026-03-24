@@ -9,7 +9,7 @@ from typing import Any, Optional
 import cv2
 import requests
 
-from app.config import YOLO_VM_TARGET_URL, VM_TIMEOUT_SEC
+from app.config import VM_BASE_URL, VM_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def check_vm_health(
     GET /health on direct VM URL. Expects JSON with status ok and model_loaded (yolo-deploy).
     Returns (ok, parsed_json_or_error_str).
     """
-    url = (base_url or YOLO_VM_TARGET_URL or "").strip().rstrip("/")
+    url = (base_url or VM_BASE_URL or "").strip().rstrip("/")
     if not url:
         return False, "no base URL"
     health_url = f"{url}/health"
@@ -214,7 +214,7 @@ def send_frame(
         logger.debug("JPEG encode failed: %s", e)
         return VmPredictOutcome(landmarks=None)
 
-    base_url = YOLO_VM_TARGET_URL.rstrip("/")
+    base_url = VM_BASE_URL.rstrip("/")
     predict_url = f"{base_url}/predict"
     sess = session or requests
     tout = float(timeout if timeout is not None else VM_TIMEOUT_SEC)

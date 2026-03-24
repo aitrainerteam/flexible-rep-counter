@@ -7,12 +7,12 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 - **Webcam capture**: OpenCV frames; optional resize/JPEG tuning before upload.
 - **Pose inference**: YOLO pose on a remote VM; client in [`app/vm_client.py`](app/vm_client.py) (`GET /health`, `POST /predict` multipart JPEG, benchmarking hooks).
 - **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
-- **Angle selection**: [`app/variance_angle_selector.py`](app/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` it may lock using the variance winner **only if** that winner matches the rep leader when any reps exist (so the idle arm does not get locked).
+- **Angle selection**: [`app/variance_angle_selector.py`](app/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `angle_selection.variance_fallback_sec` (in `rep_counter.toml`) the session may lock using pure **variance** selection when the retry window allows.
 - **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.
 - **Rep counting**: `PeakDetector` in [`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py) (also re-exported from [`app/math_engine.py`](app/math_engine.py))—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
 - **Importable package**: Core logic lives under [`src/flexible_rep_counter/`](src/flexible_rep_counter/). OpenCV UI is in [`visualizer/opencv_runtime.py`](visualizer/opencv_runtime.py) (repo-only; run via [`main.py`](main.py)).
 - **Docs**: See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full pipeline, call order, and math/selection details.
-- **UI**: OpenCV overlay; logs go to stderr when `LOG_LEVEL=DEBUG`.
+- **UI**: OpenCV overlay; log verbosity follows `[app].log_level` in `rep_counter.toml` (stderr when `DEBUG`).
 
 ## Use as a library (other projects)
 
@@ -51,78 +51,30 @@ pip install -e .          # register the flexible_rep_counter package (needed fo
 python main.py
 ```
 
-Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (see [`main.py`](main.py)).
+Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (defaults follow `[predict]` in `rep_counter.toml` when omitted).
 
 ### Session flow
 
-1. **Angle selection**: Buffer frames (cap `ANGLE_SELECTION_MAX_BUFFER_FRAMES`) until `ANGLE_SELECTION_MIN_SEC` and `ANGLE_SELECTION_MIN_FRAMES` are met. Per-frame, lightweight peak detectors on all candidate angles feed **rep dominance** stats; variance/ROM gates pick a stable joint. Lock when dominance + variance agree for `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES`, or after `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` via pure variance selection if needed. Retries use `ANGLE_SELECTION_RETRY_INTERVAL_SEC`.
-2. **Calibration**: First reps establish peak/valley baselines; the buffer is **replayed** through the same detectors so displayed reps include motion from the selection window. Locking uses `REP_CALIBRATION_CERTAINTY` and optionally `REP_CALIBRATION_FORCE_EXTRA_REPS`.
-3. **Tracking**: Counts with margins, range gate, and `REP_MIN_INTERVAL_MS`. Quit with `q` or Escape in the video window.
+1. **Angle selection**: Buffer frames (cap `angle_selection.max_buffer_frames`) until `angle_selection.min_sec` and `angle_selection.min_frames`. Per-frame, lightweight peak detectors on all candidate angles feed **rep dominance** stats; variance/ROM gates pick a stable joint. Lock when dominance + variance agree for `angle_selection.dominance_streak_frames`, or after `angle_selection.variance_fallback_sec` via pure variance selection if needed. Retries use `angle_selection.retry_interval_sec`.
+2. **Calibration**: First reps establish peak/valley baselines; the buffer is **replayed** through the same detectors so displayed reps include motion from the selection window. Locking uses `rep.calibration_certainty` and optionally `rep.calibration_force_extra_reps`.
+3. **Tracking**: Counts with margins, range gate, and `rep.min_interval_ms`. Quit with `q` or Escape in the video window.
 
 ## Configuration
 
-**Primary:** [`rep_counter.toml`](rep_counter.toml) in the repo root (or current working directory, or any parent directory). It is version-controlled. Keys under `[vm]`, `[rep]`, and `[angle_selection.joints.*]` replace the old `.env` entries for those settings.
+**Source of truth:** [`rep_counter.toml`](rep_counter.toml) in the repo root, or the current working directory, or any parent directory. Set `FLEXIBLE_REP_COUNTER_CONFIG` to an absolute path to use a different file.
 
-**Overrides:** Any environment variable (including from a root `.env`, loaded by [`flexible_rep_counter/core/settings.py`](src/flexible_rep_counter/core/settings.py)) still takes precedence over the TOML file. Set `FLEXIBLE_REP_COUNTER_CONFIG` to an absolute path to point at a different TOML file.
+Sections:
 
-### VM
+| Section | Role |
+|---------|------|
+| `[app]` | `log_level` (`DEBUG`, `INFO`, …) |
+| `[vm]` | `direct_url` (required for the visualizer), `timeout_sec`, `health_timeout_sec` |
+| `[predict]` | `resize_width`, `jpeg_quality`, `validate_response` |
+| `[rep]` | Peak detector tuning: hysteresis, margins, calibration, `min_interval_ms`, etc. |
+| `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds |
+| `[angle_selection.joints.<NAME>]` | Per-joint overrides (e.g. `LEFT_ELBOW`) for `min_variance`, `min_range_deg`, `second_best_ratio` |
 
-| Variable | Description |
-|----------|-------------|
-| `[vm].direct_url` in `rep_counter.toml` | Default VM base URL when env vars are unset |
-| `YOLO_VM_DIRECT_URL` | Primary VM base URL (used if set; overrides TOML) |
-| `YOLO_VM_TARGET_URL` | Fallback VM base URL if `YOLO_VM_DIRECT_URL` is empty |
-| `VM_TIMEOUT_SEC` | Request timeout for pose calls (default `5.0`) |
-| `VM_HEALTH_TIMEOUT_SEC` | Health check timeout (default `5.0`) |
-| `PREDICT_RESIZE_WIDTH` | Resize width before JPEG (`0` = full frame) |
-| `PREDICT_JPEG_QUALITY` | JPEG quality `1`–`100` (default `85`) |
-| `PREDICT_VALIDATE_RESPONSE` | `1`/`0` — validate JSON shape on responses |
-
-The visualizer app requires a non-empty VM URL: set `[vm].direct_url` in `rep_counter.toml`, or set `YOLO_VM_DIRECT_URL` / `YOLO_VM_TARGET_URL`.
-
-### Rep counting
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `REP_HYSTERESIS` | Min angle change (°) to register a direction change | `5` (or `[rep].hysteresis`) |
-| `REP_MIN_PEAK_DISTANCE` | Min frames between peak/valley events | `5` |
-| `REP_SMOOTHING_FACTOR` | EMA alpha for angle smoothing (0–1) | `0.45` |
-| `REP_PEAK_MARGIN` | Peak must be within this many ° of session max avg | `15` (or `[rep].peak_margin` in TOML) |
-| `REP_VALLEY_MARGIN` | Valley must be within this many ° of session min avg | `15` (or `[rep].valley_margin`) |
-| `REP_MIN_RANGE_GATE` | Rolling motion span must exceed this (°) before reps count; `0` off | `15` |
-| `REP_RANGE_WINDOW_FRAMES` | Frames in rolling span window | `90` |
-| `REP_RANGE_MIN_SAMPLES` | Min samples before span is trusted | `12` |
-| `REP_ANGLE_DELTA_DEADBAND` | Ignore sub-threshold ° changes before EMA; `0` off | `0` |
-| `REP_CALIBRATION_REPS` | Reps without strict margins before lock | `3` (or `[rep].calibration_reps`) |
-| `REP_CALIBRATION_CERTAINTY` | Min certainty (0–1) to lock baselines; `0` = lock after min reps only | `0.5` |
-| `REP_CALIBRATION_FORCE_EXTRA_REPS` | Extra counted reps if certainty still low after min reps | `2` |
-| `REP_MIN_INTERVAL_MS` | Min time between reps; `0` off | `400` (or `[rep].min_interval_ms`) |
-
-### Angle selection (before rep calibration)
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ANGLE_SELECTION_MIN_SEC` | Minimum wall time for selection window | `7.0` |
-| `ANGLE_SELECTION_MIN_FRAMES` | Minimum frames in window | `70` |
-| `ANGLE_SELECTION_MAX_BUFFER_FRAMES` | Cap on buffered frames | `400` |
-| `ANGLE_SELECTION_RETRY_INTERVAL_SEC` | Retry if gates not met | `2.0` |
-| `ANGLE_SELECTION_DOMINANCE_FRACTION` | Leader’s rep share must exceed this (strict `>` in code) | `~0.667` |
-| `ANGLE_SELECTION_MIN_LEADING_REPS` | Minimum reps on leader joint | `2` |
-| `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` | Frames dominance + variance must hold before lock | `36` |
-| `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC` | After this many seconds, allow pure-variance lock | `14.0` |
-| `ANGLE_SELECTION_MIN_VARIANCE` | Min variance (global; per-joint env suffix `_LEFT_ELBOW`, or TOML `[angle_selection.joints.LEFT_ELBOW]`) | `6.0` |
-| `ANGLE_SELECTION_MIN_RANGE_DEG` | Min observed range (°) for a candidate | `16.0` |
-| `ANGLE_SELECTION_SECOND_BEST_RATIO` | Top candidate must beat runner-up by this ratio | `1.15` |
-| `ANGLE_SELECTION_MIN_ACTIVE_WINDOWS` | Active variance windows required (see code) | `4` |
-| `ANGLE_SELECTION_SMOOTH_WINDOW` | Smoothing window for selection series | `5` |
-
-### Debugging
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `DEBUG` |
-
-When `LOG_LEVEL=DEBUG`, extra log lines are written to stderr (see [`app/debug_console.py`](app/debug_console.py)).
+The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars.
 
 ### VM API (client contract)
 

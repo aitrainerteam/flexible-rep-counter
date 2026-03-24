@@ -73,9 +73,7 @@ Goal: observe motion, then **lock exactly one** entry of **`COMMON_ANGLES`** (on
    - and **`_get_top_candidate(variances)`** agrees with the leader (variance winner == rep leader), so noise on the idle arm does not steal the lock.
 7. **Dominance streak** — if conditions hold for the same `leader_key` for `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` consecutive frames (and wall/frame minimums are met), **lock**:
    - **`_apply_locked_tracking(..., selection_detector=sdba.get(leader_key))`** — reuse the **same** `PeakDetector` instance that observed the selection window so counts stay continuous.
-8. **Variance fallback** (only if dominance never stabilizes): when **`can_try`** (retry interval) and elapsed ≥ `ANGLE_SELECTION_VARIANCE_FALLBACK_SEC`, call **`determine_best_angle(buf_list)`**. If it returns `source=="variance"`:
-   - **Limb alignment**: if any selection-phase rep events exist (`totalReps > 0`), require **`selectedAngle == leader_key`** so the high-variance pick cannot be the **idle** arm while the user reps on the other side.
-   - **`_apply_locked_tracking(..., selection_detector=None)`** — new detector + **`replay_angle_series_on_peak_detector`** over the buffer.
+8. **Variance fallback** (only if dominance never stabilizes): when **`can_try`** (retry interval) and elapsed ≥ `angle_selection.variance_fallback_sec`, call **`determine_best_angle(buf_list)`**. If it returns `source=="variance"`, **`_apply_locked_tracking(..., selection_detector=None)`** — new detector + **`replay_angle_series_on_peak_detector`** over the buffer.
 9. **`_selection_status_message`** drives the overlay string during this phase.
 
 ### B) Tracking phase — `selected_angle` is set
@@ -158,7 +156,7 @@ Returns `{ selectedAngle, source, tuningParams, debug }`. Used for **variance fa
 
 ## Configuration source of truth
 
-All thresholds are documented in **[`README.md`](README.md)** and loaded in **[`app/config.py`](app/config.py)** from environment (and `.env`).
+Tuning is loaded from **`rep_counter.toml`** (see **[`README.md`](README.md)**) in **[`flexible_rep_counter/core/settings.py`](src/flexible_rep_counter/core/settings.py)**; **[`app/config.py`](app/config.py)** re-exports those values and requires a non-empty **`[vm].direct_url`** for the visualizer.
 
 ---
 

@@ -352,22 +352,13 @@ class RepCounterSession:
                     selection_detector=sdba.get(leader_key),
                 )
                 locked_this_frame = True
-            elif can_try:
+            elif can_try and variance_fallback_ready:
                 result = determine_best_angle(buf_list, exercise=None)
                 tuning_params = result.get("tuningParams") or get_default_tuning_params()
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
                 src = str(result.get("source") or "")
-                # Variance fallback must not be gated on rep-dominance leader: selection-phase
-                # PeakDetectors often spike on the wrong joint (e.g. RIGHT_KNEE noise) while
-                # median-window variance still picks the moving limb. Requiring
-                # angle_keys_compatible(sel, leader_key) caused permanent "selecting" deadlock.
-                variance_ok = (
-                    sel
-                    and sel in COMMON_ANGLES
-                    and src == "variance"
-                    and variance_fallback_ready
-                )
+                variance_ok = sel and sel in COMMON_ANGLES and src == "variance"
                 if variance_ok:
                     _apply_locked_tracking(
                         rs,
@@ -503,9 +494,9 @@ class RepCounterSession:
         else:
             label = _format_angle_label(sel_ang) if sel_ang else "Joint"
             if sel_ang and sel_ang.startswith("LEFT_"):
-                status = f"Tracking {label} - left side only (other limb not counted)"
+                status = f"Tracking {label} - left side only"
             elif sel_ang and sel_ang.startswith("RIGHT_"):
-                status = f"Tracking {label} - right side only (other limb not counted)"
+                status = f"Tracking {label} - right side only"
             else:
                 status = f"Tracking {label}"
 

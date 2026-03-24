@@ -13,7 +13,7 @@ if _SRC.is_dir():
     if sp not in sys.path:
         sys.path.insert(0, sp)
 
-from app.config import YOLO_VM_TARGET_URL
+from app.config import VM_BASE_URL
 from visualizer.opencv_runtime import run_webcam_loop
 
 
@@ -34,14 +34,14 @@ def main() -> None:
         type=int,
         default=None,
         metavar="W",
-        help="Resize frame to this width before JPEG upload (0=no resize). Default: PREDICT_RESIZE_WIDTH in .env",
+        help="Resize frame to this width before JPEG upload (0=no resize). Default: [predict].resize_width in rep_counter.toml",
     )
     parser.add_argument(
         "--jpeg-quality",
         type=int,
         default=None,
         metavar="Q",
-        help="JPEG quality 1-100 for uploads. Default: PREDICT_JPEG_QUALITY in .env",
+        help="JPEG quality 1-100 for uploads. Default: [predict].jpeg_quality in rep_counter.toml",
     )
     parser.add_argument(
         "--no-validate-response",
@@ -50,7 +50,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print("Rep counter starting (VM:", YOLO_VM_TARGET_URL, ")")
+    print("Rep counter starting (VM:", VM_BASE_URL, ")")
     try:
         run_webcam_loop(
             skip_health_check=args.no_health_check,
