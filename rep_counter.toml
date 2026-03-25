@@ -10,41 +10,71 @@ timeout_sec = 5.0
 health_timeout_sec = 5.0
 
 [predict]
+# Max width (px) before JPEG encode; 0 = never downscale. Higher = sharper image / larger uploads; lower = faster, coarser pose.
 resize_width = 0
+# JPEG 1–100. Higher = better detail & larger payload; lower = smaller/faster but noisier keypoints.
 jpeg_quality = 85
+# true = validate pose API response shape/content; false = skip validation (faster, less safety).
 validate_response = true
 
 [rep]
-peak_margin = 30
-valley_margin = 32
-hysteresis = 12
+# After calibration: peak may fall this fraction of the calibrated ROM below the locked avg peak (0–1). E.g. ROM=50 deg and pct=0.50 → peak must be ≥ avg_peak − 25. Higher = tolerate more ROM drift; lower = stricter, may drop reps if form shifts.
+peak_margin_pct = 0.50
+# After calibration: valley may rise this fraction of the calibrated ROM above the locked avg valley (0–1). E.g. ROM=50 deg and pct=0.50 → valley must be ≤ avg_valley + 25. Higher = looser; lower = stricter valleys.
+valley_margin_pct = 0.50
+# Degrees smoothed angle must move past a running extremum to flip up/down state. Higher = needs bigger swings, fewer noise flips; lower = more sensitive, risk of chatter counts.
+hysteresis = 18
+# Minimum frames since last peak/valley event before another can register. Higher = slower max rep rate, fewer double-counts; lower = allows faster reps, risk of duplicates.
 min_peak_distance = 5
-smoothing_factor = 0.45
+# EMA weight on each new sample (0–1). Higher = tracks motion faster, noisier; lower = smoother curve, slower to react.
+smoothing_factor = 0.70
+# Rolling window p95−p5 spread (deg) required before reps count. Higher = only count when recent ROM is large; lower = gate opens sooner, small twitches may pass if other checks pass.
 min_range_gate = 15
+# Frames in the rolling range window. Higher = stabler spread estimate, slower to adapt; lower = faster adaptation, jumpier gate.
 range_window_frames = 90
+# Frames needed in that window before the range gate may open. Higher = longer “warm-up” before counting; lower = earlier counting possible.
 range_min_samples = 12
+# If |raw angle − last passed| < this (deg), reuse last value before smoothing. Higher = more jitter suppression, risk of freezing motion; 0 = off, all motion passes through.
 angle_delta_deadband = 0
+# Full rep cycles recorded before peak/valley averages lock (margins apply after). Higher = longer calibration, stabler baseline; lower = locks sooner, riskier baseline.
 calibration_reps = 3
-calibration_certainty = 0.5
-calibration_force_extra_reps = 2
-min_interval_ms = 900
+# Lock calibration when certainty ≥ this (0 = disable certainty gate). Higher = need very consistent peaks/valleys; lower = lock despite more jitter.
+calibration_certainty = 0.2
+# If certainty still low, keep calibrating up to this many extra reps beyond calibration_reps before forcing lock. Higher = more patience; lower = force lock sooner.
+calibration_force_extra_reps = 0
+# Min milliseconds between rep increments. Higher = hard cap on rep speed; lower = allow rapid reps, risk of burst double-counts.
+min_interval_ms = 500
 
 [angle_selection]
-min_sec = 7.0
-min_frames = 70
+# Minimum seconds of observation before angle lock is allowed. Higher = longer wait; lower = may lock on too little context.
+min_sec = 2.0
+# Minimum frames in buffer before lock allowed. Higher = more data; lower = earlier attempts.
+min_frames = 45
+# Cap on buffered frames during selection (memory / how far back variance sees). Higher = longer history; lower = less memory, shorter context.
 max_buffer_frames = 400
+# Seconds after a failed variance pick before retrying. Higher = longer pause between retries; lower = retries sooner (may thrash).
 retry_interval_sec = 2.0
+# Rep-count leader must exceed this fraction of total selection reps. Higher = need clearer one-joint dominance; lower = easier to satisfy dominance path.
 dominance_fraction = 0.6666666666666666
+# Leader needs at least this many reps for dominance lock. Higher = more proof; lower = can lock with fewer reps.
 min_leading_reps = 2
+# Consecutive frames dominance must hold before locking to leader. Higher = more stable confirmation; lower = faster lock, risk of wrong joint.
 dominance_streak_frames = 36
+# Seconds observed before variance-based fallback can run if dominance has not locked. Higher = wait longer for dominance; lower = fall back to variance sooner.
 variance_fallback_sec = 14.0
+# Min median window variance for a joint to qualify. Higher = only very active angles pass; lower = weaker motion can win.
 min_variance = 6.0
+# Min smoothed ROM (max−min deg) for a joint to qualify. Higher = need large movement; lower = smaller ROM angles can be chosen.
 min_range_deg = 16.0
+# Winner’s variance must be ≥ runner_up × this (when runner-up > 0). Higher = need a clearer winner; lower = closer scores still pick a joint.
 second_best_ratio = 1.15
+# Min sliding windows with “active” variance for a candidate. Higher = stricter consistency; lower = fewer windows required.
 min_active_windows = 4
+# Moving-average window (samples) when smoothing angles for variance/ROM stats. Higher = smoother stats, slower detail; lower = noisier, more responsive.
 smooth_window = 5
 
 # Per joint: keys match COMMON_ANGLES. Omitted fields use [angle_selection] globals above.
+# min_variance / min_range_deg: override globals for noisy or small-ROM joints. Higher = harder for that joint to win; lower = easier.
 [angle_selection.joints.LEFT_ELBOW]
 min_variance = 5
 min_range_deg = 12

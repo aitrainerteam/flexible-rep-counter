@@ -104,7 +104,7 @@ State machine:
 - **Smoothing**: EMA on the input angle; optional **delta deadband** before EMA to drop tiny jitter.
 - **Peak / valley events**: When reversing direction, if **`min_peak_distance`** frames have passed since the last event, a peak or valley may be recorded.
 - **Range gate**: Recent window of smoothed values must have p95−p5 spread ≥ **`min_range_gate_degrees`** before reps count (stops micro-bounces from counting).
-- **Calibration**: First **`calibration_reps`** completed rep cycles record peaks/valleys **without** strict margin checks; then **average peak** and **average valley** are **locked**. After lock, new peaks must stay near the average peak (within **`peak_margin`**) and valleys near average valley (within **`valley_margin`**), so ROM drift does not duplicate counts.
+- **Calibration**: First **`calibration_reps`** completed rep cycles record peaks/valleys **without** strict margin checks; then **average peak** and **average valley** are **locked**. After lock, new peaks must stay near the average peak (within **`peak_margin_pct`** × calibrated ROM) and valleys near average valley (within **`valley_margin_pct`** × ROM), so ROM drift does not duplicate counts.  Margins are expressed as fractions (0–1) of the calibrated ROM (`avg_peak − avg_valley`).
 - **Certainty**: From spread of recorded peaks/valleys vs amplitude; can delay lock until **`calibration_force_extra_reps`** if certainty is low.
 - **Rep count**: Derived from paired peak/valley sequences (`min(len(peaks), len(valleys))` style progression inside the implementation); **`min_rep_interval_ms`** caps how fast reps can increment.
 

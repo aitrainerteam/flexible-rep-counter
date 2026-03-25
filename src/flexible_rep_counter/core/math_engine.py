@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import time
 from collections import deque
@@ -14,35 +13,6 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 MIN_VARIANCE_THRESHOLD = 5.0
-
-# region agent log
-_DEBUG_LOG_PATH = "/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-4ab592.log"
-
-
-def _agent_debug_ndjson(
-    location: str, message: str, data: dict[str, Any], hypothesis_id: str
-) -> None:
-    try:
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as _df:
-            _df.write(
-                json.dumps(
-                    {
-                        "sessionId": "4ab592",
-                        "runId": "post-fix",
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
-
-
-# endregion
 
 # -----------------------------------------------------------------------------
 # Geometry
@@ -174,7 +144,9 @@ def _stddev(values: Sequence[float]) -> float:
 class PeakDetector:
     """State machine: NEUTRAL -> GOING_UP/GOING_DOWN; peaks/valleys with hysteresis and min distance.
     First `calibration_reps` reps record peaks/valleys without margin checks; then averages are locked
-    and subsequent peaks/valleys must fall within peak_margin/valley_margin of those baselines.
+    and subsequent peaks/valleys must fall within a percentage of the calibrated ROM from those baselines.
+    ``peak_margin_pct`` / ``valley_margin_pct`` express tolerance as a fraction (0–1) of the locked
+    ROM (avg_peak − avg_valley).  E.g. ROM = 50° and pct = 0.50 → effective margin = 25°.
     Optional rolling-window range gate: reps are not recorded until recent p95–p5 spread exceeds
     min_range_gate_degrees (avoids false reps from tiny oscillations; window is not monotonic global min/max).
     Optional per-frame delta deadband: if |angle - last_passed| is below the threshold, the previous
@@ -186,8 +158,8 @@ class PeakDetector:
         smoothing_factor: float = 0.3,
         hysteresis: float = 3.0,
         min_peak_distance: int = 10,
-        peak_margin: float = 15.0,
-        valley_margin: float = 15.0,
+        peak_margin_pct: float = 0.50,
+        valley_margin_pct: float = 0.50,
         min_range_gate_degrees: float = 15.0,
         range_window_frames: int = 90,
         range_min_samples: int = 12,
@@ -202,8 +174,8 @@ class PeakDetector:
         self.smoothing_factor = smoothing_factor
         self.hysteresis = hysteresis
         self.min_peak_distance = min_peak_distance
-        self.peak_margin = peak_margin
-        self.valley_margin = valley_margin
+        self.peak_margin_pct = max(0.0, min(1.0, float(peak_margin_pct)))
+        self.valley_margin_pct = max(0.0, min(1.0, float(valley_margin_pct)))
         self.calibration_reps = max(1, int(calibration_reps))
         self.calibration_certainty = max(0.0, min(1.0, float(calibration_certainty)))
         self.calibration_force_extra_reps = max(0, int(calibration_force_extra_reps))
@@ -270,6 +242,12 @@ class PeakDetector:
             "certainty": certainty,
             "amplitude": amplitude,
         }
+
+    def _calibrated_rom(self) -> float:
+        """Calibrated range of motion (avg_peak − avg_valley), or 0 if not yet calibrated."""
+        if self._calibrated_avg_peak is not None and self._calibrated_avg_valley is not None:
+            return max(0.0, self._calibrated_avg_peak - self._calibrated_avg_valley)
+        return 0.0
 
     def _maybe_lock_calibration(self) -> None:
         if self._calibrated:
@@ -382,9 +360,11 @@ class PeakDetector:
                     if not self._calibrated:
                         within_margin = True
                     else:
+                        rom = self._calibrated_rom()
                         within_margin = (
                             self._calibrated_avg_peak is not None
-                            and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin
+                            and rom > 0
+                            and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin_pct * rom
                         )
                     gate_ok = self._range_gate_allows_rep_recording()
                     if within_margin and gate_ok:
@@ -407,22 +387,6 @@ class PeakDetector:
                                 rep_completed = True
                                 self._last_rep_time_ms = now_ms
                             self._maybe_lock_calibration()
-                    # region agent log
-                    elif self.frame_count % 30 == 0:
-                        _agent_debug_ndjson(
-                            "math_engine.py:PeakDetector.update",
-                            "peak_not_recorded",
-                            {
-                                "within_margin": within_margin,
-                                "range_gate_open": gate_ok,
-                                "calibrated": self._calibrated,
-                                "current_peak": self.current_peak_value,
-                                "avg_peak": self._calibrated_avg_peak,
-                                "rep_count": self.rep_count,
-                            },
-                            "H3" if not within_margin else "H2",
-                        )
-                    # endregion
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
 
@@ -434,9 +398,11 @@ class PeakDetector:
                     if not self._calibrated:
                         within_margin = True
                     else:
+                        rom = self._calibrated_rom()
                         within_margin = (
                             self._calibrated_avg_valley is not None
-                            and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin
+                            and rom > 0
+                            and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin_pct * rom
                         )
                     gate_ok_v = self._range_gate_allows_rep_recording()
                     if within_margin and gate_ok_v:
@@ -459,22 +425,6 @@ class PeakDetector:
                                 rep_completed = True
                                 self._last_rep_time_ms = now_ms
                             self._maybe_lock_calibration()
-                    # region agent log
-                    elif self.frame_count % 30 == 0:
-                        _agent_debug_ndjson(
-                            "math_engine.py:PeakDetector.update",
-                            "valley_not_recorded",
-                            {
-                                "within_margin": within_margin,
-                                "range_gate_open": gate_ok_v,
-                                "calibrated": self._calibrated,
-                                "current_valley": self.current_valley_value,
-                                "avg_valley": self._calibrated_avg_valley,
-                                "rep_count": self.rep_count,
-                            },
-                            "H3" if not within_margin else "H2",
-                        )
-                    # endregion
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 
@@ -552,8 +502,8 @@ def create_peak_detector(
     smoothing_factor: float = 0.3,
     hysteresis: float = 3.0,
     min_peak_distance: int = 10,
-    peak_margin: float = 15.0,
-    valley_margin: float = 15.0,
+    peak_margin_pct: float = 0.50,
+    valley_margin_pct: float = 0.50,
     min_range_gate_degrees: float = 15.0,
     range_window_frames: int = 90,
     range_min_samples: int = 12,
@@ -569,8 +519,8 @@ def create_peak_detector(
         smoothing_factor=smoothing_factor,
         hysteresis=hysteresis,
         min_peak_distance=min_peak_distance,
-        peak_margin=peak_margin,
-        valley_margin=valley_margin,
+        peak_margin_pct=peak_margin_pct,
+        valley_margin_pct=valley_margin_pct,
         min_range_gate_degrees=min_range_gate_degrees,
         range_window_frames=range_window_frames,
         range_min_samples=range_min_samples,

@@ -143,8 +143,8 @@ DEBUG_CONSOLE_ENABLED = LOG_LEVEL == "DEBUG"
 DEFAULT_HYSTERESIS = _toml_float("rep", "hysteresis", default=5.0)
 DEFAULT_MIN_PEAK_DISTANCE = _toml_int("rep", "min_peak_distance", default=5)
 DEFAULT_SMOOTHING_FACTOR = _toml_float("rep", "smoothing_factor", default=0.45)
-DEFAULT_PEAK_MARGIN = _toml_float("rep", "peak_margin", default=15.0)
-DEFAULT_VALLEY_MARGIN = _toml_float("rep", "valley_margin", default=15.0)
+DEFAULT_PEAK_MARGIN_PCT = _toml_float("rep", "peak_margin_pct", default=0.50)
+DEFAULT_VALLEY_MARGIN_PCT = _toml_float("rep", "valley_margin_pct", default=0.50)
 DEFAULT_MIN_RANGE_GATE = _toml_float("rep", "min_range_gate", default=15.0)
 DEFAULT_RANGE_WINDOW_FRAMES = _toml_int("rep", "range_window_frames", default=90)
 DEFAULT_RANGE_MIN_SAMPLES = _toml_int("rep", "range_min_samples", default=12)
@@ -197,8 +197,8 @@ def get_default_tuning_params() -> dict:
         "hysteresis": DEFAULT_HYSTERESIS,
         "minPeakDistance": DEFAULT_MIN_PEAK_DISTANCE,
         "smoothingFactor": DEFAULT_SMOOTHING_FACTOR,
-        "peakMargin": DEFAULT_PEAK_MARGIN,
-        "valleyMargin": DEFAULT_VALLEY_MARGIN,
+        "peakMarginPct": DEFAULT_PEAK_MARGIN_PCT,
+        "valleyMarginPct": DEFAULT_VALLEY_MARGIN_PCT,
         "minRangeGate": DEFAULT_MIN_RANGE_GATE,
         "rangeWindowFrames": DEFAULT_RANGE_WINDOW_FRAMES,
         "rangeMinSamples": DEFAULT_RANGE_MIN_SAMPLES,

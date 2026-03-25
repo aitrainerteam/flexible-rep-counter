@@ -40,8 +40,8 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
         smoothing_factor=float(tp.get("smoothingFactor", d["smoothingFactor"])),
         hysteresis=float(tp.get("hysteresis", d["hysteresis"])),
         min_peak_distance=int(tp.get("minPeakDistance", d["minPeakDistance"])),
-        peak_margin=float(tp.get("peakMargin", d["peakMargin"])),
-        valley_margin=float(tp.get("valleyMargin", d["valleyMargin"])),
+        peak_margin_pct=float(tp.get("peakMarginPct", d["peakMarginPct"])),
+        valley_margin_pct=float(tp.get("valleyMarginPct", d["valleyMarginPct"])),
         min_range_gate_degrees=float(tp.get("minRangeGate", d["minRangeGate"])),
         range_window_frames=int(tp.get("rangeWindowFrames", d["rangeWindowFrames"])),
         range_min_samples=int(tp.get("rangeMinSamples", d["rangeMinSamples"])),
@@ -338,7 +338,19 @@ class RepCounterSession:
             lock_from_dominance = (
                 ready and dom_ok and streak >= ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES
             )
-            variance_fallback_ready = ready and elapsed >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC
+            # If we already observe enough reps during selection, allow earlier variance lock
+            # instead of waiting the full fallback timeout.
+            cal_reps_target = int(
+                tuning_params.get(
+                    "calibrationReps",
+                    get_default_tuning_params()["calibrationReps"],
+                )
+            )
+            total_selection_reps = int(rep_dom.get("totalReps") or 0)
+            variance_fallback_ready = ready and (
+                elapsed >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC
+                or total_selection_reps >= cal_reps_target
+            )
 
             locked_this_frame = False
             selected_angle_local: Optional[str] = None
