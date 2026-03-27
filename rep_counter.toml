@@ -75,7 +75,7 @@ min_range_deg = 16.0
 # Winner’s variance must be ≥ runner_up × this (when runner-up > 0). Higher = need a clearer winner; lower = closer scores still pick a joint.
 second_best_ratio = 1.15
 # Min sliding windows with “active” variance for a candidate. Higher = stricter consistency; lower = fewer windows required.
-min_active_windows = 4
+min_active_windows = 3
 # Moving-average window (samples) when smoothing angles for variance/ROM stats. Higher = smoother stats, slower detail; lower = noisier, more responsive.
 smooth_window = 5
 

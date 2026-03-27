@@ -43,7 +43,13 @@ FRAME_MIN_CONFIDENCE = 0.5
 MIN_ACTIVE_WINDOWS = ANGLE_SELECTION_MIN_ACTIVE_WINDOWS
 SMOOTH_WINDOW = ANGLE_SELECTION_SMOOTH_WINDOW
 ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
-SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO = 0.6
+SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO = 0.55
+# Across-body angles (elbow–shoulder–opposite shoulder, etc.) must beat same-side
+# non-across alternatives by this median-window-variance ratio to stay selected.
+ACROSS_DOMINANCE_MIN_RATIO = 1.32
+# When the #2 candidate is hip/shoulder *across* and #1 is a limb joint, median-window
+# variances are not directly comparable; use at most this ratio (vs global second_best).
+SECOND_BEST_RELAXED_WHEN_RUNNERUP_ACROSS = 1.06
 
 
 def _angle_side(angle_key: str) -> str:
@@ -229,6 +235,33 @@ def _candidate_score_if_eligible(
     return consistent_var
 
 
+def _non_across_alternatives_order(across_key: str) -> list[str]:
+    """Same-side joints to try before accepting a shoulder/hip *across* angle."""
+    if across_key == "LEFT_SHOULDER_ACROSS":
+        return ["LEFT_ELBOW", "LEFT_SHOULDER"]
+    if across_key == "RIGHT_SHOULDER_ACROSS":
+        return ["RIGHT_ELBOW", "RIGHT_SHOULDER"]
+    if across_key == "LEFT_HIP_ACROSS":
+        return ["LEFT_KNEE", "LEFT_HIP"]
+    if across_key == "RIGHT_HIP_ACROSS":
+        return ["RIGHT_KNEE", "RIGHT_HIP"]
+    return []
+
+
+def _prefer_same_side_alt_over_across(
+    across_key: str,
+    across_score: float,
+    alt_key: str,
+    alt_score: float,
+) -> bool:
+    if across_score <= 0.0 or alt_score <= 0.0:
+        return False
+    if across_key.endswith("_SHOULDER_ACROSS") and alt_key.endswith("_ELBOW"):
+        if alt_score >= across_score * SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO:
+            return True
+    return across_score < alt_score * ACROSS_DOMINANCE_MIN_RATIO
+
+
 def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Pick the clearest winner: multi-window activity, meaningful ROM, and margin over the runner-up."""
     ranked: list[tuple[float, str, dict[str, Any]]] = []
@@ -241,22 +274,24 @@ def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[st
     if not ranked:
         return None
     top_score, top_key, top_data = ranked[0]
-    if top_key.endswith("_SHOULDER_ACROSS"):
-        preferred_elbow = top_key.replace("SHOULDER_ACROSS", "ELBOW")
-        elbow_data = variances.get(preferred_elbow)
-        if elbow_data is not None:
-            elbow_score = _candidate_score_if_eligible(preferred_elbow, elbow_data)
-            # Across-shoulder angles can spike from torso sway during curls.
-            # If the same-side elbow is also clearly active, prefer elbow tracking.
-            if (
-                elbow_score is not None
-                and top_score > 0.0
-                and elbow_score >= top_score * SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO
-            ):
-                return {"key": preferred_elbow, **elbow_data}
+    if top_key.endswith("_SHOULDER_ACROSS") or top_key.endswith("_HIP_ACROSS"):
+        for alt_key in _non_across_alternatives_order(top_key):
+            alt_data = variances.get(alt_key)
+            if alt_data is None:
+                continue
+            alt_score = _candidate_score_if_eligible(alt_key, alt_data)
+            if alt_score is None:
+                continue
+            prefer_alt = _prefer_same_side_alt_over_across(
+                top_key, top_score, alt_key, alt_score
+            )
+            if prefer_alt:
+                return {"key": alt_key, **alt_data}
     if len(ranked) >= 2:
-        second_score = ranked[1][0]
+        second_score, second_key, _ = ranked[1]
         ratio = _angle_selection_thresholds(top_key)["second_best_ratio"]
+        if second_key.endswith("_ACROSS") and not top_key.endswith("_ACROSS"):
+            ratio = min(ratio, SECOND_BEST_RELAXED_WHEN_RUNNERUP_ACROSS)
         if second_score > 0 and top_score < second_score * ratio:
             return None
     return {"key": top_key, **top_data}

@@ -178,7 +178,7 @@ ANGLE_SELECTION_SWITCH_VARIANCE_RATIO = _toml_float(
 ANGLE_SELECTION_MIN_VARIANCE = _toml_float("angle_selection", "min_variance", default=6.0)
 ANGLE_SELECTION_MIN_RANGE_DEG = _toml_float("angle_selection", "min_range_deg", default=16.0)
 ANGLE_SELECTION_SECOND_BEST_RATIO = _toml_float("angle_selection", "second_best_ratio", default=1.15)
-ANGLE_SELECTION_MIN_ACTIVE_WINDOWS = _toml_int("angle_selection", "min_active_windows", default=4)
+ANGLE_SELECTION_MIN_ACTIVE_WINDOWS = _toml_int("angle_selection", "min_active_windows", default=3)
 ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", default=5)
 
 
