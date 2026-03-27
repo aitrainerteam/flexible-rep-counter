@@ -5,14 +5,43 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
 
 MIN_VARIANCE_THRESHOLD = 5.0
+_DEBUG_LOG_PATH = Path("/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-75e746.log")
+_DEBUG_SESSION_ID = "75e746"
+_DEBUG_RUN_ID = "post-fix"
+
+
+def _agent_debug_log(
+    *,
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, Any],
+) -> None:
+    try:
+        payload = {
+            "sessionId": _DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 # -----------------------------------------------------------------------------
 # Geometry
@@ -80,14 +109,24 @@ def calculate_body_scale(landmarks: list) -> float:
     if not landmarks or len(landmarks) < 17:
         return 1.0
     nose = landmarks[0]
+    left_shoulder = landmarks[5]
+    right_shoulder = landmarks[6]
     left_ankle = landmarks[15]
     right_ankle = landmarks[16]
-    if not nose or not left_ankle or not right_ankle:
+    if not left_ankle or not right_ankle:
         return 1.0
-    _, ny = _get_xy(nose)
+    top_y: Optional[float] = None
+    if nose and isinstance(nose.get("confidence"), (int, float)) and float(nose.get("confidence", 0.0)) > 0.0:
+        _, top_y = _get_xy(nose)
+    elif left_shoulder and right_shoulder:
+        _, ly = _get_xy(left_shoulder)
+        _, ry = _get_xy(right_shoulder)
+        top_y = (ly + ry) / 2.0
+    if top_y is None:
+        return 1.0
     _, ly = _get_xy(left_ankle)
     _, ry = _get_xy(right_ankle)
-    height = (ly + ry) / 2 - ny
+    height = (ly + ry) / 2 - top_y
     return abs(height) or 1.0
 
 
@@ -264,6 +303,33 @@ class PeakDetector:
             self._calibrated = True
             self._calibrated_avg_peak = float(stats["avgPeak"]) if stats.get("avgPeak") is not None else None
             self._calibrated_avg_valley = float(stats["avgValley"]) if stats.get("avgValley") is not None else None
+            # region agent log
+            _agent_debug_log(
+                run_id=_DEBUG_RUN_ID,
+                hypothesis_id="H5",
+                location="math_engine.py:_maybe_lock_calibration",
+                message="Calibration locked",
+                data={
+                    "detectorLabel": str(getattr(self, "debug_label", "") or ""),
+                    "repCount": int(self.rep_count),
+                    "calibrationReps": int(self.calibration_reps),
+                    "certainty": round(float(certainty), 5),
+                    "certaintyTarget": round(float(self.calibration_certainty), 5),
+                    "forceAtRep": int(force_at),
+                    "forceLockUsed": bool(not certainty_ok and force_ok),
+                    "avgPeak": (
+                        round(float(self._calibrated_avg_peak), 5)
+                        if self._calibrated_avg_peak is not None
+                        else None
+                    ),
+                    "avgValley": (
+                        round(float(self._calibrated_avg_valley), 5)
+                        if self._calibrated_avg_valley is not None
+                        else None
+                    ),
+                },
+            )
+            # endregion
 
     def _pass_through_deadband(self, raw_value: float) -> float:
         """Hold previous angle when frame-to-frame change is below threshold; else accept new sample."""
@@ -367,26 +433,66 @@ class PeakDetector:
                             and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin_pct * rom
                         )
                     gate_ok = self._range_gate_allows_rep_recording()
-                    if within_margin and gate_ok:
-                        new_rep_count_if = min(len(self.peaks) + 1, len(self.valleys))
-                        rep_would_increment = new_rep_count_if > self.rep_count
-                        now_ms = time.time() * 1000.0
-                        interval_ok = True
-                        if rep_would_increment and self.min_rep_interval_ms > 0:
-                            if self._last_rep_time_ms is not None and (
-                                now_ms - self._last_rep_time_ms
-                            ) < self.min_rep_interval_ms:
-                                interval_ok = False
-                        if interval_ok:
-                            detected_peak = self.current_peak_value
-                            self.peaks.append(self.current_peak_value)
-                            self.last_peak_frame = self.frame_count
-                            new_rep_count = min(len(self.peaks), len(self.valleys))
-                            if new_rep_count > self.rep_count:
-                                self.rep_count = new_rep_count
-                                rep_completed = True
-                                self._last_rep_time_ms = now_ms
-                            self._maybe_lock_calibration()
+                    distance_ok = self.frame_count - self.last_peak_frame >= self.min_peak_distance
+                    interval_ok = True
+                    new_rep_count_if = min(len(self.peaks) + 1, len(self.valleys))
+                    rep_would_increment = new_rep_count_if > self.rep_count
+                    now_ms = time.time() * 1000.0
+                    if rep_would_increment and self.min_rep_interval_ms > 0:
+                        if self._last_rep_time_ms is not None and (
+                            now_ms - self._last_rep_time_ms
+                        ) < self.min_rep_interval_ms:
+                            interval_ok = False
+                    # region agent log
+                    _agent_debug_log(
+                        run_id=_DEBUG_RUN_ID,
+                        hypothesis_id="H2_H3_H4",
+                        location="math_engine.py:peak_turn",
+                        message="Peak turn evaluated",
+                        data={
+                            "detectorLabel": str(getattr(self, "debug_label", "") or ""),
+                            "stateBeforeTurn": PEAK_STATE_GOING_UP,
+                            "frameCount": int(self.frame_count),
+                            "repCount": int(self.rep_count),
+                            "peaksLen": int(len(self.peaks)),
+                            "valleysLen": int(len(self.valleys)),
+                            "newRepCountIf": int(new_rep_count_if),
+                            "repWouldIncrement": bool(rep_would_increment),
+                            "withinMargin": bool(within_margin),
+                            "rangeGateOpen": bool(gate_ok),
+                            "distanceOk": bool(distance_ok),
+                            "intervalOk": bool(interval_ok),
+                        },
+                    )
+                    # endregion
+                    allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
+                    if within_margin and (gate_ok or allow_record_while_gate_closed):
+                        detected_peak = self.current_peak_value
+                        self.peaks.append(self.current_peak_value)
+                        self.last_peak_frame = self.frame_count
+                        new_rep_count = min(len(self.peaks), len(self.valleys))
+                        if new_rep_count > self.rep_count and gate_ok and interval_ok:
+                            self.rep_count = new_rep_count
+                            rep_completed = True
+                            self._last_rep_time_ms = now_ms
+                        elif new_rep_count > self.rep_count and allow_record_while_gate_closed:
+                            # region agent log
+                            _agent_debug_log(
+                                run_id=_DEBUG_RUN_ID,
+                                hypothesis_id="H4_fix",
+                                location="math_engine.py:peak_turn_deferred_rep",
+                                message="Deferred rep increment while gate closed (calibration capture)",
+                                data={
+                                    "detectorLabel": str(getattr(self, "debug_label", "") or ""),
+                                    "frameCount": int(self.frame_count),
+                                    "repCount": int(self.rep_count),
+                                    "pendingRepCount": int(new_rep_count),
+                                    "peaksLen": int(len(self.peaks)),
+                                    "valleysLen": int(len(self.valleys)),
+                                },
+                            )
+                            # endregion
+                        self._maybe_lock_calibration()
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
 
@@ -405,26 +511,66 @@ class PeakDetector:
                             and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin_pct * rom
                         )
                     gate_ok_v = self._range_gate_allows_rep_recording()
-                    if within_margin and gate_ok_v:
-                        new_rep_count_if = min(len(self.peaks), len(self.valleys) + 1)
-                        rep_would_increment = new_rep_count_if > self.rep_count
-                        now_ms = time.time() * 1000.0
-                        interval_ok = True
-                        if rep_would_increment and self.min_rep_interval_ms > 0:
-                            if self._last_rep_time_ms is not None and (
-                                now_ms - self._last_rep_time_ms
-                            ) < self.min_rep_interval_ms:
-                                interval_ok = False
-                        if interval_ok:
-                            detected_valley = self.current_valley_value
-                            self.valleys.append(self.current_valley_value)
-                            self.last_peak_frame = self.frame_count
-                            new_rep_count = min(len(self.peaks), len(self.valleys))
-                            if new_rep_count > self.rep_count:
-                                self.rep_count = new_rep_count
-                                rep_completed = True
-                                self._last_rep_time_ms = now_ms
-                            self._maybe_lock_calibration()
+                    distance_ok_v = self.frame_count - self.last_peak_frame >= self.min_peak_distance
+                    interval_ok = True
+                    new_rep_count_if = min(len(self.peaks), len(self.valleys) + 1)
+                    rep_would_increment = new_rep_count_if > self.rep_count
+                    now_ms = time.time() * 1000.0
+                    if rep_would_increment and self.min_rep_interval_ms > 0:
+                        if self._last_rep_time_ms is not None and (
+                            now_ms - self._last_rep_time_ms
+                        ) < self.min_rep_interval_ms:
+                            interval_ok = False
+                    # region agent log
+                    _agent_debug_log(
+                        run_id=_DEBUG_RUN_ID,
+                        hypothesis_id="H2_H3_H4",
+                        location="math_engine.py:valley_turn",
+                        message="Valley turn evaluated",
+                        data={
+                            "detectorLabel": str(getattr(self, "debug_label", "") or ""),
+                            "stateBeforeTurn": PEAK_STATE_GOING_DOWN,
+                            "frameCount": int(self.frame_count),
+                            "repCount": int(self.rep_count),
+                            "peaksLen": int(len(self.peaks)),
+                            "valleysLen": int(len(self.valleys)),
+                            "newRepCountIf": int(new_rep_count_if),
+                            "repWouldIncrement": bool(rep_would_increment),
+                            "withinMargin": bool(within_margin),
+                            "rangeGateOpen": bool(gate_ok_v),
+                            "distanceOk": bool(distance_ok_v),
+                            "intervalOk": bool(interval_ok),
+                        },
+                    )
+                    # endregion
+                    allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok_v)
+                    if within_margin and (gate_ok_v or allow_record_while_gate_closed):
+                        detected_valley = self.current_valley_value
+                        self.valleys.append(self.current_valley_value)
+                        self.last_peak_frame = self.frame_count
+                        new_rep_count = min(len(self.peaks), len(self.valleys))
+                        if new_rep_count > self.rep_count and gate_ok_v and interval_ok:
+                            self.rep_count = new_rep_count
+                            rep_completed = True
+                            self._last_rep_time_ms = now_ms
+                        elif new_rep_count > self.rep_count and allow_record_while_gate_closed:
+                            # region agent log
+                            _agent_debug_log(
+                                run_id=_DEBUG_RUN_ID,
+                                hypothesis_id="H4_fix",
+                                location="math_engine.py:valley_turn_deferred_rep",
+                                message="Deferred rep increment while gate closed (calibration capture)",
+                                data={
+                                    "detectorLabel": str(getattr(self, "debug_label", "") or ""),
+                                    "frameCount": int(self.frame_count),
+                                    "repCount": int(self.rep_count),
+                                    "pendingRepCount": int(new_rep_count),
+                                    "peaksLen": int(len(self.peaks)),
+                                    "valleysLen": int(len(self.valleys)),
+                                },
+                            )
+                            # endregion
+                        self._maybe_lock_calibration()
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 

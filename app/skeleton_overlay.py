@@ -6,11 +6,8 @@ from __future__ import annotations
 import cv2
 from typing import Optional
 
-# COCO 17: 0 nose, 1 L eye, 2 R eye, 3 L ear, 4 R ear,
-# 5 L shoulder, 6 R shoulder, 7 L elbow, 8 R elbow, 9 L wrist, 10 R wrist,
-# 11 L hip, 12 R hip, 13 L knee, 14 R knee, 15 L ankle, 16 R ankle
+# COCO 17: face (0-4) kept only for index compatibility; body starts at 5.
 SKELETON_CONNECTIONS = [
-    (0, 1), (0, 2), (1, 3), (2, 4),           # face
     (5, 6), (5, 11), (6, 12), (11, 12),       # torso
     (5, 7), (7, 9), (6, 8), (8, 10),          # arms
     (11, 13), (13, 15), (12, 14), (14, 16),   # legs
@@ -54,7 +51,7 @@ def draw_skeleton(
     point_radius: int = DEFAULT_POINT_RADIUS,
 ) -> None:
     """
-    Draw COCO 17 skeleton and keypoints on an OpenCV BGR frame in-place.
+    Draw body-only skeleton and keypoints on an OpenCV BGR frame in-place.
     landmarks: list of 17 dicts with x, y, confidence.
     """
     if not landmarks or len(landmarks) < 17:
@@ -67,7 +64,8 @@ def draw_skeleton(
         if pt1 and pt2:
             cv2.line(frame, pt1, pt2, line_color, line_thickness, cv2.LINE_AA)
 
-    for kp in landmarks:
+    # Skip face keypoints (0-4) to reduce render work and visual clutter.
+    for kp in landmarks[5:]:
         pt = _get_xy(kp, fs, confidence_threshold=confidence_threshold)
         if pt:
             cv2.circle(frame, pt, point_radius, point_color, -1, cv2.LINE_AA)

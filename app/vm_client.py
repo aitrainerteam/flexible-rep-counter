@@ -13,7 +13,8 @@ from app.config import VM_BASE_URL, VM_TIMEOUT_SEC
 
 logger = logging.getLogger(__name__)
 
-# COCO 17 keypoint order (matches yolo-deploy / Ultralytics pose)
+# COCO 17 keypoint order (matches yolo-deploy / Ultralytics pose).
+# Face slots are kept for index compatibility, but may be absent in payloads.
 COCO_KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
     "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
@@ -21,6 +22,8 @@ COCO_KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 NUM_KEYPOINTS = 17
+FACE_KEYPOINT_COUNT = 5
+BODY_KEYPOINT_NAMES = COCO_KEYPOINT_NAMES[FACE_KEYPOINT_COUNT:]
 
 
 @dataclass
@@ -37,6 +40,10 @@ class VmPredictOutcome:
 
 def _landmark_from_xyc(x: float, y: float, c: float) -> dict:
     return {"x": float(x), "y": float(y), "confidence": float(c)}
+
+
+def _empty_landmark() -> dict:
+    return {"x": 0.0, "y": 0.0, "confidence": 0.0}
 
 
 def validate_predict_response(data: Any) -> tuple[bool, list[str]]:
@@ -61,9 +68,10 @@ def validate_predict_response(data: Any) -> tuple[bool, list[str]]:
         if not isinstance(kp, dict):
             issues.append(f"{p}.keypoints is not a dict")
             continue
-        for name in COCO_KEYPOINT_NAMES:
+        # Require only body joints. Face keypoints are optional.
+        for name in BODY_KEYPOINT_NAMES:
             if name not in kp:
-                issues.append(f"{p}.keypoints missing '{name}'")
+                issues.append(f"{p}.keypoints missing body joint '{name}'")
                 break
             pt = kp[name]
             if not isinstance(pt, dict) or "x" not in pt or "y" not in pt:
@@ -113,13 +121,15 @@ def _person_keypoints_to_list(kp_dict: dict) -> Optional[list[dict]]:
     if not isinstance(kp_dict, dict):
         return None
     out = []
-    for name in COCO_KEYPOINT_NAMES:
+    for idx, name in enumerate(COCO_KEYPOINT_NAMES):
         pt = kp_dict.get(name)
         if isinstance(pt, dict):
             x = pt.get("x", pt.get("x_center", 0))
             y = pt.get("y", pt.get("y_center", 0))
             c = pt.get("conf", pt.get("confidence", 1.0))
             out.append(_landmark_from_xyc(x, y, c))
+        elif idx < FACE_KEYPOINT_COUNT:
+            out.append(_empty_landmark())
         else:
             return None
     return out

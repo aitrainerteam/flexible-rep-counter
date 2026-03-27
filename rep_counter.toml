@@ -62,6 +62,12 @@ min_leading_reps = 2
 dominance_streak_frames = 36
 # Seconds observed before variance-based fallback can run if dominance has not locked. Higher = wait longer for dominance; lower = fall back to variance sooner.
 variance_fallback_sec = 14.0
+# During tracking, re-run variance selection at this interval (sec). Lower = faster adaptation to new exercise, higher = less churn.
+reevaluate_every_sec = 0.75
+# After a switch, wait at least this many seconds before allowing another switch. Higher = stabler lock, lower = more reactive.
+switch_min_sec = 1.5
+# Candidate variance must beat current tracked joint by this ratio to switch (unless current fails gate). Higher = stricter switching.
+switch_variance_ratio = 1.2
 # Min median window variance for a joint to qualify. Higher = only very active angles pass; lower = weaker motion can win.
 min_variance = 6.0
 # Min smoothed ROM (max−min deg) for a joint to qualify. Higher = need large movement; lower = smaller ROM angles can be chosen.

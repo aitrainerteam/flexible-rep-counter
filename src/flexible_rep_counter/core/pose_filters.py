@@ -26,6 +26,7 @@ ONE_EURO_CONFIG = {
 HISTORY_SIZE = 5
 CONFIDENCE_THRESHOLD = 0.3
 MAX_VELOCITY_PER_FRAME = 50.0
+BODY_START_INDEX = 5
 
 
 class OneEuroFilter:
@@ -90,14 +91,22 @@ def filter_keypoints_one_euro(
     if not keypoints or len(keypoints) != 17 or len(filters) != 17:
         return keypoints
     t = timestamp_ms if timestamp_ms is not None else time.time() * 1000.0
-    return [
-        {
-            "x": filters[i]["x"].filter(kp.get("x", 0.0), t),
-            "y": filters[i]["y"].filter(kp.get("y", 0.0), t),
-            "confidence": kp.get("confidence", 1.0),
-        }
-        for i, kp in enumerate(keypoints)
-    ]
+    out: list[dict] = []
+    for i, kp in enumerate(keypoints):
+        if i < BODY_START_INDEX:
+            out.append({"x": 0.0, "y": 0.0, "confidence": 0.0})
+            continue
+        if not isinstance(kp, dict):
+            out.append({"x": 0.0, "y": 0.0, "confidence": 0.0})
+            continue
+        out.append(
+            {
+                "x": filters[i]["x"].filter(kp.get("x", 0.0), t),
+                "y": filters[i]["y"].filter(kp.get("y", 0.0), t),
+                "confidence": kp.get("confidence", 1.0),
+            }
+        )
+    return out
 
 
 def reset_one_euro_filters(filters: list[dict]) -> None:
@@ -162,12 +171,15 @@ class PoseFilterPipeline:
             return keypoints
         smoothed = filter_keypoints_one_euro(keypoints, self._filters, timestamp_ms)
         if self._previous is not None:
-            smoothed = [clamp_velocity(smoothed[i], self._previous[i]) for i in range(17)]
+            smoothed = [
+                clamp_velocity(smoothed[i], self._previous[i]) if i >= BODY_START_INDEX else smoothed[i]
+                for i in range(17)
+            ]
         self._previous = smoothed
         if self._history:
             keypoint_history = [[f[i] for f in self._history] for i in range(17)]
             smoothed = [
-                interpolate_keypoint(smoothed[i], keypoint_history[i])
+                interpolate_keypoint(smoothed[i], keypoint_history[i]) if i >= BODY_START_INDEX else smoothed[i]
                 for i in range(17)
             ]
         self._history.append(smoothed)

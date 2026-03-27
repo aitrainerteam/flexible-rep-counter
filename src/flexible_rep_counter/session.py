@@ -1,9 +1,11 @@
 """Session state machine: landmark stream -> rep metrics (same logic as legacy webcam loop)."""
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 from flexible_rep_counter.core.math_engine import (
@@ -20,6 +22,9 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_MIN_LEADING_REPS,
     ANGLE_SELECTION_MIN_SEC,
     ANGLE_SELECTION_RETRY_INTERVAL_SEC,
+    ANGLE_SELECTION_REEVALUATE_EVERY_SEC,
+    ANGLE_SELECTION_SWITCH_MIN_SEC,
+    ANGLE_SELECTION_SWITCH_VARIANCE_RATIO,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     get_default_tuning_params,
 )
@@ -28,9 +33,38 @@ from flexible_rep_counter.core.variance_angle_selector import (
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
+    passes_consistent_variance_gate,
     summarize_rep_dominance,
 )
 from flexible_rep_counter.types import StepResult
+
+_DEBUG_LOG_PATH = Path("/Users/aa/Desktop/flexible-rep-counter/.cursor/debug-75e746.log")
+_DEBUG_SESSION_ID = "75e746"
+_DEBUG_RUN_ID = "post-fix"
+
+
+def _agent_debug_log(
+    *,
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, Any],
+) -> None:
+    try:
+        payload = {
+            "sessionId": _DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
 
 
 def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
@@ -66,6 +100,8 @@ def _apply_locked_tracking(
     run_state["selected_angle"] = selected_angle
     run_state["selected_config"] = COMMON_ANGLES[selected_angle]
     run_state["selection_last_attempt"] = None
+    run_state["selection_last_reevaluate_at"] = time.time()
+    run_state["selection_last_switch_at"] = time.time()
     det: Any
     if selection_detector is not None:
         det = selection_detector
@@ -77,11 +113,60 @@ def _apply_locked_tracking(
         ]
         replay_angle_series_on_peak_detector(det, series)
     run_state["peak_detector"] = det
-    run_state["selection_detectors_by_angle"] = {}
+    det_state = det.get_state() if det is not None else {}
+    # region agent log
+    _agent_debug_log(
+        run_id=_DEBUG_RUN_ID,
+        hypothesis_id="H1",
+        location="session.py:_apply_locked_tracking",
+        message="Tracking lock applied with detector state carryover",
+        data={
+            "selectedAngle": str(selected_angle),
+            "detectorRepCount": int(det_state.get("repCount") or 0),
+            "calibrationComplete": bool(det_state.get("calibrationComplete", False)),
+            "calibratedAvgPeak": (
+                float(det_state["calibratedAvgPeak"])
+                if det_state.get("calibratedAvgPeak") is not None
+                else None
+            ),
+            "calibratedAvgValley": (
+                float(det_state["calibratedAvgValley"])
+                if det_state.get("calibratedAvgValley") is not None
+                else None
+            ),
+        },
+    )
+    # endregion
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
-    cast_fb = run_state["frame_buffer"]
-    cast_fb.clear()
+
+
+def _collect_joint_records(
+    detectors_by_angle: dict[str, Any], variances: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    records: dict[str, Any] = {}
+    for angle_key in COMMON_ANGLES:
+        det = detectors_by_angle.get(angle_key)
+        det_state = det.get_state() if det is not None else {}
+        v = variances.get(angle_key) or {}
+        records[angle_key] = {
+            "repCount": int(det_state.get("repCount") or 0),
+            "avgPeak": (
+                float(det_state["calibratedAvgPeak"])
+                if det_state.get("calibratedAvgPeak") is not None
+                else None
+            ),
+            "avgValley": (
+                float(det_state["calibratedAvgValley"])
+                if det_state.get("calibratedAvgValley") is not None
+                else None
+            ),
+            "calibrationComplete": bool(det_state.get("calibrationComplete", False)),
+            "medianWindowVariance": float(v.get("medianWindowVariance") or 0.0),
+            "activeWindowCount": int(v.get("activeWindowCount") or 0),
+            "smoothedRangeDeg": float(v.get("smoothedRangeDeg") or 0.0),
+        }
+    return records
 
 
 def _selection_status_message(
@@ -184,6 +269,8 @@ class RepCounterSession:
             "started_at": time.time() if self._auto_started else None,
             "frame_buffer": deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES),
             "selection_last_attempt": None,
+            "selection_last_reevaluate_at": None,
+            "selection_last_switch_at": None,
             "selection_detectors_by_angle": {},
             "selection_dominance_key": None,
             "selection_dominance_streak": 0,
@@ -191,6 +278,11 @@ class RepCounterSession:
             "selected_config": None,
             "peak_detector": None,
             "tuning_params": dict(tp),
+            "debug_last_selection_log_bucket": -1,
+            "debug_last_rep_count": 0,
+            "debug_last_calibration_complete": None,
+            "debug_last_range_gate_open": None,
+            "debug_last_peak_state": None,
         }
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
@@ -200,9 +292,16 @@ class RepCounterSession:
         self._run_state["started"] = True
         self._run_state["started_at"] = wall_time if wall_time is not None else time.time()
         self._run_state["selection_last_attempt"] = None
+        self._run_state["selection_last_reevaluate_at"] = None
+        self._run_state["selection_last_switch_at"] = None
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["debug_last_selection_log_bucket"] = -1
+        self._run_state["debug_last_rep_count"] = 0
+        self._run_state["debug_last_calibration_complete"] = None
+        self._run_state["debug_last_range_gate_open"] = None
+        self._run_state["debug_last_peak_state"] = None
 
     def clear_tracking_keep_started(self) -> None:
         """Second Start click: clear selection/tracking but keep started=True."""
@@ -211,9 +310,16 @@ class RepCounterSession:
         self._run_state["peak_detector"] = None
         self._run_state["frame_buffer"] = deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES)
         self._run_state["selection_last_attempt"] = None
+        self._run_state["selection_last_reevaluate_at"] = None
+        self._run_state["selection_last_switch_at"] = None
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["debug_last_selection_log_bucket"] = -1
+        self._run_state["debug_last_rep_count"] = 0
+        self._run_state["debug_last_calibration_complete"] = None
+        self._run_state["debug_last_range_gate_open"] = None
+        self._run_state["debug_last_peak_state"] = None
 
     @property
     def started(self) -> bool:
@@ -286,14 +392,38 @@ class RepCounterSession:
         self._last_smoothed_landmarks = lm
 
         frame_buffer = rs["frame_buffer"]
+        frame_buffer.append(lm)
+        buf_list = list(frame_buffer)
+        started_at = float(rs.get("started_at") or 0.0)
+        elapsed = now - started_at
+
+        sdba: dict[str, Any] = rs.get("selection_detectors_by_angle") or {}
+        if not sdba:
+            sdba = {ak: _peak_detector_from_tuning(tuning_params) for ak in COMMON_ANGLES}
+            for ak, det in sdba.items():
+                try:
+                    setattr(det, "debug_label", ak)
+                except Exception:
+                    pass
+            rs["selection_detectors_by_angle"] = sdba
+
+        angle_values: dict[str, Optional[float]] = {}
+        detector_outputs: dict[str, dict[str, Any]] = {}
+        for ak, cfg in COMMON_ANGLES.items():
+            val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+            angle_values[ak] = val
+            detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
+
+        rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
+        rep_dom = summarize_rep_dominance(rep_counts_sel)
+        variances = compute_angle_variances_from_buffer(buf_list)
+        joint_records = _collect_joint_records(sdba, variances)
+
         selected_angle = rs["selected_angle"]
-        selected_config = rs["selected_config"]
-        peak_detector = rs["peak_detector"]
+        if selected_angle is not None and rs.get("peak_detector") is None:
+            rs["peak_detector"] = sdba.get(selected_angle)
 
         if selected_angle is None:
-            frame_buffer.append(lm)
-            started_at = float(rs.get("started_at") or 0.0)
-            elapsed = now - started_at
             ready = (
                 len(frame_buffer) >= ANGLE_SELECTION_MIN_FRAMES
                 and elapsed >= ANGLE_SELECTION_MIN_SEC
@@ -303,18 +433,6 @@ class RepCounterSession:
                 last_att is None
                 or (now - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
             )
-            sdba: dict[str, Any] = rs.get("selection_detectors_by_angle") or {}
-            if not sdba:
-                sdba = {ak: _peak_detector_from_tuning(tuning_params) for ak in COMMON_ANGLES}
-                rs["selection_detectors_by_angle"] = sdba
-            for ak, cfg in COMMON_ANGLES.items():
-                val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
-                sdba[ak].update(val)  # type: ignore[union-attr]
-
-            rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
-            rep_dom = summarize_rep_dominance(rep_counts_sel)
-            buf_list = list(frame_buffer)
-            variances = compute_angle_variances_from_buffer(buf_list)
             dom_ok = dominance_conditions_met(
                 variances,
                 rep_dom,
@@ -351,11 +469,52 @@ class RepCounterSession:
                 elapsed >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC
                 or total_selection_reps >= cal_reps_target
             )
+            log_bucket = int(elapsed * 2.0)
+            if (
+                can_try
+                or dom_ok
+                or rs.get("debug_last_selection_log_bucket", -1) != log_bucket
+            ):
+                rs["debug_last_selection_log_bucket"] = log_bucket
+                # region agent log
+                _agent_debug_log(
+                    run_id=_DEBUG_RUN_ID,
+                    hypothesis_id="H2_H5",
+                    location="session.py:selection_snapshot",
+                    message="Selection state snapshot",
+                    data={
+                        "elapsedSec": round(float(elapsed), 3),
+                        "bufferFrames": len(frame_buffer),
+                        "ready": bool(ready),
+                        "canTry": bool(can_try),
+                        "domOk": bool(dom_ok),
+                        "leaderKey": str(leader_key) if leader_key else None,
+                        "streak": int(streak),
+                        "totalSelectionReps": int(total_selection_reps),
+                        "varianceFallbackReady": bool(variance_fallback_ready),
+                    },
+                )
+                # endregion
 
             locked_this_frame = False
             selected_angle_local: Optional[str] = None
 
             if lock_from_dominance and leader_key:
+                # region agent log
+                _agent_debug_log(
+                    run_id=_DEBUG_RUN_ID,
+                    hypothesis_id="H1",
+                    location="session.py:lock_from_dominance",
+                    message="Angle locked from dominance",
+                    data={
+                        "selectedAngle": str(leader_key),
+                        "leaderShare": float(rep_dom.get("leaderShare") or 0.0),
+                        "leaderReps": int(rep_dom.get("leaderReps") or 0),
+                        "totalSelectionReps": int(rep_dom.get("totalReps") or 0),
+                        "streak": int(streak),
+                    },
+                )
+                # endregion
                 _apply_locked_tracking(
                     rs,
                     leader_key,
@@ -370,14 +529,46 @@ class RepCounterSession:
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
                 src = str(result.get("source") or "")
+                # region agent log
+                _agent_debug_log(
+                    run_id=_DEBUG_RUN_ID,
+                    hypothesis_id="H5",
+                    location="session.py:variance_attempt",
+                    message="Variance selection attempt",
+                    data={
+                        "selectedAngle": str(sel) if sel else None,
+                        "source": src,
+                        "topCandidate": (
+                            (result.get("debug") or {}).get("topCandidate")
+                            if isinstance(result.get("debug"), dict)
+                            else None
+                        ),
+                    },
+                )
+                # endregion
                 variance_ok = sel and sel in COMMON_ANGLES and src == "variance"
                 if variance_ok:
+                    # region agent log
+                    _agent_debug_log(
+                        run_id=_DEBUG_RUN_ID,
+                        hypothesis_id="H2",
+                        location="session.py:variance_lock_carryover",
+                        message="Variance lock carryover snapshot",
+                        data={
+                            "selectedAngle": str(sel),
+                            "selectionRepCountForAngle": int(
+                                sdba.get(str(sel)).get_rep_count() if sdba.get(str(sel)) else 0
+                            ),
+                            "totalSelectionReps": int(rep_dom.get("totalReps") or 0),
+                        },
+                    )
+                    # endregion
                     _apply_locked_tracking(
                         rs,
                         sel,
                         buf_list,
                         tuning_params,
-                        selection_detector=None,
+                        selection_detector=sdba.get(sel),
                     )
                     locked_this_frame = True
                 else:
@@ -430,21 +621,82 @@ class RepCounterSession:
                 status_message=status,
                 tracking_detail_message="",
                 leader_key=leader_key if isinstance(leader_key, str) else None,
-                selection_debug={"rep_dom": rep_dom, "dom_ok": dom_ok},
+                selection_debug={
+                    "rep_dom": rep_dom,
+                    "dom_ok": dom_ok,
+                    "joint_records": joint_records,
+                },
             )
 
-        # Tracking phase
-        angle_value = None
-        if selected_config:
-            angle_value = calculate_from_type(
-                selected_config["type"],
-                selected_config["landmarks"],
-                lm,
-            )
-        return self._build_tracking_step_result(rs, angle_value)
+        # Tracking phase: keep reassessing based on recent variance while preserving per-joint records.
+        switched_to: Optional[str] = None
+        last_re_eval = rs.get("selection_last_reevaluate_at")
+        re_eval_due = (
+            ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
+            or last_re_eval is None
+            or (now - float(last_re_eval)) >= ANGLE_SELECTION_REEVALUATE_EVERY_SEC
+        )
+        if re_eval_due:
+            rs["selection_last_reevaluate_at"] = now
+            result = determine_best_angle(buf_list, exercise=None)
+            cand = result.get("selectedAngle")
+            src = str(result.get("source") or "")
+            candidate = cand if isinstance(cand, str) and cand in COMMON_ANGLES else None
+            if candidate and src == "variance" and candidate != selected_angle:
+                cur_ok = passes_consistent_variance_gate(variances, selected_angle)
+                cand_var = float((variances.get(candidate) or {}).get("medianWindowVariance") or 0.0)
+                cur_var = float((variances.get(selected_angle) or {}).get("medianWindowVariance") or 0.0)
+                stronger = (cur_var <= 0.0 and cand_var > 0.0) or (
+                    cur_var > 0.0 and cand_var >= cur_var * ANGLE_SELECTION_SWITCH_VARIANCE_RATIO
+                )
+                last_switch = rs.get("selection_last_switch_at")
+                cooldown_ok = (
+                    last_switch is None
+                    or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
+                )
+                if cooldown_ok and ((not cur_ok) or stronger):
+                    rs["selected_angle"] = candidate
+                    rs["selected_config"] = COMMON_ANGLES[candidate]
+                    rs["peak_detector"] = sdba.get(candidate)
+                    rs["selection_last_switch_at"] = now
+                    switched_to = candidate
+                    selected_angle = candidate
+                    _agent_debug_log(
+                        run_id="pre-fix",
+                        hypothesis_id="H6",
+                        location="session.py:tracking_reselection",
+                        message="Switched tracked joint during tracking",
+                        data={
+                            "newSelectedAngle": candidate,
+                            "currentVariance": round(cur_var, 5),
+                            "candidateVariance": round(cand_var, 5),
+                            "currentPassesGate": bool(cur_ok),
+                            "switchRatio": float(ANGLE_SELECTION_SWITCH_VARIANCE_RATIO),
+                        },
+                    )
+
+        angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None
+        selected_output = (
+            detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
+        )
+        return self._build_tracking_step_result(
+            rs,
+            angle_value,
+            detector_output=selected_output,
+            selection_debug={
+                "rep_dom": rep_dom,
+                "joint_records": joint_records,
+                "switched_to": switched_to,
+            },
+        )
 
     def _build_tracking_step_result(
-        self, rs: dict[str, Any], angle_value: Optional[float]
+        self,
+        rs: dict[str, Any],
+        angle_value: Optional[float],
+        *,
+        detector_output: Optional[dict[str, Any]] = None,
+        selection_debug: Optional[dict[str, Any]] = None,
     ) -> StepResult:
         tuning_params = rs["tuning_params"]
         peak_detector = rs["peak_detector"]
@@ -465,7 +717,7 @@ class RepCounterSession:
         avg_valley: Optional[float] = None
 
         if peak_detector is not None:
-            out = peak_detector.update(angle_value)
+            out = detector_output if detector_output is not None else peak_detector.update(angle_value)
             rep_count = int(out.get("repCount", 0) or 0)
             primary_rep_count = rep_count
             state_str = str(out.get("state", "—"))
@@ -481,6 +733,79 @@ class RepCounterSession:
             cal_certainty_target = float(
                 out.get("calibrationCertaintyTarget", cal_certainty_target)
             )
+            last_rep = int(rs.get("debug_last_rep_count") or 0)
+            last_cal = rs.get("debug_last_calibration_complete")
+            last_gate = rs.get("debug_last_range_gate_open")
+            last_peak_state = rs.get("debug_last_peak_state")
+            rep_inc = rep_count > last_rep
+            cal_changed = (last_cal is None) or (bool(last_cal) != bool(calibration_complete))
+            gate_changed = (last_gate is None) or (bool(last_gate) != bool(range_gate_open))
+            state_changed = (last_peak_state is None) or (str(last_peak_state) != state_str)
+            if rep_inc or cal_changed or gate_changed:
+                # region agent log
+                _agent_debug_log(
+                    run_id=_DEBUG_RUN_ID,
+                    hypothesis_id="H3_H4",
+                    location="session.py:tracking_state",
+                    message="Tracking detector transition",
+                    data={
+                        "trackedJoint": str(rs.get("selected_angle") or ""),
+                        "repCountRaw": int(rep_count),
+                        "shownRepCount": int(rep_count),
+                        "calibrationComplete": bool(calibration_complete),
+                        "calibrationTargetReps": int(cal_target),
+                        "calibrationCertainty": round(float(cal_certainty), 5),
+                        "calibrationCertaintyTarget": round(float(cal_certainty_target), 5),
+                        "rangeGateOpen": bool(range_gate_open),
+                        "rollingRange": (
+                            round(float(rolling_range), 4)
+                            if rolling_range is not None
+                            else None
+                        ),
+                        "state": state_str,
+                    },
+                )
+                # endregion
+            if state_changed:
+                st_for_state = peak_detector.get_state()
+                # region agent log
+                _agent_debug_log(
+                    run_id=_DEBUG_RUN_ID,
+                    hypothesis_id="H6",
+                    location="session.py:tracking_state_change",
+                    message="Tracked joint peak-detector state changed",
+                    data={
+                        "trackedJoint": str(rs.get("selected_angle") or ""),
+                        "state": state_str,
+                        "repCountRaw": int(rep_count),
+                        "smoothedValue": (
+                            round(float(smoothed_value), 5)
+                            if smoothed_value is not None
+                            else None
+                        ),
+                        "currentPeakValue": (
+                            round(float(st_for_state.get("currentPeakValue")), 5)
+                            if st_for_state.get("currentPeakValue") is not None
+                            else None
+                        ),
+                        "currentValleyValue": (
+                            round(float(st_for_state.get("currentValleyValue")), 5)
+                            if st_for_state.get("currentValleyValue") is not None
+                            else None
+                        ),
+                        "hysteresis": float(
+                            tuning_params.get(
+                                "hysteresis",
+                                get_default_tuning_params()["hysteresis"],
+                            )
+                        ),
+                    },
+                )
+                # endregion
+            rs["debug_last_rep_count"] = rep_count
+            rs["debug_last_calibration_complete"] = calibration_complete
+            rs["debug_last_range_gate_open"] = range_gate_open
+            rs["debug_last_peak_state"] = state_str
             st = peak_detector.get_state()
             avg_peak = st.get("calibratedAvgPeak")
             avg_valley = st.get("calibratedAvgValley")
@@ -489,7 +814,7 @@ class RepCounterSession:
             if avg_valley is not None:
                 avg_valley = float(avg_valley)
 
-        shown_rep_count = rep_count if calibration_complete else 0
+        shown_rep_count = rep_count
         sel_ang = rs.get("selected_angle")
         if isinstance(sel_ang, str):
             tlm = list(COMMON_ANGLES[sel_ang]["landmarks"])
@@ -545,4 +870,5 @@ class RepCounterSession:
             phase="tracking",
             status_message=status,
             tracking_detail_message=cal_detail if not calibration_complete else "",
+            selection_debug=dict(selection_debug or {}),
         )

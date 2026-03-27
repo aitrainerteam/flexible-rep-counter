@@ -43,6 +43,7 @@ FRAME_MIN_CONFIDENCE = 0.5
 MIN_ACTIVE_WINDOWS = ANGLE_SELECTION_MIN_ACTIVE_WINDOWS
 SMOOTH_WINDOW = ANGLE_SELECTION_SMOOTH_WINDOW
 ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
+SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO = 0.6
 
 
 def _angle_side(angle_key: str) -> str:
@@ -212,25 +213,47 @@ def passes_consistent_variance_gate(
     return True
 
 
+def _candidate_score_if_eligible(
+    angle_key: str, data: dict[str, Any]
+) -> Optional[float]:
+    t = _angle_selection_thresholds(angle_key)
+    consistent_var = float(data.get("medianWindowVariance") or 0.0)
+    active_windows = int(data.get("activeWindowCount") or 0)
+    span_deg = float(data.get("smoothedRangeDeg") or 0.0)
+    if active_windows < MIN_ACTIVE_WINDOWS:
+        return None
+    if consistent_var < t["min_variance"]:
+        return None
+    if span_deg < t["min_range_deg"]:
+        return None
+    return consistent_var
+
+
 def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Pick the clearest winner: multi-window activity, meaningful ROM, and margin over the runner-up."""
     ranked: list[tuple[float, str, dict[str, Any]]] = []
     for key, data in variances.items():
-        t = _angle_selection_thresholds(key)
-        consistent_var = float(data.get("medianWindowVariance") or 0.0)
-        active_windows = int(data.get("activeWindowCount") or 0)
-        span_deg = float(data.get("smoothedRangeDeg") or 0.0)
-        if active_windows < MIN_ACTIVE_WINDOWS:
+        score = _candidate_score_if_eligible(key, data)
+        if score is None:
             continue
-        if consistent_var < t["min_variance"]:
-            continue
-        if span_deg < t["min_range_deg"]:
-            continue
-        ranked.append((consistent_var, key, data))
+        ranked.append((score, key, data))
     ranked.sort(key=lambda x: x[0], reverse=True)
     if not ranked:
         return None
     top_score, top_key, top_data = ranked[0]
+    if top_key.endswith("_SHOULDER_ACROSS"):
+        preferred_elbow = top_key.replace("SHOULDER_ACROSS", "ELBOW")
+        elbow_data = variances.get(preferred_elbow)
+        if elbow_data is not None:
+            elbow_score = _candidate_score_if_eligible(preferred_elbow, elbow_data)
+            # Across-shoulder angles can spike from torso sway during curls.
+            # If the same-side elbow is also clearly active, prefer elbow tracking.
+            if (
+                elbow_score is not None
+                and top_score > 0.0
+                and elbow_score >= top_score * SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO
+            ):
+                return {"key": preferred_elbow, **elbow_data}
     if len(ranked) >= 2:
         second_score = ranked[1][0]
         ratio = _angle_selection_thresholds(top_key)["second_best_ratio"]
