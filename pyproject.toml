@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flexible-rep-counter"
-version = "0.1.1"
+version = "0.1.2"
 description = "Flexible rep counter engine (landmarks -> reps) with optional local OpenCV visualizer app"
 readme = "README.md"
 requires-python = ">=3.10"
