@@ -42,7 +42,6 @@ LOW_CONFIDENCE_THRESHOLD = 0.5
 FRAME_MIN_CONFIDENCE = 0.5
 MIN_ACTIVE_WINDOWS = ANGLE_SELECTION_MIN_ACTIVE_WINDOWS
 SMOOTH_WINDOW = ANGLE_SELECTION_SMOOTH_WINDOW
-ISOMETRIC_FALLBACK_ANGLE = "LEFT_HIP"
 SHOULDER_ACROSS_TO_ELBOW_MIN_SCORE_RATIO = 0.55
 # Across-body angles (elbow–shoulder–opposite shoulder, etc.) must beat same-side
 # non-across alternatives by this median-window-variance ratio to stay selected.
@@ -83,26 +82,27 @@ def angle_keys_compatible(a: Optional[str], b: Optional[str]) -> bool:
     return _angle_base(a) == _angle_base(b)
 
 
-def _exercise_looks_isometric(exercise: Optional[dict[str, Any]]) -> bool:
-    """True when caller passed exercise metadata indicating a static hold (optional API)."""
-    if not exercise:
-        return False
-    if exercise.get("isIsometric") is True:
-        return True
-    if (exercise.get("category") or "").lower() == "core" and "isometric" in (
-        (exercise.get("description") or "").lower()
-    ):
-        return True
-    name = (exercise.get("name") or "").lower()
-    return any(x in name for x in ("plank", "hold", "isometric"))
-
-
 def _angle_selection_thresholds(angle_key: str) -> dict[str, float]:
     """
     Per-common-angle gates from env, ``rep_counter.toml`` ``[angle_selection.joints.<KEY>]``,
     then global defaults (see ``get_angle_selection_joint_thresholds``).
     """
     return get_angle_selection_joint_thresholds(angle_key)
+
+
+def _variance_eligibility(angle_key: str, data: dict[str, Any]) -> tuple[bool, float]:
+    """Same gates as top-candidate scoring: (passes, median_window_variance_or_zero)."""
+    t = _angle_selection_thresholds(angle_key)
+    consistent_var = float(data.get("medianWindowVariance") or 0.0)
+    active_windows = int(data.get("activeWindowCount") or 0)
+    span_deg = float(data.get("smoothedRangeDeg") or 0.0)
+    if active_windows < MIN_ACTIVE_WINDOWS:
+        return False, 0.0
+    if consistent_var < t["min_variance"]:
+        return False, 0.0
+    if span_deg < t["min_range_deg"]:
+        return False, 0.0
+    return True, consistent_var
 
 
 def compute_angle_variances_from_buffer(
@@ -206,33 +206,15 @@ def passes_consistent_variance_gate(
     data = variances.get(angle_key)
     if not data:
         return False
-    t = _angle_selection_thresholds(angle_key)
-    consistent_var = float(data.get("medianWindowVariance") or 0.0)
-    active_windows = int(data.get("activeWindowCount") or 0)
-    span_deg = float(data.get("smoothedRangeDeg") or 0.0)
-    if active_windows < MIN_ACTIVE_WINDOWS:
-        return False
-    if consistent_var < t["min_variance"]:
-        return False
-    if span_deg < t["min_range_deg"]:
-        return False
-    return True
+    ok, _ = _variance_eligibility(angle_key, data)
+    return ok
 
 
 def _candidate_score_if_eligible(
     angle_key: str, data: dict[str, Any]
 ) -> Optional[float]:
-    t = _angle_selection_thresholds(angle_key)
-    consistent_var = float(data.get("medianWindowVariance") or 0.0)
-    active_windows = int(data.get("activeWindowCount") or 0)
-    span_deg = float(data.get("smoothedRangeDeg") or 0.0)
-    if active_windows < MIN_ACTIVE_WINDOWS:
-        return None
-    if consistent_var < t["min_variance"]:
-        return None
-    if span_deg < t["min_range_deg"]:
-        return None
-    return consistent_var
+    ok, score = _variance_eligibility(angle_key, data)
+    return score if ok else None
 
 
 def _non_across_alternatives_order(across_key: str) -> list[str]:
@@ -303,10 +285,7 @@ def _get_angle_confidence(frame_buffer: list[list[dict]], angle_config: Optional
     return get_average_confidence_for_landmarks(frame_buffer, angle_config["landmarks"])
 
 
-def determine_best_angle(
-    frame_buffer: list[list[dict]],
-    exercise: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
+def determine_best_angle(frame_buffer: list[list[dict]]) -> dict[str, Any]:
     """
     Pick the best angle to track from a buffer of frames.
     Returns { selectedAngle, source, tuningParams, debug }.
@@ -326,8 +305,6 @@ def determine_best_angle(
 
     if not frame_buffer or len(frame_buffer) < 40:
         return default_result
-
-    is_isometric = _exercise_looks_isometric(exercise)
 
     variances = _calculate_all_variances(frame_buffer)
     debug["variances"] = {
@@ -356,31 +333,11 @@ def determine_best_angle(
     )
 
     if not top_candidate:
-        if is_isometric and ISOMETRIC_FALLBACK_ANGLE in COMMON_ANGLES:
-            fallback_config = COMMON_ANGLES[ISOMETRIC_FALLBACK_ANGLE]
-            avg_conf = _get_angle_confidence(frame_buffer, fallback_config)
-            debug["avgConfidence"] = avg_conf
-            return {
-                "selectedAngle": ISOMETRIC_FALLBACK_ANGLE,
-                "source": "isometric_fallback",
-                "tuningParams": get_default_tuning_params(),
-                "debug": debug,
-            }
         return default_result
 
     effective_variance = top_candidate.get("medianWindowVariance") or top_candidate.get("variance") or 0.0
     top_thresholds = _angle_selection_thresholds(top_candidate["key"])
     if effective_variance < top_thresholds["min_variance"]:
-        if is_isometric and ISOMETRIC_FALLBACK_ANGLE in COMMON_ANGLES:
-            fallback_config = COMMON_ANGLES[ISOMETRIC_FALLBACK_ANGLE]
-            avg_conf = _get_angle_confidence(frame_buffer, fallback_config)
-            debug["avgConfidence"] = avg_conf
-            return {
-                "selectedAngle": ISOMETRIC_FALLBACK_ANGLE,
-                "source": "isometric_fallback",
-                "tuningParams": get_default_tuning_params(),
-                "debug": debug,
-            }
         return default_result
 
     avg_confidence = _get_angle_confidence(frame_buffer, top_candidate.get("config"))

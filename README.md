@@ -7,9 +7,9 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 - **Webcam capture**: OpenCV frames; optional resize/JPEG tuning before upload.
 - **Pose inference**: YOLO pose on a remote VM; client in [`app/vm_client.py`](app/vm_client.py) (`GET /health`, `POST /predict` multipart JPEG, benchmarking hooks).
 - **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
-- **Angle selection**: [`app/variance_angle_selector.py`](app/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `angle_selection.variance_fallback_sec` (in `rep_counter.toml`) the session may lock using pure **variance** selection when the retry window allows.
+- **Angle selection**: [`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `angle_selection.variance_fallback_sec` (in `rep_counter.toml`) the session may lock using pure **variance** selection when the retry window allows.
 - **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.
-- **Rep counting**: `PeakDetector` in [`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py) (also re-exported from [`app/math_engine.py`](app/math_engine.py))—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
+- **Rep counting**: `PeakDetector` in [`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py)—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
 - **Importable package**: Core logic lives under [`src/flexible_rep_counter/`](src/flexible_rep_counter/). OpenCV UI is in [`visualizer/opencv_runtime.py`](visualizer/opencv_runtime.py) (repo-only; run via [`main.py`](main.py)).
 - **Docs**: See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full pipeline, call order, and math/selection details.
 - **UI**: OpenCV overlay; log verbosity follows `[app].log_level` in `rep_counter.toml` (stderr when `DEBUG`).
@@ -42,7 +42,7 @@ cd /path/to/flexible-rep-counter
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pip install -e .          # register the flexible_rep_counter package (needed for app shims)
+pip install -e .          # register the flexible_rep_counter package
 ```
 
 ### Run
@@ -51,7 +51,7 @@ pip install -e .          # register the flexible_rep_counter package (needed fo
 python main.py
 ```
 
-Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (defaults follow `[predict]` in `rep_counter.toml` when omitted).
+Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`, `--jpeg-quality Q`, `--no-validate-response` (defaults follow `[predict]` in `rep_counter.toml` for resize/quality; validation defaults to on unless this flag is set).
 
 ### Session flow
 
@@ -69,12 +69,12 @@ Sections:
 |---------|------|
 | `[app]` | `log_level` (`DEBUG`, `INFO`, …) |
 | `[vm]` | `direct_url` (required for the visualizer), `timeout_sec`, `health_timeout_sec` |
-| `[predict]` | `resize_width`, `jpeg_quality`, `validate_response` |
+| `[predict]` | `resize_width`, `jpeg_quality` |
 | `[rep]` | Peak detector tuning: hysteresis, margins, calibration, `min_interval_ms`, etc. |
 | `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds |
 | `[angle_selection.joints.<NAME>]` | Per-joint overrides (e.g. `LEFT_ELBOW`) for `min_variance`, `min_range_deg`, `second_best_ratio` |
 
-The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars.
+The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars. Response validation for `/predict` is on by default in code; use `--no-validate-response` to disable.
 
 ### VM API (client contract)
 

@@ -50,7 +50,7 @@ For each frame after the user clicks **Start**:
 3. **`_update_vm_metrics(snap)`** — updates FPS-style inference rate, optional benchmark log file.
 4. If **`snap["landmarks"]` is None** → draw “No pose”, continue.
 5. **`_scale_landmarks_to_display`** — if the JPEG sent to the VM was resized, scale x/y back to the display frame.
-6. **`PoseFilterPipeline.process(raw_scaled, timestamp_ms)`** ([`app/pose_filters.py`](app/pose_filters.py)) — temporal smoothing per keypoint, then velocity clamp, then short history interpolation for low-confidence points.
+6. **`PoseFilterPipeline.process(raw_scaled, timestamp_ms)`** ([`src/flexible_rep_counter/core/pose_filters.py`](src/flexible_rep_counter/core/pose_filters.py)) — temporal smoothing per keypoint, then velocity clamp, then short history interpolation for low-confidence points.
 7. **`draw_skeleton(frame_bgr, landmarks)`** ([`app/skeleton_overlay.py`](app/skeleton_overlay.py)).
 
 Then branch:
@@ -60,9 +60,9 @@ Then branch:
 Goal: observe motion, then **lock exactly one** entry of **`COMMON_ANGLES`** (one joint / one side). The opposite limb is **never** tracked or displayed as a second counter.
 
 1. **`frame_buffer.append(landmarks)`** — bounded by `ANGLE_SELECTION_MAX_BUFFER_FRAMES`.
-2. **Selection PeakDetectors** — lazy-init `selection_detectors_by_angle`: one **`PeakDetector`** per key in **`COMMON_ANGLES`** ([`app/variance_angle_selector.py`](app/variance_angle_selector.py)).
+2. **Selection PeakDetectors** — lazy-init `selection_detectors_by_angle`: one **`PeakDetector`** per key in **`COMMON_ANGLES`** ([`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py)).
 3. For **each** candidate angle key, each frame:
-   - **`calculate_from_type(type, landmark_indices, landmarks)`** ([`app/math_engine.py`](app/math_engine.py)) → scalar angle (or None).
+   - **`calculate_from_type(type, landmark_indices, landmarks)`** ([`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py)) → scalar angle (or None).
    - **`detector.update(value)`** — same peak/valley machine as live tracking (see “PeakDetector” below). This produces **per-joint rep-like events** used only for **dominance**, not the final user count yet.
 4. **`summarize_rep_dominance(rep_counts_sel)`** — among joints with rep_count &gt; 0, find the **leader** (max count) and its **share** of total selection-phase rep events.
 5. **`compute_angle_variances_from_buffer(buf_list)`** — builds per-angle statistics from the buffered landmark sequence (see “Angle variance / joint scoring”).
@@ -73,14 +73,14 @@ Goal: observe motion, then **lock exactly one** entry of **`COMMON_ANGLES`** (on
    - and **`_get_top_candidate(variances)`** agrees with the leader (variance winner == rep leader), so noise on the idle arm does not steal the lock.
 7. **Dominance streak** — if conditions hold for the same `leader_key` for `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` consecutive frames (and wall/frame minimums are met), **lock**:
    - **`_apply_locked_tracking(..., selection_detector=sdba.get(leader_key))`** — reuse the **same** `PeakDetector` instance that observed the selection window so counts stay continuous.
-8. **Variance fallback** (only if dominance never stabilizes): when **`can_try`** (retry interval) and elapsed ≥ `angle_selection.variance_fallback_sec`, call **`determine_best_angle(buf_list)`**. If it returns `source=="variance"`, **`_apply_locked_tracking(..., selection_detector=None)`** — new detector + **`replay_angle_series_on_peak_detector`** over the buffer.
+8. **Variance fallback** (only if dominance never stabilizes): when **`can_try`** (retry interval) and elapsed ≥ `angle_selection.variance_fallback_sec`, call **`determine_best_angle(buf_list)`**. If it returns `source=="variance"`, **`_apply_locked_tracking(..., selection_detector=sdba.get(sel))`** — reuse that joint’s selection detector (same instance as dominance path).
 9. **`_selection_status_message`** drives the overlay string during this phase.
 
 ### B) Tracking phase — `selected_angle` is set
 
 1. **`angle_value = calculate_from_type(selected_config["type"], selected_config["landmarks"], landmarks)`**.
 2. **`out = peak_detector.update(angle_value)`** — single detector, single joint; the other arm’s angles are **not** fed into any detector.
-3. **Displayed rep count** — `rep_count` from `out["repCount"]`, but shown as **0** until **`calibrationComplete`** (user sees calibration progress without flashing false totals).
+3. **Displayed rep count** — `rep_count` from `out["repCount"]` (with session-layer adjustment for unmatched peak/valley halves); overlay shows raw count during calibration via **`reps_raw` / `calibration_target_reps`**.
 4. Status line reminds that only **left** or **right** side is locked (for `LEFT_*` / `RIGHT_*` keys).
 
 ### Reset (second Start click)
@@ -89,7 +89,7 @@ Mouse handler clears selection, `peak_detector`, and the frame buffer so a new s
 
 ---
 
-## Math engine ([`app/math_engine.py`](app/math_engine.py))
+## Math engine ([`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py))
 
 ### Geometry
 
@@ -118,7 +118,7 @@ State machine:
 
 ---
 
-## Angle tracking and joint decision ([`app/variance_angle_selector.py`](app/variance_angle_selector.py))
+## Angle tracking and joint decision ([`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py))
 
 ### `COMMON_ANGLES`
 
@@ -142,7 +142,7 @@ Ensures the **rep leader** during selection matches that statistical winner when
 
 ### `determine_best_angle`
 
-Returns `{ selectedAngle, source, tuningParams, debug }`. Used for **variance fallback** only in the loop; **`exercise`** metadata can enable isometric fallback paths when passed (webcam loop passes `exercise=None`).
+Returns `{ selectedAngle, source, tuningParams, debug }`. Used for **variance fallback** and **tracking re-eval** in the session.
 
 ---
 

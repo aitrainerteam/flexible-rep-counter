@@ -14,8 +14,6 @@ health_timeout_sec = 5.0
 resize_width = 0
 # JPEG 1–100. Higher = better detail & larger payload; lower = smaller/faster but noisier keypoints.
 jpeg_quality = 85
-# true = validate pose API response shape/content; false = skip validation (faster, less safety).
-validate_response = true
 
 [rep]
 # After calibration: peak may fall this fraction of the calibrated ROM below the locked avg peak (0–1). E.g. ROM=50 deg and pct=0.50 → peak must be ≥ avg_peak − 25. Higher = tolerate more ROM drift; lower = stricter, may drop reps if form shifts.
@@ -26,8 +24,6 @@ valley_margin_pct = 0.50
 hysteresis = 18
 # Minimum frames since last peak/valley event before another can register. Higher = slower max rep rate, fewer double-counts; lower = allows faster reps, risk of duplicates.
 min_peak_distance = 5
-# EMA weight on each new sample (0–1). Higher = tracks motion faster, noisier; lower = smoother curve, slower to react.
-smoothing_factor = 0.70
 # Rolling window p95−p5 spread (deg) required before reps count. Higher = only count when recent ROM is large; lower = gate opens sooner, small twitches may pass if other checks pass.
 min_range_gate = 15
 # Frames in the rolling range window. Higher = stabler spread estimate, slower to adapt; lower = faster adaptation, jumpier gate.

@@ -79,17 +79,6 @@ def _toml_int(*keys: str, default: int) -> int:
     return default
 
 
-def _toml_bool(*keys: str, default: bool) -> bool:
-    v = _toml_val(*keys)
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() not in ("0", "false", "no", "")
-    return default
-
-
 def _vm_netloc_host_port(hostname: str, port: int) -> str:
     try:
         if ip_address(hostname).version == 6:
@@ -135,14 +124,16 @@ VM_TIMEOUT_SEC = _toml_float("vm", "timeout_sec", default=5.0)
 VM_HEALTH_TIMEOUT_SEC = _toml_float("vm", "health_timeout_sec", default=5.0)
 PREDICT_RESIZE_WIDTH = _toml_int("predict", "resize_width", default=0)
 PREDICT_JPEG_QUALITY = _toml_int("predict", "jpeg_quality", default=85)
-PREDICT_VALIDATE_RESPONSE = _toml_bool("predict", "validate_response", default=True)
+# Fixed default; use `python main.py --no-validate-response` to skip JSON shape checks.
+PREDICT_VALIDATE_RESPONSE = True
 
 LOG_LEVEL = str(_toml_val("app", "log_level") or "DEBUG").strip().upper() or "DEBUG"
 DEBUG_CONSOLE_ENABLED = LOG_LEVEL == "DEBUG"
 
 DEFAULT_HYSTERESIS = _toml_float("rep", "hysteresis", default=5.0)
 DEFAULT_MIN_PEAK_DISTANCE = _toml_int("rep", "min_peak_distance", default=5)
-DEFAULT_SMOOTHING_FACTOR = _toml_float("rep", "smoothing_factor", default=0.45)
+# EMA on angle stream; not exposed in TOML (tune with hysteresis / margins).
+DEFAULT_SMOOTHING_FACTOR = 0.70
 DEFAULT_PEAK_MARGIN_PCT = _toml_float("rep", "peak_margin_pct", default=0.50)
 DEFAULT_VALLEY_MARGIN_PCT = _toml_float("rep", "valley_margin_pct", default=0.50)
 DEFAULT_MIN_RANGE_GATE = _toml_float("rep", "min_range_gate", default=15.0)

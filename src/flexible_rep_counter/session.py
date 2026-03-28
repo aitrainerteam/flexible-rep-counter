@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, Optional
 
 from flexible_rep_counter.core.math_engine import (
+    PeakDetector,
     calculate_from_type,
     create_peak_detector,
     replay_angle_series_on_peak_detector,
@@ -37,7 +38,7 @@ from flexible_rep_counter.core.variance_angle_selector import (
 from flexible_rep_counter.types import StepResult
 
 
-def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> Any:
+def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
     d = get_default_tuning_params()
     tp = tuning_params or {}
     return create_peak_detector(
@@ -401,7 +402,6 @@ class RepCounterSession:
                 or total_selection_reps >= cal_reps_target
             )
             locked_this_frame = False
-            selected_angle_local: Optional[str] = None
 
             if lock_from_dominance and leader_key:
                 _apply_locked_tracking(
@@ -413,7 +413,7 @@ class RepCounterSession:
                 )
                 locked_this_frame = True
             elif can_try and variance_fallback_ready:
-                result = determine_best_angle(buf_list, exercise=None)
+                result = determine_best_angle(buf_list)
                 tuning_params = result.get("tuningParams") or get_default_tuning_params()
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
@@ -441,7 +441,7 @@ class RepCounterSession:
                 n_frames=len(frame_buffer),
                 retry_at=retry_at,
                 locked_this_frame=locked_this_frame,
-                selected_angle=selected_angle_local,
+                selected_angle=rs.get("selected_angle"),
                 run_state_selected=rs.get("selected_angle"),
                 dom_ok=dom_ok,
                 leader_key=leader_key,
@@ -495,7 +495,7 @@ class RepCounterSession:
         )
         if re_eval_due:
             rs["selection_last_reevaluate_at"] = now
-            result = determine_best_angle(buf_list, exercise=None)
+            result = determine_best_angle(buf_list)
             cand = result.get("selectedAngle")
             src = str(result.get("source") or "")
             candidate = cand if isinstance(cand, str) and cand in COMMON_ANGLES else None

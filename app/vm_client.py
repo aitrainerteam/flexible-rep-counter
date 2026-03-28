@@ -28,13 +28,15 @@ BODY_KEYPOINT_NAMES = COCO_KEYPOINT_NAMES[FACE_KEYPOINT_COUNT:]
 
 @dataclass
 class VmPredictOutcome:
-    """Result of one /predict call including client-side timing (yolo-deploy-style)."""
+    """Result of one /predict call including client-side timing (yolo-deploy-style).
+
+    benchmark keys: encode_ms, roundtrip_ms, upload_ms, payload_kb, inference_ms (server),
+    response_time (perf_counter). sent_hw is (height, width) of the encoded JPEG for display scaling.
+    """
 
     landmarks: Optional[list[dict]]
     benchmark: Optional[dict[str, Any]] = None
-    """encode_ms, roundtrip_ms, upload_ms, payload_kb, inference_ms (server), response_time (perf_counter)."""
     sent_hw: Optional[tuple[int, int]] = None
-    """(height, width) of the image encoded and sent; use to scale keypoints to the display frame."""
     validation_issues: list[str] = field(default_factory=list)
 
 

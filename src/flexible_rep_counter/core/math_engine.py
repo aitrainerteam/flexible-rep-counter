@@ -310,6 +310,82 @@ class PeakDetector:
     def _range_gate_allows_rep_recording(self) -> bool:
         return self._last_range_gate_open
 
+    def _record_peak_on_reversal(self) -> tuple[Optional[float], bool]:
+        """Append a peak at end of GOING_UP; may increment rep_count. Returns (detected_peak, rep_completed)."""
+        if self.frame_count - self.last_peak_frame < self.min_peak_distance:
+            return None, False
+        if not self._calibrated:
+            within_margin = True
+        else:
+            rom = self._calibrated_rom()
+            within_margin = (
+                self._calibrated_avg_peak is not None
+                and rom > 0
+                and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin_pct * rom
+            )
+        gate_ok = self._range_gate_allows_rep_recording()
+        interval_ok = True
+        new_rep_count_if = min(len(self.peaks) + 1, len(self.valleys))
+        rep_would_increment = new_rep_count_if > self.rep_count
+        now_ms = time.time() * 1000.0
+        if rep_would_increment and self.min_rep_interval_ms > 0:
+            if self._last_rep_time_ms is not None and (
+                now_ms - self._last_rep_time_ms
+            ) < self.min_rep_interval_ms:
+                interval_ok = False
+        allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
+        if not (within_margin and (gate_ok or allow_record_while_gate_closed)):
+            return None, False
+        detected_peak = self.current_peak_value
+        self.peaks.append(self.current_peak_value)
+        self.last_peak_frame = self.frame_count
+        new_rep_count = min(len(self.peaks), len(self.valleys))
+        rep_completed = False
+        if new_rep_count > self.rep_count and gate_ok and interval_ok:
+            self.rep_count = new_rep_count
+            rep_completed = True
+            self._last_rep_time_ms = now_ms
+        self._maybe_lock_calibration()
+        return detected_peak, rep_completed
+
+    def _record_valley_on_reversal(self) -> tuple[Optional[float], bool]:
+        """Append a valley at end of GOING_DOWN; may increment rep_count. Returns (detected_valley, rep_completed)."""
+        if self.frame_count - self.last_peak_frame < self.min_peak_distance:
+            return None, False
+        if not self._calibrated:
+            within_margin = True
+        else:
+            rom = self._calibrated_rom()
+            within_margin = (
+                self._calibrated_avg_valley is not None
+                and rom > 0
+                and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin_pct * rom
+            )
+        gate_ok = self._range_gate_allows_rep_recording()
+        interval_ok = True
+        new_rep_count_if = min(len(self.peaks), len(self.valleys) + 1)
+        rep_would_increment = new_rep_count_if > self.rep_count
+        now_ms = time.time() * 1000.0
+        if rep_would_increment and self.min_rep_interval_ms > 0:
+            if self._last_rep_time_ms is not None and (
+                now_ms - self._last_rep_time_ms
+            ) < self.min_rep_interval_ms:
+                interval_ok = False
+        allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
+        if not (within_margin and (gate_ok or allow_record_while_gate_closed)):
+            return None, False
+        detected_valley = self.current_valley_value
+        self.valleys.append(self.current_valley_value)
+        self.last_peak_frame = self.frame_count
+        new_rep_count = min(len(self.peaks), len(self.valleys))
+        rep_completed = False
+        if new_rep_count > self.rep_count and gate_ok and interval_ok:
+            self.rep_count = new_rep_count
+            rep_completed = True
+            self._last_rep_time_ms = now_ms
+        self._maybe_lock_calibration()
+        return detected_valley, rep_completed
+
     def update(self, raw_value: Optional[float]) -> dict[str, Any]:
         if raw_value is None:
             self._last_debanded_pass = None
@@ -366,38 +442,11 @@ class PeakDetector:
             if self.smoothed_value > self.current_peak_value:
                 self.current_peak_value = self.smoothed_value
             elif self.smoothed_value < self.current_peak_value - self.hysteresis:
-                if self.frame_count - self.last_peak_frame >= self.min_peak_distance:
-                    if not self._calibrated:
-                        within_margin = True
-                    else:
-                        rom = self._calibrated_rom()
-                        within_margin = (
-                            self._calibrated_avg_peak is not None
-                            and rom > 0
-                            and self.current_peak_value >= self._calibrated_avg_peak - self.peak_margin_pct * rom
-                        )
-                    gate_ok = self._range_gate_allows_rep_recording()
-                    distance_ok = self.frame_count - self.last_peak_frame >= self.min_peak_distance
-                    interval_ok = True
-                    new_rep_count_if = min(len(self.peaks) + 1, len(self.valleys))
-                    rep_would_increment = new_rep_count_if > self.rep_count
-                    now_ms = time.time() * 1000.0
-                    if rep_would_increment and self.min_rep_interval_ms > 0:
-                        if self._last_rep_time_ms is not None and (
-                            now_ms - self._last_rep_time_ms
-                        ) < self.min_rep_interval_ms:
-                            interval_ok = False
-                    allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
-                    if within_margin and (gate_ok or allow_record_while_gate_closed):
-                        detected_peak = self.current_peak_value
-                        self.peaks.append(self.current_peak_value)
-                        self.last_peak_frame = self.frame_count
-                        new_rep_count = min(len(self.peaks), len(self.valleys))
-                        if new_rep_count > self.rep_count and gate_ok and interval_ok:
-                            self.rep_count = new_rep_count
-                            rep_completed = True
-                            self._last_rep_time_ms = now_ms
-                        self._maybe_lock_calibration()
+                dp, rc = self._record_peak_on_reversal()
+                if dp is not None:
+                    detected_peak = dp
+                if rc:
+                    rep_completed = True
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
 
@@ -405,38 +454,11 @@ class PeakDetector:
             if self.smoothed_value < self.current_valley_value:
                 self.current_valley_value = self.smoothed_value
             elif self.smoothed_value > self.current_valley_value + self.hysteresis:
-                if self.frame_count - self.last_peak_frame >= self.min_peak_distance:
-                    if not self._calibrated:
-                        within_margin = True
-                    else:
-                        rom = self._calibrated_rom()
-                        within_margin = (
-                            self._calibrated_avg_valley is not None
-                            and rom > 0
-                            and self.current_valley_value <= self._calibrated_avg_valley + self.valley_margin_pct * rom
-                        )
-                    gate_ok_v = self._range_gate_allows_rep_recording()
-                    distance_ok_v = self.frame_count - self.last_peak_frame >= self.min_peak_distance
-                    interval_ok = True
-                    new_rep_count_if = min(len(self.peaks), len(self.valleys) + 1)
-                    rep_would_increment = new_rep_count_if > self.rep_count
-                    now_ms = time.time() * 1000.0
-                    if rep_would_increment and self.min_rep_interval_ms > 0:
-                        if self._last_rep_time_ms is not None and (
-                            now_ms - self._last_rep_time_ms
-                        ) < self.min_rep_interval_ms:
-                            interval_ok = False
-                    allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok_v)
-                    if within_margin and (gate_ok_v or allow_record_while_gate_closed):
-                        detected_valley = self.current_valley_value
-                        self.valleys.append(self.current_valley_value)
-                        self.last_peak_frame = self.frame_count
-                        new_rep_count = min(len(self.peaks), len(self.valleys))
-                        if new_rep_count > self.rep_count and gate_ok_v and interval_ok:
-                            self.rep_count = new_rep_count
-                            rep_completed = True
-                            self._last_rep_time_ms = now_ms
-                        self._maybe_lock_calibration()
+                dv, rc = self._record_valley_on_reversal()
+                if dv is not None:
+                    detected_valley = dv
+                if rc:
+                    rep_completed = True
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 

@@ -9,11 +9,10 @@ from typing import Any, Literal, Optional
 class StepResult:
     """Per-frame output after processing smoothed landmarks."""
 
+    # Shown rep count (peak detector + optional session adjustment for unmatched half-cycles).
     reps: int
-    """Rep count shown to the user (0 until calibration completes)."""
-
+    # Completed rep cycles from the peak detector before session-layer adjustment.
     reps_raw: int
-    """Internal rep count from the peak detector (includes calibration reps)."""
 
     tracked_joint: Optional[str]
     angle_3_point_value: Optional[float]
@@ -31,8 +30,8 @@ class StepResult:
     calibration_certainty_target: float
     phase: Literal["idle", "selecting", "tracking"]
     status_message: str
+    # Extra tracking line (calibration progress, range gate); empty when not used.
     tracking_detail_message: str
-    """Second line for tracking phase (calibration / range gate text)."""
 
     leader_key: Optional[str] = None
     selection_debug: dict[str, Any] = field(default_factory=dict)
