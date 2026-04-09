@@ -16,8 +16,35 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 
 ## Use as a library (other projects)
 
+**This package is not published on PyPI.** `pip install flexible-rep-counter` / `pip index versions flexible-rep-counter` will not find it until you publish it yourself. Install from a **local clone**, a **built wheel**, or a **Git URL** instead.
+
 ```bash
-pip install -e ".[viz]"   # from this repo root; [viz] adds OpenCV + requests for the demo app
+# Editable (recommended while developing both repos)
+pip install -e "/path/to/flexible-rep-counter"
+
+# Or build a wheel in this repo (python3 -m build), then:
+pip install /path/to/flexible-rep-counter/dist/flexible_rep_counter-*-py3-none-any.whl
+
+# Optional OpenCV + requests for the demo app
+pip install -e "/path/to/flexible-rep-counter[viz]"
+```
+
+**`requirements.txt`** (PEP 508 direct URL or path):
+
+```text
+flexible-rep-counter @ file:///absolute/path/to/flexible-rep-counter
+```
+
+Or a relative path from the file that contains the requirement (same parent layout as your project).
+
+**`pyproject.toml` dependency** (e.g. sibling checkout):
+
+```toml
+[project]
+dependencies = [
+  "flexible-rep-counter @ file:///absolute/path/to/flexible-rep-counter",
+]
+# or: { path = "../flexible-rep-counter", editable = true }  # tool-specific
 ```
 
 ```python
@@ -27,6 +54,15 @@ session = RepCounterSession(auto_started=True, use_pose_filter=False)
 landmarks = keypoints_numpy_to_landmarks(keypoints_np)  # (17, 3) float array
 step = session.step_landmarks(landmarks, timestamp_ms=...)
 # step.reps, step.tracked_joint, step.angle_3_point_value, step.avg_peak, step.avg_valley, ...
+```
+
+**Matching this repo’s angle math** (COCO 17 landmarks as `list[dict]` with `x`, `y`, `confidence`): use the same entry points as the session—[`calculate_from_type`](src/flexible_rep_counter/core/math_engine.py) plus joint configs in [`COMMON_ANGLES`](src/flexible_rep_counter/core/variance_angle_selector.py) (e.g. `angle_3_point` and landmark index triples). Example:
+
+```python
+from flexible_rep_counter.core import COMMON_ANGLES, calculate_from_type
+
+cfg = COMMON_ANGLES["LEFT_ELBOW"]
+deg = calculate_from_type(cfg["type"], cfg["landmarks"], landmarks)
 ```
 
 **ai-personal-trainer** (sibling checkout): `pyproject.toml` includes an editable `flexible-rep-counter` path dependency; run `uv sync` or `pip install -e ../flexible-rep-counter` if needed.
