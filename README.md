@@ -6,6 +6,7 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 
 - **Webcam capture**: OpenCV frames; optional resize/JPEG tuning before upload.
 - **Pose inference**: YOLO pose on a remote VM; client in [`app/vm_client.py`](app/vm_client.py) (`GET /health`, `POST /predict` multipart JPEG, benchmarking hooks).
+- **Runtime timing HUD**: Bottom-right panel shows VM timings (`roundtrip/upload/encode/inference`) plus local CPU stage timings from the rep engine (`session`, `detector`, `variance`) so you can watch jitter spikes in real time.
 - **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
 - **Angle selection**: [`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `angle_selection.variance_fallback_sec` (in `rep_counter.toml`) the session may lock using pure **variance** selection when the retry window allows.
 - **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.

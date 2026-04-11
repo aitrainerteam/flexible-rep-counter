@@ -228,7 +228,14 @@ def _put_text_readable(frame: Any, text: str, pos: tuple[int, int], font: int, s
 
 def _merge_benchmark_peaks(peaks: dict[str, float | None], b: dict[str, Any]) -> None:
     """Session maxima for timing fields (yolo-deploy camera_pose_client style)."""
-    for key in ("roundtrip_ms", "upload_ms", "encode_ms"):
+    for key in (
+        "roundtrip_ms",
+        "upload_ms",
+        "encode_ms",
+        "session_ms",
+        "detector_ms",
+        "variance_ms",
+    ):
         v = b.get(key)
         if v is None:
             continue
@@ -243,6 +250,23 @@ def _merge_benchmark_peaks(peaks: dict[str, float | None], b: dict[str, Any]) ->
         fi = float(inf)
         prev_i = peaks.get("inference_ms")
         peaks["inference_ms"] = fi if prev_i is None else max(prev_i, fi)
+
+
+def _extract_local_perf(step: StepResult) -> dict[str, float]:
+    sd = step.selection_debug if isinstance(step.selection_debug, dict) else {}
+    perf = sd.get("perf_ms") if isinstance(sd.get("perf_ms"), dict) else {}
+    out: dict[str, float] = {}
+    for src, dst in (
+        ("session_total_ms", "session_ms"),
+        ("detector_update_ms", "detector_ms"),
+        ("variance_ms", "variance_ms"),
+    ):
+        v = perf.get(src)
+        try:
+            out[dst] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _draw_vm_benchmark_hud(
@@ -265,6 +289,16 @@ def _draw_vm_benchmark_hud(
         srv = benchmark.get("inference_ms")
         line1 = f"rt {rt:.0f}ms  up {float(benchmark.get('upload_ms') or 0):.0f}ms  enc {float(benchmark.get('encode_ms') or 0):.0f}ms"
         lines.append((line1, (220, 220, 220)))
+        session_ms = benchmark.get("session_ms")
+        detector_ms = benchmark.get("detector_ms")
+        variance_ms = benchmark.get("variance_ms")
+        if session_ms is not None or detector_ms is not None or variance_ms is not None:
+            lines.append(
+                (
+                    f"cpu sess {float(session_ms or 0):.1f}ms  det {float(detector_ms or 0):.1f}ms  var {float(variance_ms or 0):.1f}ms",
+                    (200, 230, 255),
+                )
+            )
         if srv is not None:
             try:
                 sm = float(srv)
@@ -279,6 +313,9 @@ def _draw_vm_benchmark_hud(
         peak_bits.append(f"rt_peak {prt:.0f}")
     if pinf is not None:
         peak_bits.append(f"srv_peak {pinf:.0f}")
+    p_session = peaks.get("session_ms")
+    if p_session is not None:
+        peak_bits.append(f"cpu_peak {p_session:.1f}")
     if peak_bits:
         lines.append(("  ".join(peak_bits), (180, 180, 255)))
     if validation_issues:
@@ -572,6 +609,9 @@ def run_webcam_loop(
         "upload_ms": None,
         "encode_ms": None,
         "inference_ms": None,
+        "session_ms": None,
+        "detector_ms": None,
+        "variance_ms": None,
     }
 
     def _update_vm_metrics(snap: dict[str, Any]) -> tuple[dict[str, Any] | None, float, list[str]]:
@@ -650,6 +690,11 @@ def run_webcam_loop(
             timestamp_ms = time.time() * 1000.0
             if raw_landmarks is None:
                 step = rs_sess.step_landmarks(None, timestamp_ms=timestamp_ms)
+                local_perf = _extract_local_perf(step)
+                if local_perf:
+                    disp_b = dict(disp_b or {})
+                    disp_b.update(local_perf)
+                    _merge_benchmark_peaks(benchmark_peaks, disp_b)
                 _draw_overlay(frame_bgr, step)
                 _draw_library_watermark(frame_bgr)
                 _draw_vm_benchmark_hud(
@@ -672,6 +717,11 @@ def run_webcam_loop(
                 (disp_h, disp_w),
             )
             step = rs_sess.step_landmarks(raw_scaled, timestamp_ms=timestamp_ms)
+            local_perf = _extract_local_perf(step)
+            if local_perf:
+                disp_b = dict(disp_b or {})
+                disp_b.update(local_perf)
+                _merge_benchmark_peaks(benchmark_peaks, disp_b)
             sm = rs_sess.last_smoothed_landmarks
             if sm:
                 draw_skeleton(frame_bgr, sm)
@@ -717,7 +767,15 @@ def run_webcam_loop(
             print(f"  payload: {last_benchmark.get('payload_kb', 0):.1f} KB")
         if any(v is not None for v in benchmark_peaks.values()):
             print("\nSession VM peaks (ms):")
-            for k in ("roundtrip_ms", "upload_ms", "encode_ms", "inference_ms"):
+            for k in (
+                "roundtrip_ms",
+                "upload_ms",
+                "encode_ms",
+                "inference_ms",
+                "session_ms",
+                "detector_ms",
+                "variance_ms",
+            ):
                 v = benchmark_peaks.get(k)
                 if v is not None:
                     print(f"  {k}: {v:.1f}")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -24,6 +25,11 @@ COCO_KEYPOINT_NAMES = [
 NUM_KEYPOINTS = 17
 FACE_KEYPOINT_COUNT = 5
 BODY_KEYPOINT_NAMES = COCO_KEYPOINT_NAMES[FACE_KEYPOINT_COUNT:]
+VM_PARSE_LEGACY_FORMATS = os.environ.get("VM_PARSE_LEGACY_FORMATS", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 @dataclass
@@ -137,21 +143,29 @@ def _person_keypoints_to_list(kp_dict: dict) -> Optional[list[dict]]:
     return out
 
 
-def _parse_keypoints(data: Any) -> Optional[list[dict]]:
-    """Parse JSON response into list of 17 landmarks {x, y, confidence}. Returns None if invalid."""
+def _parse_keypoints_vm_schema(data: Any) -> Optional[list[dict]]:
+    """Parse production VM schema (person_n -> keypoints map)."""
+    if not isinstance(data, dict):
+        return None
+    person_1 = data.get("person_1")
+    if isinstance(person_1, dict):
+        parsed = _person_keypoints_to_list(person_1.get("keypoints"))
+        if parsed is not None:
+            return parsed
+    for key, value in data.items():
+        if key == "person_1" or not key.startswith("person_") or not isinstance(value, dict):
+            continue
+        parsed = _person_keypoints_to_list(value.get("keypoints"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_keypoints_legacy(data: Any) -> Optional[list[dict]]:
+    """Optional compatibility parser for legacy payload formats."""
     if data is None:
         return None
 
-    # yolo-deploy format: person_1, person_2, ... with keypoints as dict (name -> {x, y, conf})
-    if isinstance(data, dict):
-        for key in sorted(data.keys()):
-            if key.startswith("person_") and isinstance(data[key], dict):
-                kp = data[key].get("keypoints")
-                parsed = _person_keypoints_to_list(kp)
-                if parsed is not None:
-                    return parsed
-
-    # Shape: list of 17 items with x, y, confidence
     if isinstance(data, list) and len(data) >= NUM_KEYPOINTS:
         out = []
         for i in range(NUM_KEYPOINTS):
@@ -167,27 +181,30 @@ def _parse_keypoints(data: Any) -> Optional[list[dict]]:
             out.append(_landmark_from_xyc(x, y, c))
         return out
 
-    # Nested: results[0].keypoints or predictions[0].keypoints
-    for key in ("results", "predictions", "keypoints"):
-        arr = data.get(key) if isinstance(data, dict) else None
-        if isinstance(arr, list) and len(arr) > 0:
-            kp = arr[0].get("keypoints", arr[0]) if isinstance(arr[0], dict) else arr[0]
-            parsed = _parse_keypoints(kp)
-            if parsed is not None:
-                return parsed
-        elif isinstance(data, dict) and key == "keypoints":
-            nested = data.get("keypoints")
-            if nested is not None:
-                parsed = _person_keypoints_to_list(nested) if isinstance(nested, dict) else _parse_keypoints(nested)
+    if isinstance(data, dict):
+        for key in ("results", "predictions"):
+            arr = data.get(key)
+            if isinstance(arr, list) and len(arr) > 0:
+                first = arr[0]
+                if isinstance(first, dict):
+                    nested = first.get("keypoints", first)
+                else:
+                    nested = first
+                parsed = _parse_keypoints_legacy(nested)
                 if parsed is not None:
                     return parsed
 
-    # Single object with keypoints key (dict format)
-    if isinstance(data, dict) and "keypoints" in data:
-        parsed = _person_keypoints_to_list(data["keypoints"])
-        if parsed is not None:
-            return parsed
-        return _parse_keypoints(data["keypoints"])
+        nested = data.get("keypoints")
+        if nested is not None:
+            if isinstance(nested, dict):
+                parsed = _person_keypoints_to_list(nested)
+                if parsed is not None:
+                    return parsed
+            return _parse_keypoints_legacy(nested)
+
+        nested_data = data.get("data")
+        if nested_data is not None:
+            return _parse_keypoints_legacy(nested_data)
 
     return None
 
@@ -278,9 +295,9 @@ def send_frame(
         if issues:
             logger.debug("predict validation ok=%s issues=%s", _ok, issues)
 
-    parsed = _parse_keypoints(body)
-    if parsed is None and isinstance(body, dict):
-        parsed = _parse_keypoints(body.get("keypoints") or body.get("data"))
+    parsed = _parse_keypoints_vm_schema(body)
+    if parsed is None and VM_PARSE_LEGACY_FORMATS:
+        parsed = _parse_keypoints_legacy(body)
 
     logger.debug(
         "VM predict ok roundtrip=%.1fms encode=%.1fms upload=%.1fms payload=%.1fKB server_inf=%s",

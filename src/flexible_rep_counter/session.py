@@ -37,9 +37,11 @@ from flexible_rep_counter.core.variance_angle_selector import (
 )
 from flexible_rep_counter.types import StepResult
 
+DEFAULT_TUNING_PARAMS = get_default_tuning_params()
+
 
 def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
-    d = get_default_tuning_params()
+    d = DEFAULT_TUNING_PARAMS
     tp = tuning_params or {}
     return create_peak_detector(
         smoothing_factor=float(tp.get("smoothingFactor", d["smoothingFactor"])),
@@ -63,7 +65,7 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
 def _apply_locked_tracking(
     run_state: dict[str, Any],
     selected_angle: str,
-    buf_list: list[list[dict]],
+    buf_list: Optional[list[list[dict]]],
     tuning_params: dict[str, Any],
     *,
     selection_detector: Optional[Any] = None,
@@ -79,9 +81,9 @@ def _apply_locked_tracking(
     else:
         det = _peak_detector_from_tuning(tuning_params)
         cfg = COMMON_ANGLES[selected_angle]
-        series = [
-            calculate_from_type(cfg["type"], cfg["landmarks"], lm) for lm in buf_list
-        ]
+        series = []
+        for lm in buf_list or []:
+            series.append(calculate_from_type(cfg["type"], cfg["landmarks"], lm))
         replay_angle_series_on_peak_detector(det, series)
     run_state["peak_detector"] = det
     run_state["selection_dominance_key"] = None
@@ -165,7 +167,7 @@ def _format_angle_label(angle_key: str) -> str:
 
 
 def _idle_result(msg: str = "Click Start to begin") -> StepResult:
-    d = get_default_tuning_params()
+    d = DEFAULT_TUNING_PARAMS
     return StepResult(
         reps=0,
         reps_raw=0,
@@ -210,7 +212,7 @@ class RepCounterSession:
 
     def reset(self, *, tuning_params: Optional[dict[str, Any]] = None) -> None:
         """Full reset (new exercise or second Start in visualizer)."""
-        tp = tuning_params if tuning_params is not None else get_default_tuning_params()
+        tp = tuning_params if tuning_params is not None else DEFAULT_TUNING_PARAMS
         self._run_state = {
             "started": bool(self._auto_started),
             "started_at": time.time() if self._auto_started else None,
@@ -225,6 +227,8 @@ class RepCounterSession:
             "selected_config": None,
             "peak_detector": None,
             "tuning_params": dict(tp),
+            "buffer_list_cache": {"signature": None, "data": []},
+            "variance_cache": {"signature": None, "include_debug": False, "data": {}},
         }
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
@@ -239,6 +243,8 @@ class RepCounterSession:
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
+        self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
 
     def clear_tracking_keep_started(self) -> None:
         """Second Start click: clear selection/tracking but keep started=True."""
@@ -252,6 +258,8 @@ class RepCounterSession:
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
+        self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
 
     @property
     def started(self) -> bool:
@@ -261,6 +269,50 @@ class RepCounterSession:
     def last_smoothed_landmarks(self) -> Optional[list[dict]]:
         """Landmarks after temporal filtering from the last successful ``step_landmarks`` call."""
         return self._last_smoothed_landmarks
+
+    @staticmethod
+    def _buffer_signature(frame_buffer: deque) -> tuple[int, int, int]:
+        n = len(frame_buffer)
+        if n <= 0:
+            return (0, 0, 0)
+        return (n, id(frame_buffer[0]), id(frame_buffer[-1]))
+
+    def _buffer_as_list(self, rs: dict[str, Any], frame_buffer: deque) -> list[list[dict]]:
+        sig = self._buffer_signature(frame_buffer)
+        cache = rs.get("buffer_list_cache") or {}
+        if cache.get("signature") == sig:
+            data = cache.get("data")
+            if isinstance(data, list):
+                return data
+        data = list(frame_buffer)
+        rs["buffer_list_cache"] = {"signature": sig, "data": data}
+        return data
+
+    def _get_variances(
+        self,
+        rs: dict[str, Any],
+        frame_buffer: deque,
+        *,
+        include_debug: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        sig = self._buffer_signature(frame_buffer)
+        cache = rs.get("variance_cache") or {}
+        if (
+            cache.get("signature") == sig
+            and (bool(cache.get("include_debug")) or not include_debug)
+            and isinstance(cache.get("data"), dict)
+        ):
+            return cache["data"]
+        variances = compute_angle_variances_from_buffer(
+            self._buffer_as_list(rs, frame_buffer),
+            include_debug=include_debug,
+        )
+        rs["variance_cache"] = {
+            "signature": sig,
+            "include_debug": include_debug,
+            "data": variances,
+        }
+        return variances
 
     def step_landmarks(
         self,
@@ -279,42 +331,22 @@ class RepCounterSession:
 
         now = wall_time_s if wall_time_s is not None else time.time()
         ts = timestamp_ms if timestamp_ms is not None else now * 1000.0
+        t_step_start = time.perf_counter()
 
         rs = self._run_state
         tuning_params = rs["tuning_params"]
+        default_tuning = DEFAULT_TUNING_PARAMS
 
         if not landmarks:
             self._last_smoothed_landmarks = None
             if rs.get("selected_angle") is not None and rs.get("peak_detector") is not None:
                 tr = self._build_tracking_step_result(rs, None)
                 return replace(tr, status_message=f"No pose - {tr.status_message}")
-            return StepResult(
-                reps=0,
-                reps_raw=0,
+            return self._no_pose_step_result(
+                tuning_params=tuning_params,
                 tracked_joint=rs.get("selected_angle"),
-                angle_3_point_value=None,
-                target_landmarks=None,
-                tuning_params=dict(tuning_params),
-                avg_peak=None,
-                avg_valley=None,
-                calibration_complete=False,
-                peak_detector_state="—",
-                smoothed_value=None,
-                range_gate_open=True,
-                rolling_range=None,
-                calibration_target_reps=int(
-                    tuning_params.get("calibrationReps", get_default_tuning_params()["calibrationReps"])
-                ),
-                calibration_certainty=0.0,
-                calibration_certainty_target=float(
-                    tuning_params.get(
-                        "calibrationCertainty",
-                        get_default_tuning_params()["calibrationCertainty"],
-                    )
-                ),
+                default_tuning=default_tuning,
                 phase="selecting" if rs.get("selected_angle") is None else "tracking",
-                status_message="No pose",
-                tracking_detail_message="",
             )
 
         if self._pose_pipeline is not None:
@@ -325,9 +357,13 @@ class RepCounterSession:
 
         frame_buffer = rs["frame_buffer"]
         frame_buffer.append(lm)
-        buf_list = list(frame_buffer)
         started_at = float(rs.get("started_at") or 0.0)
         elapsed = now - started_at
+        perf_ms: dict[str, float] = {
+            "detector_update_ms": 0.0,
+            "variance_ms": 0.0,
+            "selection_logic_ms": 0.0,
+        }
 
         sdba: dict[str, Any] = rs.get("selection_detectors_by_angle") or {}
         if not sdba:
@@ -339,23 +375,27 @@ class RepCounterSession:
                     pass
             rs["selection_detectors_by_angle"] = sdba
 
-        angle_values: dict[str, Optional[float]] = {}
-        detector_outputs: dict[str, dict[str, Any]] = {}
-        for ak, cfg in COMMON_ANGLES.items():
-            val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
-            angle_values[ak] = val
-            detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
-
-        rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
-        rep_dom = summarize_rep_dominance(rep_counts_sel)
-        variances = compute_angle_variances_from_buffer(buf_list)
-        joint_records = _collect_joint_records(sdba, variances)
-
         selected_angle = rs["selected_angle"]
         if selected_angle is not None and rs.get("peak_detector") is None:
             rs["peak_detector"] = sdba.get(selected_angle)
 
         if selected_angle is None:
+            angle_values: dict[str, Optional[float]] = {}
+            detector_outputs: dict[str, dict[str, Any]] = {}
+            t_det = time.perf_counter()
+            for ak, cfg in COMMON_ANGLES.items():
+                val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+                angle_values[ak] = val
+                detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
+            perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
+
+            rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
+            rep_dom = summarize_rep_dominance(rep_counts_sel)
+            t_var = time.perf_counter()
+            variances = self._get_variances(rs, frame_buffer, include_debug=False)
+            perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
+            joint_records = _collect_joint_records(sdba, variances)
+
             ready = (
                 len(frame_buffer) >= ANGLE_SELECTION_MIN_FRAMES
                 and elapsed >= ANGLE_SELECTION_MIN_SEC
@@ -393,7 +433,7 @@ class RepCounterSession:
             cal_reps_target = int(
                 tuning_params.get(
                     "calibrationReps",
-                    get_default_tuning_params()["calibrationReps"],
+                    default_tuning["calibrationReps"],
                 )
             )
             total_selection_reps = int(rep_dom.get("totalReps") or 0)
@@ -402,19 +442,25 @@ class RepCounterSession:
                 or total_selection_reps >= cal_reps_target
             )
             locked_this_frame = False
+            t_sel = time.perf_counter()
 
             if lock_from_dominance and leader_key:
                 _apply_locked_tracking(
                     rs,
                     leader_key,
-                    buf_list,
+                    None,
                     tuning_params,
                     selection_detector=sdba.get(leader_key),
                 )
                 locked_this_frame = True
             elif can_try and variance_fallback_ready:
-                result = determine_best_angle(buf_list)
-                tuning_params = result.get("tuningParams") or get_default_tuning_params()
+                buf_list = self._buffer_as_list(rs, frame_buffer)
+                result = determine_best_angle(
+                    buf_list,
+                    variances=variances,
+                    include_debug=False,
+                )
+                tuning_params = result.get("tuningParams") or DEFAULT_TUNING_PARAMS
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
                 src = str(result.get("source") or "")
@@ -423,7 +469,7 @@ class RepCounterSession:
                     _apply_locked_tracking(
                         rs,
                         sel,
-                        buf_list,
+                        None,
                         tuning_params,
                         selection_detector=sdba.get(sel),
                     )
@@ -433,6 +479,7 @@ class RepCounterSession:
                     rs["selected_config"] = None
                     rs["peak_detector"] = None
                     rs["selection_last_attempt"] = now
+            perf_ms["selection_logic_ms"] = (time.perf_counter() - t_sel) * 1000.0
 
             retry_at = rs.get("selection_last_attempt")
             status = _selection_status_message(
@@ -448,6 +495,7 @@ class RepCounterSession:
                 streak=streak,
                 rep_dom=rep_dom,
             )
+            perf_ms["session_total_ms"] = (time.perf_counter() - t_step_start) * 1000.0
             return StepResult(
                 reps=0,
                 reps_raw=0,
@@ -464,14 +512,14 @@ class RepCounterSession:
                 rolling_range=None,
                 calibration_target_reps=int(
                     rs["tuning_params"].get(
-                        "calibrationReps", get_default_tuning_params()["calibrationReps"]
+                        "calibrationReps", default_tuning["calibrationReps"]
                     )
                 ),
                 calibration_certainty=0.0,
                 calibration_certainty_target=float(
                     rs["tuning_params"].get(
                         "calibrationCertainty",
-                        get_default_tuning_params()["calibrationCertainty"],
+                        default_tuning["calibrationCertainty"],
                     )
                 ),
                 phase="selecting",
@@ -482,10 +530,37 @@ class RepCounterSession:
                     "rep_dom": rep_dom,
                     "dom_ok": dom_ok,
                     "joint_records": joint_records,
+                    "perf_ms": perf_ms,
                 },
             )
 
-        # Tracking phase: keep reassessing based on recent variance while preserving per-joint records.
+        # Tracking phase: update only the selected detector each frame.
+        angle_values: dict[str, Optional[float]] = {}
+        detector_outputs: dict[str, dict[str, Any]] = {}
+        variances: dict[str, dict[str, Any]] = {}
+        joint_records: dict[str, Any] = {}
+        rep_dom = {
+            "totalReps": 0,
+            "leaderKey": selected_angle,
+            "leaderReps": 0,
+            "leaderShare": 0.0,
+        }
+        if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
+            cfg = COMMON_ANGLES[selected_angle]
+            t_det = time.perf_counter()
+            val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+            angle_values[selected_angle] = val
+            detector_outputs[selected_angle] = sdba[selected_angle].update(val)  # type: ignore[index]
+            perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
+            active_detector = sdba.get(selected_angle) or rs.get("peak_detector")
+            rep_value = int(active_detector.get_rep_count() or 0) if active_detector is not None else 0
+            rep_dom = {
+                "totalReps": rep_value,
+                "leaderKey": selected_angle,
+                "leaderReps": rep_value,
+                "leaderShare": 1.0 if rep_value > 0 else 0.0,
+            }
+
         switched_to: Optional[str] = None
         last_re_eval = rs.get("selection_last_reevaluate_at")
         re_eval_due = (
@@ -495,7 +570,17 @@ class RepCounterSession:
         )
         if re_eval_due:
             rs["selection_last_reevaluate_at"] = now
-            result = determine_best_angle(buf_list)
+            t_var = time.perf_counter()
+            variances = self._get_variances(rs, frame_buffer, include_debug=False)
+            perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
+            t_sel = time.perf_counter()
+            buf_list = self._buffer_as_list(rs, frame_buffer)
+            result = determine_best_angle(
+                buf_list,
+                variances=variances,
+                include_debug=False,
+            )
+            perf_ms["selection_logic_ms"] = (time.perf_counter() - t_sel) * 1000.0
             cand = result.get("selectedAngle")
             src = str(result.get("source") or "")
             candidate = cand if isinstance(cand, str) and cand in COMMON_ANGLES else None
@@ -518,11 +603,17 @@ class RepCounterSession:
                     rs["selection_last_switch_at"] = now
                     switched_to = candidate
                     selected_angle = candidate
+                    cfg = COMMON_ANGLES[candidate]
+                    val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+                    angle_values[candidate] = val
+                    detector_outputs[candidate] = sdba[candidate].update(val)  # type: ignore[index]
+            joint_records = _collect_joint_records(sdba, variances)
 
         angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None
         selected_output = (
             detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
         )
+        perf_ms["session_total_ms"] = (time.perf_counter() - t_step_start) * 1000.0
         return self._build_tracking_step_result(
             rs,
             angle_value,
@@ -531,6 +622,7 @@ class RepCounterSession:
                 "rep_dom": rep_dom,
                 "joint_records": joint_records,
                 "switched_to": switched_to,
+                "perf_ms": perf_ms,
             },
         )
 
@@ -544,7 +636,7 @@ class RepCounterSession:
     ) -> StepResult:
         tuning_params = rs["tuning_params"]
         peak_detector = rs["peak_detector"]
-        d_tuning = get_default_tuning_params()
+        d_tuning = DEFAULT_TUNING_PARAMS
         rep_count = 0
         state_str = "—"
         smoothed_value = None
@@ -654,4 +746,41 @@ class RepCounterSession:
             status_message=status,
             tracking_detail_message=cal_detail if not calibration_complete else "",
             selection_debug=dict(selection_debug or {}),
+        )
+
+    def _no_pose_step_result(
+        self,
+        *,
+        tuning_params: dict[str, Any],
+        tracked_joint: Optional[str],
+        default_tuning: dict[str, Any],
+        phase: str,
+    ) -> StepResult:
+        return StepResult(
+            reps=0,
+            reps_raw=0,
+            tracked_joint=tracked_joint,
+            angle_3_point_value=None,
+            target_landmarks=None,
+            tuning_params=dict(tuning_params),
+            avg_peak=None,
+            avg_valley=None,
+            calibration_complete=False,
+            peak_detector_state="—",
+            smoothed_value=None,
+            range_gate_open=True,
+            rolling_range=None,
+            calibration_target_reps=int(
+                tuning_params.get("calibrationReps", default_tuning["calibrationReps"])
+            ),
+            calibration_certainty=0.0,
+            calibration_certainty_target=float(
+                tuning_params.get(
+                    "calibrationCertainty",
+                    default_tuning["calibrationCertainty"],
+                )
+            ),
+            phase=phase,
+            status_message="No pose",
+            tracking_detail_message="",
         )

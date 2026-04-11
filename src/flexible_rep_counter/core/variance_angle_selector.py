@@ -107,6 +107,8 @@ def _variance_eligibility(angle_key: str, data: dict[str, Any]) -> tuple[bool, f
 
 def compute_angle_variances_from_buffer(
     frame_buffer: list[list[dict]],
+    *,
+    include_debug: bool = True,
 ) -> dict[str, dict[str, Any]]:
     if not frame_buffer:
         return {}
@@ -129,16 +131,18 @@ def compute_angle_variances_from_buffer(
             robust = compute_robust_variance(smoothed)
             consistent = compute_consistent_variance_score(smoothed, min_window_size=min_ws)
             span_deg = max(smoothed) - min(smoothed) if len(smoothed) >= 2 else 0.0
-            variances[angle_key] = {
+            row: dict[str, Any] = {
                 **stats,
                 "robustVariance": robust["variance"],
                 "medianWindowVariance": consistent["medianWindowVariance"],
                 "activeWindowCount": consistent["activeWindowCount"],
-                "windowVariances": consistent["windowVariances"],
                 "smoothedRangeDeg": span_deg,
-                "history": history,
                 "config": config,
             }
+            if include_debug:
+                row["windowVariances"] = consistent["windowVariances"]
+                row["history"] = history
+            variances[angle_key] = row
     return variances
 
 
@@ -285,7 +289,12 @@ def _get_angle_confidence(frame_buffer: list[list[dict]], angle_config: Optional
     return get_average_confidence_for_landmarks(frame_buffer, angle_config["landmarks"])
 
 
-def determine_best_angle(frame_buffer: list[list[dict]]) -> dict[str, Any]:
+def determine_best_angle(
+    frame_buffer: list[list[dict]],
+    *,
+    variances: Optional[dict[str, dict[str, Any]]] = None,
+    include_debug: bool = True,
+) -> dict[str, Any]:
     """
     Pick the best angle to track from a buffer of frames.
     Returns { selectedAngle, source, tuningParams, debug }.
@@ -306,21 +315,24 @@ def determine_best_angle(frame_buffer: list[list[dict]]) -> dict[str, Any]:
     if not frame_buffer or len(frame_buffer) < 40:
         return default_result
 
-    variances = _calculate_all_variances(frame_buffer)
-    debug["variances"] = {
-        k: {
-            "variance": v.get("variance"),
-            "robustVariance": v.get("robustVariance"),
-            "medianWindowVariance": v.get("medianWindowVariance"),
-            "activeWindowCount": v.get("activeWindowCount"),
-            "smoothedRangeDeg": v.get("smoothedRangeDeg"),
-            "mean": v.get("mean"),
-            "thresholds": _angle_selection_thresholds(k),
+    variance_rows = variances or _calculate_all_variances(
+        frame_buffer, include_debug=include_debug
+    )
+    if include_debug:
+        debug["variances"] = {
+            k: {
+                "variance": v.get("variance"),
+                "robustVariance": v.get("robustVariance"),
+                "medianWindowVariance": v.get("medianWindowVariance"),
+                "activeWindowCount": v.get("activeWindowCount"),
+                "smoothedRangeDeg": v.get("smoothedRangeDeg"),
+                "mean": v.get("mean"),
+                "thresholds": _angle_selection_thresholds(k),
+            }
+            for k, v in variance_rows.items()
         }
-        for k, v in variances.items()
-    }
 
-    top_candidate = _get_top_candidate(variances)
+    top_candidate = _get_top_candidate(variance_rows)
     debug["topCandidate"] = (
         {
             "key": top_candidate["key"],
