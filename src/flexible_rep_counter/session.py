@@ -6,6 +6,12 @@ from collections import deque
 from dataclasses import replace
 from typing import Any, Optional
 
+from flexible_rep_counter.instrumentation import (
+    RepInstrumentationSink,
+    RepInstrumentationSettings,
+    merge_trace,
+)
+
 from flexible_rep_counter.core.math_engine import (
     PeakDetector,
     calculate_from_type,
@@ -38,6 +44,31 @@ from flexible_rep_counter.core.variance_angle_selector import (
 from flexible_rep_counter.types import StepResult
 
 DEFAULT_TUNING_PARAMS = get_default_tuning_params()
+
+# Match yolo-deploy / angles.py gate so pose_dropped aligns with omitted angles in JSON.
+_MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
+
+
+def _diagnose_missing_angle(
+    cfg: dict[str, Any], landmarks: list[dict]
+) -> tuple[str, dict[str, Any]]:
+    """Why ``calculate_from_type`` may return None for this joint configuration."""
+    detail: dict[str, Any] = {"landmark_indices": list(cfg.get("landmarks") or [])}
+    idxs = list(cfg.get("landmarks") or [])
+    confs: list[dict[str, Any]] = []
+    for i in idxs:
+        if i >= len(landmarks):
+            detail["keypoints"] = confs
+            return "missing_keypoint_index", detail
+        p = landmarks[i]
+        c = float(p.get("confidence", 0.0))
+        confs.append({"index": i, "confidence": c})
+        if c < _MIN_KEYPOINT_CONF_FOR_ANGLE:
+            detail["keypoints"] = confs
+            detail["min_conf_required"] = _MIN_KEYPOINT_CONF_FOR_ANGLE
+            return "low_keypoint_confidence", detail
+    detail["keypoints"] = confs
+    return "geometry_unavailable", detail
 
 
 def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
@@ -200,10 +231,15 @@ class RepCounterSession:
         tuning_params: Optional[dict[str, Any]] = None,
         use_pose_filter: bool = True,
         auto_started: bool = False,
+        instrumentation_settings: Optional[RepInstrumentationSettings] = None,
     ) -> None:
         self._use_filter = use_pose_filter
         self._pose_pipeline = PoseFilterPipeline() if use_pose_filter else None
         self._auto_started = auto_started
+        self._instrumentation_settings = instrumentation_settings
+        self._instr_sink: Optional[RepInstrumentationSink] = None
+        if instrumentation_settings is not None and instrumentation_settings.enabled:
+            self._instr_sink = RepInstrumentationSink(instrumentation_settings)
         self._run_state: dict[str, Any] = {}
         self._last_smoothed_landmarks: Optional[list[dict]] = None
         self.reset(tuning_params=tuning_params)
@@ -212,6 +248,8 @@ class RepCounterSession:
 
     def reset(self, *, tuning_params: Optional[dict[str, Any]] = None) -> None:
         """Full reset (new exercise or second Start in visualizer)."""
+        if self._instr_sink is not None:
+            self._instr_sink.flush()
         tp = tuning_params if tuning_params is not None else DEFAULT_TUNING_PARAMS
         self._run_state = {
             "started": bool(self._auto_started),
@@ -232,6 +270,7 @@ class RepCounterSession:
         }
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
+        self._sync_detector_instrumentation_flags()
 
     def set_started(self, wall_time: Optional[float] = None) -> None:
         """Mark session as started (visualizer Start button)."""
@@ -245,6 +284,7 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
+        self._sync_detector_instrumentation_flags()
 
     def clear_tracking_keep_started(self) -> None:
         """Second Start click: clear selection/tracking but keep started=True."""
@@ -260,6 +300,7 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
+        self._sync_detector_instrumentation_flags()
 
     @property
     def started(self) -> bool:
@@ -314,12 +355,181 @@ class RepCounterSession:
         }
         return variances
 
+    def _sync_detector_instrumentation_flags(self) -> None:
+        rs = self._run_state
+        sdba = rs.get("selection_detectors_by_angle") or {}
+        en = self._instr_sink is not None
+        for det in sdba.values():
+            try:
+                det.instrumentation_enabled = bool(en)
+            except Exception:
+                pass
+        pd = rs.get("peak_detector")
+        if pd is not None:
+            try:
+                pd.instrumentation_enabled = bool(en)
+            except Exception:
+                pass
+
+    def _instrumentation_should_emit(self, trace_context: Optional[dict[str, Any]]) -> bool:
+        if self._instr_sink is None or not trace_context:
+            return False
+        uid = trace_context.get("user_uid")
+        if not uid:
+            return False
+        settings = self._instr_sink.settings
+        if not settings.should_emit_for_user(str(uid)):
+            return False
+        fi = int(trace_context.get("frame_idx", 0) or 0)
+        if not settings.should_sample_frame(fi):
+            return False
+        return True
+
+    def _instr_emit(
+        self, trace_context: Optional[dict[str, Any]], event: dict[str, Any]
+    ) -> None:
+        if not self._instrumentation_should_emit(trace_context):
+            return
+        self._instr_sink.emit(merge_trace(event, trace_context))
+
+    def _drain_detector_instrumentation(
+        self, trace_context: Optional[dict[str, Any]], det: Any
+    ) -> None:
+        if det is None or not self._instrumentation_should_emit(trace_context):
+            return
+        try:
+            events = det.drain_instrumentation_events()
+        except Exception:
+            return
+        for ev in events:
+            self._instr_emit(trace_context, ev)
+
+    def _finalize_instrumentation_selection(
+        self,
+        trace_context: Optional[dict[str, Any]],
+        out: StepResult,
+        *,
+        raw_angle_values: dict[str, Optional[float]],
+        angle_values: dict[str, Optional[float]],
+        sdba: dict[str, Any],
+        leader_key: Optional[str],
+    ) -> None:
+        if not self._instrumentation_should_emit(trace_context):
+            return
+        seen: set[int] = set()
+        for det in sdba.values():
+            i = id(det)
+            if i in seen:
+                continue
+            seen.add(i)
+            self._drain_detector_instrumentation(trace_context, det)
+        lk = leader_key if isinstance(leader_key, str) else None
+        self._instr_emit(
+            trace_context,
+            {
+                "event": "frame_snapshot",
+                "phase": out.phase,
+                "tracked_joint": out.tracked_joint,
+                "leader_key": out.leader_key,
+                "reps": out.reps,
+                "reps_raw": out.reps_raw,
+                "peak_detector_state": out.peak_detector_state,
+                "range_gate_open": out.range_gate_open,
+                "rolling_range": out.rolling_range,
+                "calibration_complete": out.calibration_complete,
+                "calibration_certainty": out.calibration_certainty,
+                "calibration_target_reps": out.calibration_target_reps,
+                "smoothed_angle": out.smoothed_value,
+                "raw_angle": raw_angle_values.get(lk) if lk else None,
+                "filtered_angle": angle_values.get(lk) if lk else None,
+                "deadband_angle": None,
+                "angles_raw_compact": {k: v for k, v in raw_angle_values.items() if v is not None},
+                "angles_filtered_compact": {
+                    k: v for k, v in angle_values.items() if v is not None
+                },
+            },
+        )
+
+    def _finalize_instrumentation_tracking(
+        self,
+        trace_context: Optional[dict[str, Any]],
+        out: StepResult,
+        *,
+        raw_angle_value: Optional[float],
+        filtered_angle_value: Optional[float],
+        selected_output: Optional[dict[str, Any]],
+        sdba: dict[str, Any],
+        peak_detector: Any,
+        sel_angle: Optional[str],
+    ) -> None:
+        if not self._instrumentation_should_emit(trace_context):
+            return
+        if (
+            out.phase == "tracking"
+            and sel_angle
+            and filtered_angle_value is None
+            and self._last_smoothed_landmarks is not None
+            and isinstance(sel_angle, str)
+            and sel_angle in COMMON_ANGLES
+        ):
+            reason, detail = _diagnose_missing_angle(
+                COMMON_ANGLES[sel_angle], self._last_smoothed_landmarks
+            )
+            self._instr_emit(
+                trace_context,
+                {
+                    "event": "pose_dropped",
+                    "reason": reason,
+                    "reason_detail": detail,
+                    "tracked_joint": sel_angle,
+                },
+            )
+        seen: set[int] = set()
+        for det in sdba.values():
+            i = id(det)
+            if i in seen:
+                continue
+            seen.add(i)
+            self._drain_detector_instrumentation(trace_context, det)
+        if peak_detector is not None and id(peak_detector) not in seen:
+            self._drain_detector_instrumentation(trace_context, peak_detector)
+        feed_v: Optional[float] = None
+        smooth_v: Optional[float] = None
+        if selected_output:
+            fv = selected_output.get("feedValue")
+            sv = selected_output.get("smoothedValue")
+            if fv is not None:
+                feed_v = float(fv)
+            if sv is not None:
+                smooth_v = float(sv)
+        self._instr_emit(
+            trace_context,
+            {
+                "event": "frame_snapshot",
+                "phase": out.phase,
+                "tracked_joint": out.tracked_joint,
+                "reps": out.reps,
+                "reps_raw": out.reps_raw,
+                "peak_detector_state": out.peak_detector_state,
+                "range_gate_open": out.range_gate_open,
+                "rolling_range": out.rolling_range,
+                "calibration_complete": out.calibration_complete,
+                "calibration_certainty": out.calibration_certainty,
+                "calibration_target_reps": out.calibration_target_reps,
+                "raw_angle": raw_angle_value,
+                "filtered_angle": filtered_angle_value,
+                "deadband_angle": feed_v,
+                "smoothed_angle": smooth_v,
+            },
+        )
+
     def step_landmarks(
         self,
         landmarks: Optional[list[dict]],
         *,
         timestamp_ms: Optional[float] = None,
         wall_time_s: Optional[float] = None,
+        trace_context: Optional[dict[str, Any]] = None,
     ) -> StepResult:
         """
         Process one frame of 17 COCO landmarks (after any resolution scaling).
@@ -339,15 +549,44 @@ class RepCounterSession:
 
         if not landmarks:
             self._last_smoothed_landmarks = None
+            self._instr_emit(
+                trace_context,
+                {"event": "pose_dropped", "reason": "no_pose", "reason_detail": {}},
+            )
             if rs.get("selected_angle") is not None and rs.get("peak_detector") is not None:
                 tr = self._build_tracking_step_result(rs, None)
-                return replace(tr, status_message=f"No pose - {tr.status_message}")
-            return self._no_pose_step_result(
+                out = replace(tr, status_message=f"No pose - {tr.status_message}")
+                self._finalize_instrumentation_tracking(
+                    trace_context,
+                    out,
+                    raw_angle_value=None,
+                    filtered_angle_value=None,
+                    selected_output=None,
+                    sdba=rs.get("selection_detectors_by_angle") or {},
+                    peak_detector=rs.get("peak_detector"),
+                    sel_angle=rs.get("selected_angle"),
+                )
+                return out
+            out = self._no_pose_step_result(
                 tuning_params=tuning_params,
                 tracked_joint=rs.get("selected_angle"),
                 default_tuning=default_tuning,
                 phase="selecting" if rs.get("selected_angle") is None else "tracking",
             )
+            self._instr_emit(
+                trace_context,
+                {
+                    "event": "frame_snapshot",
+                    "phase": out.phase,
+                    "tracked_joint": out.tracked_joint,
+                    "reps": out.reps,
+                    "reps_raw": out.reps_raw,
+                    "reason": "no_pose",
+                },
+            )
+            return out
+
+        raw_landmarks = landmarks
 
         if self._pose_pipeline is not None:
             lm = self._pose_pipeline.process(landmarks, ts)
@@ -374,6 +613,7 @@ class RepCounterSession:
                 except Exception:
                     pass
             rs["selection_detectors_by_angle"] = sdba
+        self._sync_detector_instrumentation_flags()
 
         selected_angle = rs["selected_angle"]
         if selected_angle is not None and rs.get("peak_detector") is None:
@@ -381,9 +621,12 @@ class RepCounterSession:
 
         if selected_angle is None:
             angle_values: dict[str, Optional[float]] = {}
+            raw_angle_values: dict[str, Optional[float]] = {}
             detector_outputs: dict[str, dict[str, Any]] = {}
             t_det = time.perf_counter()
             for ak, cfg in COMMON_ANGLES.items():
+                raw_av = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                raw_angle_values[ak] = raw_av
                 val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
                 angle_values[ak] = val
                 detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
@@ -453,6 +696,7 @@ class RepCounterSession:
                     selection_detector=sdba.get(leader_key),
                 )
                 locked_this_frame = True
+                self._sync_detector_instrumentation_flags()
             elif can_try and variance_fallback_ready:
                 buf_list = self._buffer_as_list(rs, frame_buffer)
                 result = determine_best_angle(
@@ -474,6 +718,7 @@ class RepCounterSession:
                         selection_detector=sdba.get(sel),
                     )
                     locked_this_frame = True
+                    self._sync_detector_instrumentation_flags()
                 else:
                     rs["selected_angle"] = None
                     rs["selected_config"] = None
@@ -496,7 +741,7 @@ class RepCounterSession:
                 rep_dom=rep_dom,
             )
             perf_ms["session_total_ms"] = (time.perf_counter() - t_step_start) * 1000.0
-            return StepResult(
+            out = StepResult(
                 reps=0,
                 reps_raw=0,
                 tracked_joint=rs.get("selected_angle"),
@@ -533,6 +778,15 @@ class RepCounterSession:
                     "perf_ms": perf_ms,
                 },
             )
+            self._finalize_instrumentation_selection(
+                trace_context,
+                out,
+                raw_angle_values=raw_angle_values,
+                angle_values=angle_values,
+                sdba=sdba,
+                leader_key=leader_key if isinstance(leader_key, str) else None,
+            )
+            return out
 
         # Tracking phase: update only the selected detector each frame.
         angle_values: dict[str, Optional[float]] = {}
@@ -545,9 +799,11 @@ class RepCounterSession:
             "leaderReps": 0,
             "leaderShare": 0.0,
         }
+        raw_angle_val: Optional[float] = None
         if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
             cfg = COMMON_ANGLES[selected_angle]
             t_det = time.perf_counter()
+            raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
             val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
             angle_values[selected_angle] = val
             detector_outputs[selected_angle] = sdba[selected_angle].update(val)  # type: ignore[index]
@@ -604,9 +860,13 @@ class RepCounterSession:
                     switched_to = candidate
                     selected_angle = candidate
                     cfg = COMMON_ANGLES[candidate]
+                    raw_angle_val = calculate_from_type(
+                        cfg["type"], cfg["landmarks"], raw_landmarks
+                    )
                     val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
                     angle_values[candidate] = val
                     detector_outputs[candidate] = sdba[candidate].update(val)  # type: ignore[index]
+                    self._sync_detector_instrumentation_flags()
             joint_records = _collect_joint_records(sdba, variances)
 
         angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None
@@ -614,7 +874,7 @@ class RepCounterSession:
             detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
         )
         perf_ms["session_total_ms"] = (time.perf_counter() - t_step_start) * 1000.0
-        return self._build_tracking_step_result(
+        out = self._build_tracking_step_result(
             rs,
             angle_value,
             detector_output=selected_output,
@@ -625,6 +885,17 @@ class RepCounterSession:
                 "perf_ms": perf_ms,
             },
         )
+        self._finalize_instrumentation_tracking(
+            trace_context,
+            out,
+            raw_angle_value=raw_angle_val,
+            filtered_angle_value=angle_value,
+            selected_output=selected_output,
+            sdba=sdba,
+            peak_detector=rs.get("peak_detector"),
+            sel_angle=selected_angle if isinstance(selected_angle, str) else None,
+        )
+        return out
 
     def _build_tracking_step_result(
         self,

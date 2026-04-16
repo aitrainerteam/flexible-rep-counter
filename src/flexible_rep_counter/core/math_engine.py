@@ -215,6 +215,23 @@ class PeakDetector:
         self._calibrated_avg_peak: Optional[float] = None
         self._calibrated_avg_valley: Optional[float] = None
         self._last_rep_time_ms: Optional[float] = None
+        # Observation-only instrumentation (see drain_instrumentation_events).
+        self.instrumentation_enabled: bool = False
+        self._instrumentation_events: list[dict[str, Any]] = []
+
+    def _instr_emit(self, event: dict[str, Any]) -> None:
+        if not self.instrumentation_enabled:
+            return
+        label = getattr(self, "debug_label", None)
+        if label is not None:
+            event = {**event, "detector_label": label}
+        self._instrumentation_events.append(event)
+
+    def drain_instrumentation_events(self) -> list[dict[str, Any]]:
+        """Return and clear pending instrumentation events for this detector."""
+        out = self._instrumentation_events
+        self._instrumentation_events = []
+        return out
 
     def _calibration_stats(self) -> dict[str, float | None]:
         if not self.peaks or not self.valleys:
@@ -313,6 +330,16 @@ class PeakDetector:
     def _record_peak_on_reversal(self) -> tuple[Optional[float], bool]:
         """Append a peak at end of GOING_UP; may increment rep_count. Returns (detected_peak, rep_completed)."""
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "peak",
+                    "reason": "min_peak_distance_block",
+                    "frame_count": self.frame_count,
+                    "last_peak_frame": self.last_peak_frame,
+                    "min_peak_distance": self.min_peak_distance,
+                }
+            )
             return None, False
         if not self._calibrated:
             within_margin = True
@@ -335,6 +362,22 @@ class PeakDetector:
                 interval_ok = False
         allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
         if not (within_margin and (gate_ok or allow_record_while_gate_closed)):
+            if not within_margin:
+                reason = "margin_fail"
+            else:
+                reason = "range_gate_closed"
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "peak",
+                    "reason": reason,
+                    "within_margin": within_margin,
+                    "gate_ok": gate_ok,
+                    "allow_record_while_gate_closed": allow_record_while_gate_closed,
+                    "calibrated": self._calibrated,
+                    "rolling_range": self._last_rolling_range,
+                }
+            )
             return None, False
         detected_peak = self.current_peak_value
         self.peaks.append(self.current_peak_value)
@@ -345,12 +388,63 @@ class PeakDetector:
             self.rep_count = new_rep_count
             rep_completed = True
             self._last_rep_time_ms = now_ms
+            self._instr_emit(
+                {
+                    "event": "rep_increment",
+                    "kind": "peak",
+                    "rep_count": self.rep_count,
+                    "peak_value": float(detected_peak) if detected_peak is not None else None,
+                    "rolling_range": self._last_rolling_range,
+                    "range_gate_open": gate_ok,
+                }
+            )
+        elif new_rep_count > self.rep_count:
+            if not gate_ok:
+                self._instr_emit(
+                    {
+                        "event": "rep_block",
+                        "kind": "peak",
+                        "reason": "range_gate_closed",
+                        "rep_count_after_extrema": new_rep_count,
+                        "rep_count": self.rep_count,
+                    }
+                )
+            elif not interval_ok:
+                self._instr_emit(
+                    {
+                        "event": "rep_block",
+                        "kind": "peak",
+                        "reason": "min_rep_interval_block",
+                        "rep_count_after_extrema": new_rep_count,
+                        "rep_count": self.rep_count,
+                    }
+                )
+        else:
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "peak",
+                    "reason": "not_rep_would_increment",
+                    "rep_count_after_extrema": new_rep_count,
+                    "rep_count": self.rep_count,
+                }
+            )
         self._maybe_lock_calibration()
         return detected_peak, rep_completed
 
     def _record_valley_on_reversal(self) -> tuple[Optional[float], bool]:
         """Append a valley at end of GOING_DOWN; may increment rep_count. Returns (detected_valley, rep_completed)."""
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "valley",
+                    "reason": "min_peak_distance_block",
+                    "frame_count": self.frame_count,
+                    "last_peak_frame": self.last_peak_frame,
+                    "min_peak_distance": self.min_peak_distance,
+                }
+            )
             return None, False
         if not self._calibrated:
             within_margin = True
@@ -373,6 +467,22 @@ class PeakDetector:
                 interval_ok = False
         allow_record_while_gate_closed = (not self._calibrated) and (not gate_ok)
         if not (within_margin and (gate_ok or allow_record_while_gate_closed)):
+            if not within_margin:
+                reason = "margin_fail"
+            else:
+                reason = "range_gate_closed"
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "valley",
+                    "reason": reason,
+                    "within_margin": within_margin,
+                    "gate_ok": gate_ok,
+                    "allow_record_while_gate_closed": allow_record_while_gate_closed,
+                    "calibrated": self._calibrated,
+                    "rolling_range": self._last_rolling_range,
+                }
+            )
             return None, False
         detected_valley = self.current_valley_value
         self.valleys.append(self.current_valley_value)
@@ -383,6 +493,47 @@ class PeakDetector:
             self.rep_count = new_rep_count
             rep_completed = True
             self._last_rep_time_ms = now_ms
+            self._instr_emit(
+                {
+                    "event": "rep_increment",
+                    "kind": "valley",
+                    "rep_count": self.rep_count,
+                    "valley_value": float(detected_valley) if detected_valley is not None else None,
+                    "rolling_range": self._last_rolling_range,
+                    "range_gate_open": gate_ok,
+                }
+            )
+        elif new_rep_count > self.rep_count:
+            if not gate_ok:
+                self._instr_emit(
+                    {
+                        "event": "rep_block",
+                        "kind": "valley",
+                        "reason": "range_gate_closed",
+                        "rep_count_after_extrema": new_rep_count,
+                        "rep_count": self.rep_count,
+                    }
+                )
+            elif not interval_ok:
+                self._instr_emit(
+                    {
+                        "event": "rep_block",
+                        "kind": "valley",
+                        "reason": "min_rep_interval_block",
+                        "rep_count_after_extrema": new_rep_count,
+                        "rep_count": self.rep_count,
+                    }
+                )
+        else:
+            self._instr_emit(
+                {
+                    "event": "rep_block",
+                    "kind": "valley",
+                    "reason": "not_rep_would_increment",
+                    "rep_count_after_extrema": new_rep_count,
+                    "rep_count": self.rep_count,
+                }
+            )
         self._maybe_lock_calibration()
         return detected_valley, rep_completed
 
@@ -394,6 +545,8 @@ class PeakDetector:
                 "repCompleted": False,
                 "peak": None,
                 "valley": None,
+                "rawValue": None,
+                "feedValue": None,
                 "smoothedValue": self.smoothed_value,
                 "state": self.state,
                 "repCount": self.rep_count,
@@ -406,6 +559,7 @@ class PeakDetector:
             }
 
         feed = self._pass_through_deadband(raw_value)
+        prev_state = self.state
         self.frame_count += 1
         if self.smoothed_value is None:
             self.smoothed_value = feed
@@ -462,11 +616,23 @@ class PeakDetector:
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
 
+        if prev_state != self.state:
+            self._instr_emit(
+                {
+                    "event": "state_transition",
+                    "from_state": prev_state,
+                    "to_state": self.state,
+                    "frame_count": self.frame_count,
+                }
+            )
+
         stats = self._calibration_stats()
         return {
             "repCompleted": rep_completed,
             "peak": detected_peak,
             "valley": detected_valley,
+            "rawValue": float(raw_value),
+            "feedValue": float(feed),
             "smoothedValue": self.smoothed_value,
             "state": self.state,
             "repCount": self.rep_count,
@@ -514,6 +680,7 @@ class PeakDetector:
         self._calibrated_avg_peak = None
         self._calibrated_avg_valley = None
         self._last_rep_time_ms = None
+        self._instrumentation_events.clear()
 
     def get_state(self) -> dict[str, Any]:
         return {
