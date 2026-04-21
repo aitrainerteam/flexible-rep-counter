@@ -878,6 +878,7 @@ class RepCounterSession:
             rs,
             angle_value,
             detector_output=selected_output,
+            tracked_joint_changed=switched_to is not None,
             selection_debug={
                 "rep_dom": rep_dom,
                 "joint_records": joint_records,
@@ -903,6 +904,7 @@ class RepCounterSession:
         angle_value: Optional[float],
         *,
         detector_output: Optional[dict[str, Any]] = None,
+        tracked_joint_changed: bool = False,
         selection_debug: Optional[dict[str, Any]] = None,
     ) -> StepResult:
         tuning_params = rs["tuning_params"]
@@ -1000,6 +1002,7 @@ class RepCounterSession:
             reps=shown_rep_count,
             reps_raw=primary_rep_count,
             tracked_joint=sel_ang if isinstance(sel_ang, str) else None,
+            tracked_joint_changed=tracked_joint_changed,
             angle_3_point_value=float(angle_value) if angle_value is not None else None,
             target_landmarks=tlm,
             tuning_params=dict(rs["tuning_params"]),

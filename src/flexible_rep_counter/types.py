@@ -32,6 +32,8 @@ class StepResult:
     status_message: str
     # Extra tracking line (calibration progress, range gate); empty when not used.
     tracking_detail_message: str
+    # True only on frames where the tracked joint changes during dynamic reevaluation.
+    tracked_joint_changed: bool = False
 
     leader_key: Optional[str] = None
     selection_debug: dict[str, Any] = field(default_factory=dict)
