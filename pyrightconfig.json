@@ -1,0 +1,11 @@
+{
+  "include": [
+    "app",
+    "src",
+    "tests",
+    "visualizer"
+  ],
+  "extraPaths": [
+    "src"
+  ]
+}

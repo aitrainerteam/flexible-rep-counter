@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Architecture Diagram</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 32px;
+    }
+    .wrapper {
+      width: 100%;
+      max-width: 800px;
+    }
+  </style>
+</head>
+<body>
+<div class="wrapper">
+<svg width="100%" viewBox="0 0 680 480" style="display:block;border-radius:20px;">
+  <defs>
+    <pattern id="dots" x="0" y="0" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(255,255,255,0.07)"/>
+    </pattern>
+    <linearGradient id="connMain" x1="0" y1="0" x2="0" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#a78bfa" stop-opacity="0.9"/>
+      <stop offset="35%"  stop-color="#34d399" stop-opacity="0.8"/>
+      <stop offset="65%"  stop-color="#60a5fa" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#fbbf24" stop-opacity="0.9"/>
+    </linearGradient>
+    <linearGradient id="gPurple" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6d28d9"/><stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="gTeal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#065f46"/><stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="gBlue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="gAmber" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#78350f"/><stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="680" height="480" rx="20" fill="#06060f"/>
+  <rect width="680" height="480" rx="20" fill="url(#dots)"/>
+
+  <!-- Ambient glow orbs -->
+  <circle cx="120" cy="90"  r="130" fill="#7c3aed" opacity="0.07"/>
+  <circle cx="560" cy="130" r="110" fill="#059669" opacity="0.06"/>
+  <circle cx="340" cy="410" r="150" fill="#d97706" opacity="0.05"/>
+  <circle cx="340" cy="250" r="80"  fill="#2563eb" opacity="0.04"/>
+
+  <!-- Connection lines (glow layer) -->
+  <path d="M340 78 C340 103 340 103 340 128"    fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.18"/>
+  <path d="M298 186 C298 218 112 218 112 248"   fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+  <path d="M340 186 L340 248"                    fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+  <path d="M382 186 C382 218 568 218 568 248"   fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+  <path d="M308 304 C308 340 188 340 188 372"   fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+  <path d="M372 304 C372 340 492 340 492 372"   fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+  <path d="M544 304 C544 340 518 340 518 372"   fill="none" stroke="url(#connMain)" stroke-width="5" opacity="0.15"/>
+
+  <!-- Connection lines (main layer) -->
+  <path d="M340 78 C340 103 340 103 340 128"    fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M298 186 C298 218 112 218 112 248"   fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M340 186 L340 248"                    fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M382 186 C382 218 568 218 568 248"   fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M308 304 C308 340 188 340 188 372"   fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M372 304 C372 340 492 340 492 372"   fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+  <path d="M544 304 C544 340 518 340 518 372"   fill="none" stroke="url(#connMain)" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Browser -->
+  <rect x="270" y="24"  width="140" height="54" rx="12" fill="url(#gPurple)" opacity="0.95"/>
+  <rect x="271" y="25"  width="138" height="52" rx="11" fill="#0b0817"/>
+  <text x="340" y="45" text-anchor="middle" font-family="monospace" font-size="11" fill="#a78bfa" letter-spacing="0.09em" font-weight="700">CLIENT</text>
+  <text x="340" y="65" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#ede9fe" font-weight="600">Browser</text>
+
+  <!-- API Gateway -->
+  <rect x="245" y="128" width="190" height="58" rx="12" fill="url(#gTeal)" opacity="0.95"/>
+  <rect x="246" y="129" width="188" height="56" rx="11" fill="#020f0a"/>
+  <text x="340" y="150" text-anchor="middle" font-family="monospace" font-size="11" fill="#34d399" letter-spacing="0.09em" font-weight="700">GATEWAY</text>
+  <text x="340" y="171" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#d1fae5" font-weight="600">API Gateway</text>
+
+  <!-- Auth -->
+  <rect x="48"  y="248" width="128" height="56" rx="12" fill="url(#gBlue)" opacity="0.95"/>
+  <rect x="49"  y="249" width="126" height="54" rx="11" fill="#020713"/>
+  <text x="112" y="269" text-anchor="middle" font-family="monospace" font-size="11" fill="#60a5fa" letter-spacing="0.09em" font-weight="700">SERVICE</text>
+  <text x="112" y="290" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#dbeafe" font-weight="600">Auth</text>
+
+  <!-- Core API -->
+  <rect x="276" y="248" width="128" height="56" rx="12" fill="url(#gBlue)" opacity="0.95"/>
+  <rect x="277" y="249" width="126" height="54" rx="11" fill="#020713"/>
+  <text x="340" y="269" text-anchor="middle" font-family="monospace" font-size="11" fill="#60a5fa" letter-spacing="0.09em" font-weight="700">SERVICE</text>
+  <text x="340" y="290" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#dbeafe" font-weight="600">Core API</text>
+
+  <!-- Worker -->
+  <rect x="504" y="248" width="128" height="56" rx="12" fill="url(#gBlue)" opacity="0.95"/>
+  <rect x="505" y="249" width="126" height="54" rx="11" fill="#020713"/>
+  <text x="568" y="269" text-anchor="middle" font-family="monospace" font-size="11" fill="#60a5fa" letter-spacing="0.09em" font-weight="700">SERVICE</text>
+  <text x="568" y="290" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#dbeafe" font-weight="600">Worker</text>
+
+  <!-- PostgreSQL -->
+  <rect x="118" y="372" width="140" height="56" rx="12" fill="url(#gAmber)" opacity="0.95"/>
+  <rect x="119" y="373" width="138" height="54" rx="11" fill="#0d0600"/>
+  <text x="188" y="393" text-anchor="middle" font-family="monospace" font-size="11" fill="#fbbf24" letter-spacing="0.09em" font-weight="700">DATABASE</text>
+  <text x="188" y="414" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#fef3c7" font-weight="600">PostgreSQL</text>
+
+  <!-- Redis -->
+  <rect x="422" y="372" width="140" height="56" rx="12" fill="url(#gAmber)" opacity="0.95"/>
+  <rect x="423" y="373" width="138" height="54" rx="11" fill="#0d0600"/>
+  <text x="492" y="393" text-anchor="middle" font-family="monospace" font-size="11" fill="#fbbf24" letter-spacing="0.09em" font-weight="700">CACHE</text>
+  <text x="492" y="414" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#fef3c7" font-weight="600">Redis</text>
+
+  <!-- Legend -->
+  <rect x="24" y="450" width="9" height="9" rx="2" fill="#7c3aed"/>
+  <text x="39" y="459" font-family="system-ui,sans-serif" font-size="11" fill="rgba(255,255,255,0.3)">Client</text>
+  <rect x="96" y="450" width="9" height="9" rx="2" fill="#059669"/>
+  <text x="111" y="459" font-family="system-ui,sans-serif" font-size="11" fill="rgba(255,255,255,0.3)">Gateway</text>
+  <rect x="186" y="450" width="9" height="9" rx="2" fill="#2563eb"/>
+  <text x="201" y="459" font-family="system-ui,sans-serif" font-size="11" fill="rgba(255,255,255,0.3)">Services</text>
+  <rect x="270" y="450" width="9" height="9" rx="2" fill="#d97706"/>
+  <text x="285" y="459" font-family="system-ui,sans-serif" font-size="11" fill="rgba(255,255,255,0.3)">Data layer</text>
+</svg>
+</div>
+</body>
+</html>

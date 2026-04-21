@@ -5,13 +5,24 @@ and landmark helpers; VM I/O stays under ``app``.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from collections import deque
+from pathlib import Path
 import cv2
+import numpy as np
 import threading
 import time
 from queue import Empty, Full, Queue
 from typing import Any, Optional
+
+# Repo dev layout: allow direct script execution without a prior `pip install -e .`
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+for _path in (_PROJECT_ROOT, _PROJECT_ROOT / "src"):
+    if _path.is_dir():
+        _sp = str(_path)
+        if _sp not in sys.path:
+            sys.path.insert(0, _sp)
 
 from flexible_rep_counter.landmark_utils import scale_landmarks_to_display
 from flexible_rep_counter.session import RepCounterSession
@@ -21,6 +32,7 @@ from app.config import (
     PREDICT_JPEG_QUALITY,
     PREDICT_RESIZE_WIDTH,
     PREDICT_VALIDATE_RESPONSE,
+    VM_BASE_URL,
     VM_HEALTH_TIMEOUT_SEC,
     VM_TIMEOUT_SEC,
 )
@@ -61,6 +73,225 @@ BUTTON_COLOR = (60, 180, 80)
 BUTTON_COLOR_JUST_CLICKED = (0, 255, 255)  # Yellow (BGR) for a few seconds after click
 BUTTON_TEXT_COLOR = (0, 0, 0)  # Black, caps, bold
 BUTTON_YELLOW_SECONDS = 2.5
+DISPLAY_WIDTH = 1280
+DISPLAY_HEIGHT = 960
+
+
+def _camera_backend_candidates(platform: str) -> list[tuple[str, int]]:
+    if platform == "darwin":
+        raw = [("avfoundation", getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY))]
+    elif platform == "win32":
+        raw = [
+            ("dshow", getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)),
+            ("msmf", getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)),
+            ("any", cv2.CAP_ANY),
+        ]
+    else:
+        raw = [("any", cv2.CAP_ANY)]
+
+    seen: set[int] = set()
+    out: list[tuple[str, int]] = []
+    for name, backend in raw:
+        if backend in seen:
+            continue
+        seen.add(backend)
+        out.append((name, backend))
+    return out
+
+
+def _open_webcam_capture(camera_index: int) -> tuple[Any, str]:
+    tried: list[str] = []
+    for backend_name, backend in _camera_backend_candidates(sys.platform):
+        tried.append(backend_name)
+        cap = cv2.VideoCapture(camera_index, backend)
+        if cap.isOpened() and _capture_has_usable_frame(cap, backend_name):
+            return cap, backend_name
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+    tried_str = ", ".join(tried)
+    raise RuntimeError(
+        f"Could not open webcam (index {camera_index}; tried backends: {tried_str}). "
+        "Try a different camera index if your webcam is not device 0."
+    )
+
+
+def _capture_has_usable_frame(
+    cap: Any,
+    backend_name: str,
+    *,
+    max_reads: int = 6,
+    warmup_delay_sec: float = 0.03,
+) -> bool:
+    """Probe a newly opened capture and reject backends that only yield empty/black frames."""
+    for attempt in range(1, max_reads + 1):
+        try:
+            ok, frame = cap.read()
+        except Exception as exc:
+            logger.debug("webcam probe backend=%s attempt=%d read failed: %s", backend_name, attempt, exc)
+            ok, frame = False, None
+        if ok and _frame_looks_usable(frame):
+            if attempt > 1:
+                logger.debug("webcam probe backend=%s usable frame after %d attempts", backend_name, attempt)
+            return True
+        if warmup_delay_sec > 0:
+            time.sleep(warmup_delay_sec)
+    logger.warning(
+        "webcam backend=%s opened but did not produce a usable frame after %d attempts; trying next backend",
+        backend_name,
+        max_reads,
+    )
+    return False
+
+
+def _frame_looks_usable(frame: Any) -> bool:
+    if frame is None:
+        return False
+
+    size = getattr(frame, "size", None)
+    if size is not None:
+        try:
+            if int(size) <= 0:
+                return False
+        except (TypeError, ValueError):
+            pass
+
+    shape = getattr(frame, "shape", None)
+    if shape is not None:
+        try:
+            if len(shape) >= 2 and (int(shape[0]) <= 0 or int(shape[1]) <= 0):
+                return False
+        except (TypeError, ValueError):
+            pass
+
+    any_method = getattr(frame, "any", None)
+    if callable(any_method):
+        try:
+            return bool(any_method())
+        except Exception:
+            pass
+
+    if isinstance(frame, (list, tuple)):
+        stack: list[Any] = [frame]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                stack.extend(item)
+                continue
+            try:
+                if float(item) != 0.0:
+                    return True
+            except (TypeError, ValueError):
+                if bool(item):
+                    return True
+        return False
+
+    return True
+
+
+def _build_waiting_frame(*, width: int = DISPLAY_WIDTH, height: int = DISPLAY_HEIGHT) -> Any:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:] = (32, 32, 32)
+    cv2.putText(
+        frame,
+        "Waiting for video...",
+        (max(20, width // 2 - 170), max(40, height // 2)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (220, 220, 220),
+        2,
+    )
+    return frame
+
+
+def _letterbox_frame_to_canvas(frame: Any, *, width: int = DISPLAY_WIDTH, height: int = DISPLAY_HEIGHT) -> Any:
+    if frame is None or getattr(frame, "shape", None) is None or len(frame.shape) < 2:
+        return _build_waiting_frame(width=width, height=height)
+
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0:
+        return _build_waiting_frame(width=width, height=height)
+
+    canvas = np.zeros((height, width, 3), dtype=frame.dtype if hasattr(frame, "dtype") else np.uint8)
+    scale = min(width / max(1, w), height / max(1, h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    scaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    x_offset = (width - new_w) // 2
+    y_offset = (height - new_h) // 2
+    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = scaled
+    return canvas
+
+
+class _DisplayWindow:
+    def __init__(
+        self,
+        *,
+        window_name: str,
+        run_state: dict[str, Any],
+        width: int = DISPLAY_WIDTH,
+        height: int = DISPLAY_HEIGHT,
+    ) -> None:
+        self._window_name = window_name
+        self._run_state = run_state
+        self._width = width
+        self._height = height
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Any = None
+        self._running = False
+        self._stop_requested = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def publish_frame(self, frame: Any) -> None:
+        if frame is None:
+            return
+        with self._frame_lock:
+            self._latest_frame = frame.copy()
+
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._display_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        self._stop_requested.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _display_loop(self) -> None:
+        try:
+            cv2.namedWindow(self._window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self._window_name, self._width, self._height)
+            cv2.setMouseCallback(self._window_name, _on_mouse, self._run_state)
+            while self._running:
+                with self._frame_lock:
+                    frame = self._latest_frame.copy() if self._latest_frame is not None else None
+                display_frame = _letterbox_frame_to_canvas(frame, width=self._width, height=self._height)
+                cv2.imshow(self._window_name, display_frame)
+                update_console_window()
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q"), 27):
+                    self._stop_requested.set()
+                    self._running = False
+                elif key == ord(" "):
+                    _trigger_start_toggle(self._run_state)
+        except Exception as exc:
+            self._stop_requested.set()
+            logger.error("display loop error: %s", exc)
+        finally:
+            try:
+                cv2.destroyWindow(self._window_name)
+            except Exception:
+                pass
 
 
 def _ascii_text(text: str) -> str:
@@ -534,6 +765,7 @@ def run_webcam_loop(
     resize_width: Optional[int] = None,
     jpeg_quality: Optional[int] = None,
     validate_response: Optional[bool] = None,
+    camera_index: int = 0,
 ) -> None:
     setup_logging()
 
@@ -546,12 +778,7 @@ def run_webcam_loop(
         if not ok:
             raise RuntimeError(f"VM health check failed: {info}")
 
-    if sys.platform == "darwin":
-        cap = cv2.VideoCapture(0, getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY))
-    else:
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam (index 0).")
+    cap, backend_name = _open_webcam_capture(camera_index)
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
@@ -564,11 +791,13 @@ def run_webcam_loop(
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
     }
-    cv2.namedWindow("Rep Counter", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Rep Counter", _on_mouse, run_state)
     ensure_console_window()
+    display = _DisplayWindow(window_name="Rep Counter", run_state=run_state)
+    display.start()
     logger.debug(
-        "webcam opened, VM predict resize_width=%s jpeg_q=%s validate=%s",
+        "webcam opened index=%s backend=%s, VM predict resize_width=%s jpeg_q=%s validate=%s",
+        camera_index,
+        backend_name,
         rw,
         jq,
         val,
@@ -644,7 +873,7 @@ def run_webcam_loop(
         return (b or last_benchmark), inf_fps, issues
 
     try:
-        while True:
+        while not display.stop_requested():
             ret, frame_bgr = cap.read()
             if not ret or frame_bgr is None:
                 continue
@@ -667,13 +896,7 @@ def run_webcam_loop(
                     (cx, cy),
                     OVERLAY_FONT, 0.7, OVERLAY_COLOR, 2,
                 )
-                cv2.imshow("Rep Counter", frame_bgr)
-                update_console_window()
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ord("Q"), 27):
-                    break
-                if key == ord(" "):
-                    _trigger_start_toggle(run_state)
+                display.publish_frame(frame_bgr)
                 continue
 
             try:
@@ -700,13 +923,7 @@ def run_webcam_loop(
                 _draw_vm_benchmark_hud(
                     frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
                 )
-                cv2.imshow("Rep Counter", frame_bgr)
-                update_console_window()
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ord("Q"), 27):
-                    break
-                if key == ord(" "):
-                    _trigger_start_toggle(run_state)
+                display.publish_frame(frame_bgr)
                 continue
 
             disp_h, disp_w = frame_bgr.shape[0], frame_bgr.shape[1]
@@ -738,13 +955,7 @@ def run_webcam_loop(
                 step.reps,
                 step.peak_detector_state,
             )
-            cv2.imshow("Rep Counter", frame_bgr)
-            update_console_window()
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
-                break
-            if key == ord(" "):
-                _trigger_start_toggle(run_state)
+            display.publish_frame(frame_bgr)
 
     finally:
         stop_worker.set()
@@ -754,6 +965,7 @@ def run_webcam_loop(
             pass
         worker.join(timeout=VM_TIMEOUT_SEC + 1.0)
         cap.release()
+        display.stop()
         cv2.destroyAllWindows()
         if last_benchmark:
             print("\nLast VM request (benchmark):")
@@ -779,3 +991,65 @@ def run_webcam_loop(
                 v = benchmark_peaks.get(k)
                 if v is not None:
                     print(f"  {k}: {v:.1f}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Webcam rep counter (VM pose API)")
+    parser.add_argument(
+        "--no-health-check",
+        action="store_true",
+        help="Skip GET /health (status ok + model_loaded) before opening the camera",
+    )
+    parser.add_argument(
+        "--benchmark-log",
+        metavar="FILE",
+        help="Append tab-separated timestamp, server inference_ms, roundtrip_ms, upload_ms per VM response",
+    )
+    parser.add_argument(
+        "--resize-width",
+        type=int,
+        default=None,
+        metavar="W",
+        help="Resize frame to this width before JPEG upload (0=no resize). Default: [predict].resize_width in rep_counter.toml",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=None,
+        metavar="Q",
+        help="JPEG quality 1-100 for uploads. Default: [predict].jpeg_quality in rep_counter.toml",
+    )
+    parser.add_argument(
+        "--no-validate-response",
+        action="store_true",
+        help="Skip JSON shape checks on /predict (inference_ms, keypoint names)",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Webcam device index to open. Default: 0",
+    )
+    args = parser.parse_args()
+
+    print("Rep counter starting (VM:", VM_BASE_URL, ")")
+    try:
+        run_webcam_loop(
+            skip_health_check=args.no_health_check,
+            benchmark_log_path=args.benchmark_log,
+            resize_width=args.resize_width,
+            jpeg_quality=args.jpeg_quality,
+            validate_response=False if args.no_validate_response else None,
+            camera_index=args.camera_index,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+        sys.exit(0)
+    except Exception as exc:
+        print("Error:", exc, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

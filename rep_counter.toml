@@ -1,7 +1,7 @@
 # Rep counter tuning. Set FLEXIBLE_REP_COUNTER_CONFIG to use another file.
 
 [app]
-log_level = "DEBUG"
+log_level = "INFO"
 
 [vm]
 # YOLO pose API base URL (fixed; no env URL fallbacks).
