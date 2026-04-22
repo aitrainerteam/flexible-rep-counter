@@ -171,7 +171,7 @@ class VmRepSimulatorRuntimeTests(unittest.TestCase):
         self.assertEqual("info", fake_logger.events[1][0])
         self.assertIn("diag pose queue recovered after 2 dropped frames", fake_logger.events[1][1])
 
-    def test_runtime_diagnostics_logs_local_and_cloud_rep_events_with_cross_counts(self) -> None:
+    def test_runtime_diagnostics_logs_cloud_rep_events_only(self) -> None:
         fake_logger = _FakeLogger()
         diag = vm_rep_simulator._RuntimeDiagnostics(
             logger_obj=fake_logger,
@@ -180,16 +180,16 @@ class VmRepSimulatorRuntimeTests(unittest.TestCase):
             start_monotonic=0.0,
         )
 
-        diag.note_rep_counts(local_reps=0, cloud_reps=0)
-        diag.note_rep_counts(local_reps=1, cloud_reps=0)
-        diag.note_rep_counts(local_reps=1, cloud_reps=1)
-        diag.note_rep_counts(local_reps=2, cloud_reps=1)
+        diag.note_cloud_rep_count(cloud_reps=0)
+        diag.note_cloud_rep_count(cloud_reps=0)
+        diag.note_cloud_rep_count(cloud_reps=1)
+        diag.note_cloud_rep_count(cloud_reps=1)
+        diag.note_cloud_rep_count(cloud_reps=2)
 
         info_messages = [message for level, message in fake_logger.events if level == "info"]
-        self.assertEqual(3, len(info_messages))
-        self.assertIn("event=local_rep_counted local_reps=1 cloud_reps=0", info_messages[0])
-        self.assertIn("event=cloud_rep_counted cloud_reps=1 local_reps=1", info_messages[1])
-        self.assertIn("event=local_rep_counted local_reps=2 cloud_reps=1", info_messages[2])
+        self.assertEqual(2, len(info_messages))
+        self.assertIn("event=cloud_rep_counted cloud_reps=1", info_messages[0])
+        self.assertIn("event=cloud_rep_counted cloud_reps=2", info_messages[1])
 
     def test_recovering_capture_reopens_after_consecutive_bad_frames(self) -> None:
         first = _FakeCapture(

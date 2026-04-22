@@ -1,7 +1,8 @@
 """OpenCV webcam frontend (repo root, not part of the installable package).
 
-Uses :mod:`flexible_rep_counter` for :class:`~flexible_rep_counter.session.RepCounterSession`
-and landmark helpers; VM I/O stays under ``app``.
+Cloud-only: sends frames to the VM and renders landmarks + ``rep_counter`` from
+``/predict`` responses. No local :class:`~flexible_rep_counter.session.RepCounterSession``.
+Landmark scaling uses :mod:`flexible_rep_counter.landmark_utils`; HTTP stays under ``app``.
 """
 from __future__ import annotations
 
@@ -26,8 +27,6 @@ for _path in (_PROJECT_ROOT, _PROJECT_ROOT / "src"):
             sys.path.insert(0, _sp)
 
 from flexible_rep_counter.landmark_utils import scale_landmarks_to_display
-from flexible_rep_counter.session import RepCounterSession
-from flexible_rep_counter.types import StepResult
 
 from app.config import (
     PREDICT_JPEG_QUALITY,
@@ -481,7 +480,6 @@ class _RuntimeDiagnostics:
         self._queue_dropped_interval = 0
         self._vm_responses_interval = 0
         self._vm_landmarks_interval = 0
-        self._last_local_reps: int | None = None
         self._last_cloud_reps: int | None = None
 
     def _emit(self, level: str, message: str, *args: Any) -> None:
@@ -538,28 +536,14 @@ class _RuntimeDiagnostics:
             self._emit("info", "diag VM responses recovered after %.1fs idle", max(0.0, float(idle_for or 0.0)))
             self._vm_stall_active = False
 
-    def note_rep_counts(self, *, local_reps: int, cloud_reps: int) -> None:
-        local_now = max(0, int(local_reps))
+    def note_cloud_rep_count(self, *, cloud_reps: int) -> None:
+        """Log when VM ``rep_counter.reps`` increases (no local rep counter)."""
         cloud_now = max(0, int(cloud_reps))
-        if self._last_local_reps is None or self._last_cloud_reps is None:
-            self._last_local_reps = local_now
+        if self._last_cloud_reps is None:
             self._last_cloud_reps = cloud_now
             return
-        if local_now > self._last_local_reps:
-            self._emit(
-                "info",
-                "event=local_rep_counted local_reps=%d cloud_reps=%d",
-                local_now,
-                cloud_now,
-            )
         if cloud_now > self._last_cloud_reps:
-            self._emit(
-                "info",
-                "event=cloud_rep_counted cloud_reps=%d local_reps=%d",
-                cloud_now,
-                local_now,
-            )
-        self._last_local_reps = local_now
+            self._emit("info", "event=cloud_rep_counted cloud_reps=%d", cloud_now)
         self._last_cloud_reps = cloud_now
 
     def maybe_log(
@@ -766,15 +750,13 @@ def _start_button_hit(state: dict[str, Any], x: int, y: int) -> bool:
 
 
 def _trigger_start_toggle(run_state: dict[str, Any]) -> None:
-    rs = run_state.get("rep_session")
-    if not isinstance(rs, RepCounterSession):
-        return
+    """Toggle streaming + HUD; rep state lives only on the VM."""
     if not run_state.get("started", False):
         run_state["started"] = True
         run_state["started_at"] = time.time()
-        rs.set_started(run_state["started_at"])
     else:
-        rs.clear_tracking_keep_started()
+        # Previously cleared local RepCounterSession tracking; cloud state is unchanged here.
+        run_state["started_at"] = time.time()
 
 
 def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) -> None:
@@ -831,23 +813,6 @@ def _merge_benchmark_peaks(peaks: dict[str, float | None], b: dict[str, Any]) ->
         fi = float(inf)
         prev_i = peaks.get("inference_ms")
         peaks["inference_ms"] = fi if prev_i is None else max(prev_i, fi)
-
-
-def _extract_local_perf(step: StepResult) -> dict[str, float]:
-    sd = step.selection_debug if isinstance(step.selection_debug, dict) else {}
-    perf = sd.get("perf_ms") if isinstance(sd.get("perf_ms"), dict) else {}
-    out: dict[str, float] = {}
-    for src, dst in (
-        ("session_total_ms", "session_ms"),
-        ("detector_update_ms", "detector_ms"),
-        ("variance_ms", "variance_ms"),
-    ):
-        v = perf.get(src)
-        try:
-            out[dst] = float(v)
-        except (TypeError, ValueError):
-            continue
-    return out
 
 
 def _draw_vm_benchmark_hud(
@@ -932,8 +897,8 @@ def _draw_overlay_from_vm(
 ) -> None:
     """Secondary overlay showing VM-side rep_counter state (source of truth for NDJSON).
 
-    Drawn at bottom-left to avoid overlapping the local RepCounterSession overlay
-    (_draw_overlay, top-left) or the benchmark HUD (_draw_vm_benchmark_hud, bottom-right).
+    Drawn at bottom-left to avoid overlapping the benchmark HUD
+    (_draw_vm_benchmark_hud, bottom-right).
     """
     h, w = frame.shape[:2]
     margin = 10
@@ -1045,9 +1010,9 @@ def _pose_worker(
 
 
 def _draw_library_watermark(frame: Any) -> None:
-    """Small label so the window is clearly driven by the library, not bundled UI in the wheel."""
+    """Small label: this window reflects VM /predict state only."""
     w = frame.shape[1]
-    label = "flexible_rep_counter"
+    label = "cloud state (VM)"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.42
     thick = 1
@@ -1060,134 +1025,6 @@ def _draw_library_watermark(frame: Any) -> None:
     tx, ty = x1, y1
     cv2.putText(frame, safe, (tx, ty), font, scale, (40, 40, 40), thick + 1, cv2.LINE_AA)
     cv2.putText(frame, safe, (tx, ty), font, scale, (220, 220, 255), thick, cv2.LINE_AA)
-
-
-def _draw_overlay(frame: Any, step: StepResult) -> None:
-    margin = 10
-    y = 30
-    line_height = 30
-    box_x1 = margin
-    box_y1 = 12
-    show_rom = (
-        step.phase == "tracking"
-        and step.calibration_complete
-        and (step.avg_peak is not None or step.avg_valley is not None)
-    )
-    td = (step.tracking_detail_message or "").strip()
-    show_td = bool(td and td != step.status_message)
-    sel_dbg = step.selection_debug or {}
-    rep_dom_sel = sel_dbg.get("rep_dom") if isinstance(sel_dbg, dict) else None
-    show_sel_pulses = step.phase == "selecting" and isinstance(rep_dom_sel, dict)
-    lines = 4
-    if step.tracked_joint:
-        lines += 1
-    if step.smoothed_value is not None:
-        lines += 1
-    if show_rom:
-        lines += 1
-    if show_td:
-        lines += 1
-    if show_sel_pulses:
-        lines += 1
-    box_x2 = min(frame.shape[1] - margin, 620)
-    box_y2 = box_y1 + lines * line_height + 8
-    _draw_transparent_box(frame, box_x1, box_y1, box_x2, box_y2)
-    _put_text_readable(
-        frame,
-        f"Phase: {step.phase.upper()}",
-        (margin, y),
-        OVERLAY_FONT,
-        0.55,
-        OVERLAY_COLOR_DIM,
-        2,
-    )
-    y += line_height
-    if step.tracked_joint:
-        _put_text_readable(
-            frame,
-            f"Angle: {step.tracked_joint}",
-            (margin, y),
-            OVERLAY_FONT,
-            OVERLAY_SCALE,
-            OVERLAY_COLOR,
-            OVERLAY_THICKNESS,
-        )
-        y += line_height
-    if step.smoothed_value is not None:
-        _put_text_readable(
-            frame,
-            f"Value: {step.smoothed_value:.1f}",
-            (margin, y),
-            OVERLAY_FONT,
-            OVERLAY_SCALE,
-            OVERLAY_COLOR_DIM,
-            OVERLAY_THICKNESS,
-        )
-        y += line_height
-    rep_line = f"Reps: {step.reps}"
-    if not step.calibration_complete:
-        rep_line += f"  (cal {step.reps_raw}/{step.calibration_target_reps})"
-    if show_sel_pulses:
-        rep_line += "  — locked reps after angle is chosen"
-    _put_text_readable(
-        frame,
-        rep_line,
-        (margin, y),
-        OVERLAY_FONT,
-        OVERLAY_SCALE,
-        OVERLAY_COLOR,
-        OVERLAY_THICKNESS,
-    )
-    y += line_height
-    if show_sel_pulses:
-        tr = int(rep_dom_sel.get("totalReps") or 0)
-        lk = rep_dom_sel.get("leaderKey")
-        lk_s = str(lk) if lk else "—"
-        _put_text_readable(
-            frame,
-            f"Motion pulses (all joints): {tr}  leader: {lk_s}",
-            (margin, y),
-            OVERLAY_FONT,
-            0.52,
-            OVERLAY_COLOR_DIM,
-            2,
-        )
-        y += line_height
-    _put_text_readable(
-        frame,
-        f"State: {step.peak_detector_state}",
-        (margin, y),
-        OVERLAY_FONT,
-        0.6,
-        OVERLAY_COLOR_DIM,
-        2,
-    )
-    y += line_height
-    _put_text_readable(
-        frame,
-        step.status_message,
-        (margin, y),
-        OVERLAY_FONT,
-        0.6,
-        OVERLAY_COLOR_STATUS,
-        2,
-    )
-    y += line_height
-    if show_rom:
-        ap = f"{step.avg_peak:.0f}" if step.avg_peak is not None else "—"
-        av = f"{step.avg_valley:.0f}" if step.avg_valley is not None else "—"
-        _put_text_readable(
-            frame,
-            f"ROM ref: peak {ap}  valley {av} deg",
-            (margin, y),
-            OVERLAY_FONT,
-            0.55,
-            OVERLAY_COLOR_DIM,
-            2,
-        )
-        y += line_height
-    if show_td:
-        _put_text_readable(frame, td, (margin, y), OVERLAY_FONT, 0.55, OVERLAY_COLOR_DIM, 2)
 
 
 def run_webcam_loop(
@@ -1225,10 +1062,8 @@ def run_webcam_loop(
 
     capture = _RecoveringCapture(camera_index=camera_index)
 
-    rep_session = RepCounterSession(auto_started=False)
     run_state: dict[str, Any] = {
         "started": False,
-        "rep_session": rep_session,
         "button_rect": (0, 0, BUTTON_W_MIN, BUTTON_H_MIN),
         "frame_shape": (0, 0),
         "reset_info": reset_info,
@@ -1378,18 +1213,9 @@ def run_webcam_loop(
             sent_hw = snap.get("sent_hw")
             logger.debug("frame sent, got landmarks=%s", raw_landmarks is not None)
             cloud_reps = _cloud_rep_count(snap.get("rep_counter"))
+            diag.note_cloud_rep_count(cloud_reps=cloud_reps)
 
-            rs_sess = run_state["rep_session"]
-            timestamp_ms = time.time() * 1000.0
             if raw_landmarks is None:
-                step = rs_sess.step_landmarks(None, timestamp_ms=timestamp_ms)
-                diag.note_rep_counts(local_reps=step.reps, cloud_reps=cloud_reps)
-                local_perf = _extract_local_perf(step)
-                if local_perf:
-                    disp_b = dict(disp_b or {})
-                    disp_b.update(local_perf)
-                    _merge_benchmark_peaks(benchmark_peaks, disp_b)
-                _draw_overlay(frame_bgr, step)
                 _draw_overlay_from_vm(frame_bgr, snap.get("rep_counter"), run_state.get("reset_info"))
                 _draw_library_watermark(frame_bgr)
                 _draw_vm_benchmark_hud(
@@ -1414,30 +1240,22 @@ def run_webcam_loop(
                 sent_hw if sent_ok else None,
                 (disp_h, disp_w),
             )
-            step = rs_sess.step_landmarks(raw_scaled, timestamp_ms=timestamp_ms)
-            diag.note_rep_counts(local_reps=step.reps, cloud_reps=cloud_reps)
-            local_perf = _extract_local_perf(step)
-            if local_perf:
-                disp_b = dict(disp_b or {})
-                disp_b.update(local_perf)
-                _merge_benchmark_peaks(benchmark_peaks, disp_b)
-            sm = rs_sess.last_smoothed_landmarks
-            if sm:
-                draw_skeleton(frame_bgr, sm)
+            draw_skeleton(frame_bgr, raw_scaled)
 
-            _draw_overlay(frame_bgr, step)
             _draw_overlay_from_vm(frame_bgr, snap.get("rep_counter"), run_state.get("reset_info"))
             _draw_library_watermark(frame_bgr)
             _draw_vm_benchmark_hud(
                 frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
             )
-            logger.debug(
-                "angle=%s smoothed=%s reps=%d state=%s",
-                step.tracked_joint,
-                step.smoothed_value or 0,
-                step.reps,
-                step.peak_detector_state,
-            )
+            vm_rc = snap.get("rep_counter")
+            if isinstance(vm_rc, dict):
+                logger.debug(
+                    "angle=%s smoothed=%s reps=%d state=%s",
+                    vm_rc.get("tracked_joint"),
+                    vm_rc.get("smoothed_value") or 0,
+                    vm_rc.get("reps", 0),
+                    vm_rc.get("peak_detector_state"),
+                )
             display.publish_frame(frame_bgr)
             diag.note_frame_published()
             diag.maybe_log(
