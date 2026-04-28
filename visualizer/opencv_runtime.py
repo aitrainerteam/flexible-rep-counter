@@ -75,6 +75,8 @@ BUTTON_TEXT_COLOR = (0, 0, 0)  # Black, caps, bold
 BUTTON_YELLOW_SECONDS = 2.5
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 960
+LOCAL_SEND_FPS_CAP = 12.0
+LOCAL_SEND_INTERVAL_SEC = 1.0 / LOCAL_SEND_FPS_CAP
 
 
 def _camera_backend_candidates(platform: str) -> list[tuple[str, int]]:
@@ -842,6 +844,7 @@ def run_webcam_loop(
         "detector_ms": None,
         "variance_ms": None,
     }
+    next_send_monotonic = 0.0
 
     def _update_vm_metrics(snap: dict[str, Any]) -> tuple[dict[str, Any] | None, float, list[str]]:
         """Merge timing peaks, optional benchmark log line; return (display_benchmark, inf_fps, issues)."""
@@ -875,6 +878,7 @@ def run_webcam_loop(
     try:
         while not display.stop_requested():
             ret, frame_bgr = cap.read()
+            loop_now = time.monotonic()
             if not ret or frame_bgr is None:
                 continue
 
@@ -899,10 +903,13 @@ def run_webcam_loop(
                 display.publish_frame(frame_bgr)
                 continue
 
-            try:
-                frame_queue.put_nowait(frame_bgr.copy())
-            except Full:
-                pass
+            # Local-only sender cap: reduce upload cadence without touching VM-side limits.
+            if loop_now >= next_send_monotonic:
+                next_send_monotonic = loop_now + LOCAL_SEND_INTERVAL_SEC
+                try:
+                    frame_queue.put_nowait(frame_bgr.copy())
+                except Full:
+                    pass
             snap = latest_pose[0]
             disp_b, inf_fps, val_issues = _update_vm_metrics(snap)
             raw_landmarks = snap.get("landmarks")

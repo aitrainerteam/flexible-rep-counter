@@ -47,6 +47,9 @@ DEFAULT_TUNING_PARAMS = get_default_tuning_params()
 
 # Match yolo-deploy / angles.py gate so pose_dropped aligns with omitted angles in JSON.
 _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
+# Temporary kill-switch: disable runtime variance-based joint recalibration/switching.
+# Keep reevaluation code in place so it can be re-enabled later by flipping this.
+DYNAMIC_RECALIBRATION_ENABLED = False
 
 
 def _diagnose_missing_angle(
@@ -819,7 +822,7 @@ class RepCounterSession:
 
         switched_to: Optional[str] = None
         last_re_eval = rs.get("selection_last_reevaluate_at")
-        re_eval_due = (
+        re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
             or last_re_eval is None
             or (now - float(last_re_eval)) >= ANGLE_SELECTION_REEVALUATE_EVERY_SEC
