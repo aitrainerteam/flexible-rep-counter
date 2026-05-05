@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from flexible_rep_counter.core.settings import (
+    ANGLE_SELECTION_MIN_FRAMES,
     ANGLE_SELECTION_MIN_ACTIVE_WINDOWS,
     ANGLE_SELECTION_SMOOTH_WINDOW,
     get_angle_selection_joint_thresholds,
@@ -109,21 +110,31 @@ def compute_angle_variances_from_buffer(
     frame_buffer: list[list[dict]],
     *,
     include_debug: bool = True,
+    angle_histories: Optional[dict[str, list[Optional[float]]]] = None,
 ) -> dict[str, dict[str, Any]]:
     if not frame_buffer:
         return {}
     variances: dict[str, dict[str, Any]] = {}
     for angle_key, config in COMMON_ANGLES.items():
         history: list[float] = []
-        for landmarks in frame_buffer:
-            if not landmarks:
-                continue
-            min_conf = get_min_confidence_for_landmarks(landmarks, config["landmarks"])
-            if min_conf is None or min_conf < FRAME_MIN_CONFIDENCE:
-                continue
-            value = calculate_from_type(config["type"], config["landmarks"], landmarks)
-            if value is not None and not (isinstance(value, float) and value != value):
-                history.append(value)
+        precomputed = angle_histories.get(angle_key) if angle_histories else None
+        if precomputed is not None:
+            for value in precomputed:
+                if value is None:
+                    continue
+                if isinstance(value, float) and value != value:
+                    continue
+                history.append(float(value))
+        else:
+            for landmarks in frame_buffer:
+                if not landmarks:
+                    continue
+                min_conf = get_min_confidence_for_landmarks(landmarks, config["landmarks"])
+                if min_conf is None or min_conf < FRAME_MIN_CONFIDENCE:
+                    continue
+                value = calculate_from_type(config["type"], config["landmarks"], landmarks)
+                if value is not None and not (isinstance(value, float) and value != value):
+                    history.append(value)
         if len(history) >= 10:
             smoothed = smooth_angle_series(history, window=SMOOTH_WINDOW)
             min_ws = 15 if len(smoothed) >= 90 else 12
@@ -312,7 +323,7 @@ def determine_best_angle(
         "debug": debug,
     }
 
-    if not frame_buffer or len(frame_buffer) < 40:
+    if not frame_buffer or len(frame_buffer) < ANGLE_SELECTION_MIN_FRAMES:
         return default_result
 
     variance_rows = variances or _calculate_all_variances(

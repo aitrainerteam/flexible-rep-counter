@@ -342,8 +342,8 @@ def send_frame(
             benchmark=benchmark,
             sent_hw=(sent_h, sent_w),
             validation_issues=issues,
-            rep_counter=None,
-            rep_session_reset=None,
+            rep_counter=rep_counter_dict,
+            rep_session_reset=rep_session_reset_dict,
         )
 
     return VmPredictOutcome(

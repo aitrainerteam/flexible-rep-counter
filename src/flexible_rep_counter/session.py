@@ -16,6 +16,7 @@ from flexible_rep_counter.core.math_engine import (
     PeakDetector,
     calculate_from_type,
     create_peak_detector,
+    get_min_confidence_for_landmarks,
     replay_angle_series_on_peak_detector,
 )
 from flexible_rep_counter.core.pose_filters import PoseFilterPipeline
@@ -35,6 +36,7 @@ from flexible_rep_counter.core.settings import (
 )
 from flexible_rep_counter.core.variance_angle_selector import (
     COMMON_ANGLES,
+    FRAME_MIN_CONFIDENCE,
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
@@ -49,7 +51,7 @@ DEFAULT_TUNING_PARAMS = get_default_tuning_params()
 _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Temporary kill-switch: disable runtime variance-based joint recalibration/switching.
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
-DYNAMIC_RECALIBRATION_ENABLED = False
+DYNAMIC_RECALIBRATION_ENABLED = True
 
 
 def _diagnose_missing_angle(
@@ -270,6 +272,9 @@ class RepCounterSession:
             "tuning_params": dict(tp),
             "buffer_list_cache": {"signature": None, "data": []},
             "variance_cache": {"signature": None, "include_debug": False, "data": {}},
+            "selection_angle_histories": {
+                ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
+            },
         }
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
@@ -287,6 +292,9 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
+        self._run_state["selection_angle_histories"] = {
+            ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
+        }
         self._sync_detector_instrumentation_flags()
 
     def clear_tracking_keep_started(self) -> None:
@@ -303,6 +311,9 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
+        self._run_state["selection_angle_histories"] = {
+            ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
+        }
         self._sync_detector_instrumentation_flags()
 
     @property
@@ -350,6 +361,11 @@ class RepCounterSession:
         variances = compute_angle_variances_from_buffer(
             self._buffer_as_list(rs, frame_buffer),
             include_debug=include_debug,
+            angle_histories={
+                ak: list(hist)
+                for ak, hist in (rs.get("selection_angle_histories") or {}).items()
+                if isinstance(hist, deque)
+            },
         )
         rs["variance_cache"] = {
             "signature": sig,
@@ -623,16 +639,32 @@ class RepCounterSession:
             rs["peak_detector"] = sdba.get(selected_angle)
 
         if selected_angle is None:
-            angle_values: dict[str, Optional[float]] = {}
-            raw_angle_values: dict[str, Optional[float]] = {}
-            detector_outputs: dict[str, dict[str, Any]] = {}
+            selecting_angle_values: dict[str, Optional[float]] = {}
+            selecting_raw_angle_values: dict[str, Optional[float]] = {}
+            selecting_detector_outputs: dict[str, dict[str, Any]] = {}
+            angle_histories: dict[str, deque] = rs.get("selection_angle_histories") or {}
+            if not angle_histories:
+                angle_histories = {
+                    ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
+                }
+                rs["selection_angle_histories"] = angle_histories
             t_det = time.perf_counter()
             for ak, cfg in COMMON_ANGLES.items():
                 raw_av = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
-                raw_angle_values[ak] = raw_av
+                selecting_raw_angle_values[ak] = raw_av
                 val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
-                angle_values[ak] = val
-                detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
+                selecting_angle_values[ak] = val
+                selecting_detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
+                min_conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
+                if (
+                    val is None
+                    or min_conf is None
+                    or min_conf < FRAME_MIN_CONFIDENCE
+                    or (isinstance(val, float) and val != val)
+                ):
+                    angle_histories[ak].append(None)
+                else:
+                    angle_histories[ak].append(float(val))
             perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
 
             rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
@@ -784,8 +816,8 @@ class RepCounterSession:
             self._finalize_instrumentation_selection(
                 trace_context,
                 out,
-                raw_angle_values=raw_angle_values,
-                angle_values=angle_values,
+                raw_angle_values=selecting_raw_angle_values,
+                angle_values=selecting_angle_values,
                 sdba=sdba,
                 leader_key=leader_key if isinstance(leader_key, str) else None,
             )
@@ -809,9 +841,11 @@ class RepCounterSession:
             raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
             val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
             angle_values[selected_angle] = val
-            detector_outputs[selected_angle] = sdba[selected_angle].update(val)  # type: ignore[index]
+            active_detector = rs.get("peak_detector") or sdba.get(selected_angle)
+            if active_detector is None:
+                active_detector = sdba[selected_angle]
+            detector_outputs[selected_angle] = active_detector.update(val)  # type: ignore[union-attr]
             perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
-            active_detector = sdba.get(selected_angle) or rs.get("peak_detector")
             rep_value = int(active_detector.get_rep_count() or 0) if active_detector is not None else 0
             rep_dom = {
                 "totalReps": rep_value,
