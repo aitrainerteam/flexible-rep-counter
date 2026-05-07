@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import replace
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from flexible_rep_counter.instrumentation import (
     RepInstrumentationSink,
@@ -52,6 +52,7 @@ _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Temporary kill-switch: disable runtime variance-based joint recalibration/switching.
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
+SWITCH_REPLAY_MIN_VALID_SAMPLES = 10
 
 
 def _diagnose_missing_angle(
@@ -122,8 +123,116 @@ def _apply_locked_tracking(
             series.append(calculate_from_type(cfg["type"], cfg["landmarks"], lm))
         replay_angle_series_on_peak_detector(det, series)
     run_state["peak_detector"] = det
+    run_state["rep_count_offset"] = 0
+    run_state["rep_count_raw_offset"] = 0
+    run_state["pending_switch_angle"] = None
+    run_state["pending_switch_detector"] = None
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
+
+
+def _is_valid_angle_value(value: Optional[float]) -> bool:
+    return value is not None and not (isinstance(value, float) and value != value)
+
+
+def _append_angle_history(
+    angle_histories: dict[str, deque],
+    angle_key: str,
+    value: Optional[float],
+    landmarks: list[dict],
+) -> None:
+    hist = angle_histories.get(angle_key)
+    if hist is None:
+        return
+    cfg = COMMON_ANGLES[angle_key]
+    min_conf = get_min_confidence_for_landmarks(landmarks, cfg["landmarks"])
+    if not _is_valid_angle_value(value) or min_conf is None or min_conf < FRAME_MIN_CONFIDENCE:
+        hist.append(None)
+        return
+    assert value is not None
+    hist.append(float(value))
+
+
+def _update_angle_histories_for_frame(
+    angle_histories: dict[str, deque],
+    angle_values: dict[str, Optional[float]],
+    landmarks: list[dict],
+) -> None:
+    for angle_key in COMMON_ANGLES:
+        _append_angle_history(
+            angle_histories,
+            angle_key,
+            angle_values.get(angle_key),
+            landmarks,
+        )
+
+
+def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
+    if detector is None:
+        return 0, 0
+    raw = int(detector.get_rep_count() or 0)
+    shown = raw
+    peaks = list(getattr(detector, "peaks", []) or [])
+    valleys = list(getattr(detector, "valleys", []) or [])
+    if peaks and valleys and len(peaks) != len(valleys):
+        shown += 1
+    return shown, raw
+
+
+def _rebuild_detector_from_history(
+    run_state: dict[str, Any],
+    angle_key: str,
+    tuning_params: dict[str, Any],
+    *,
+    min_valid_samples: int = SWITCH_REPLAY_MIN_VALID_SAMPLES,
+) -> Optional[PeakDetector]:
+    histories = run_state.get("selection_angle_histories") or {}
+    series = histories.get(angle_key)
+    if not isinstance(series, deque):
+        return None
+    values = list(series)
+    valid = sum(1 for v in values if _is_valid_angle_value(v))
+    if valid < min_valid_samples:
+        return None
+    detector = _peak_detector_from_tuning(tuning_params)
+    replay_angle_series_on_peak_detector(detector, values)
+    return detector
+
+
+def _is_detector_calibrated(
+    detector: Optional[Any], detector_output: Optional[dict[str, Any]] = None
+) -> bool:
+    if detector is None:
+        return False
+    if isinstance(detector_output, dict):
+        return bool(detector_output.get("calibrationComplete", False))
+    try:
+        state = detector.get_state()
+    except Exception:
+        return False
+    return bool(state.get("calibrationComplete", False))
+
+
+def _activate_joint_switch(
+    run_state: dict[str, Any],
+    detectors_by_angle: dict[str, Any],
+    *,
+    new_angle: str,
+    detector: Any,
+    cumulative_shown: int,
+    cumulative_raw: int,
+    switched_at: float,
+) -> None:
+    detectors_by_angle[new_angle] = detector
+    shown, raw = _detector_counts(detector)
+    run_state["rep_count_offset"] = max(0, cumulative_shown - shown)
+    run_state["rep_count_raw_offset"] = max(0, cumulative_raw - raw)
+    run_state["selected_angle"] = new_angle
+    run_state["selected_config"] = COMMON_ANGLES[new_angle]
+    run_state["peak_detector"] = detector
+    run_state["selection_last_switch_at"] = switched_at
+    run_state["pending_switch_angle"] = None
+    run_state["pending_switch_detector"] = None
 
 
 def _collect_joint_records(
@@ -269,6 +378,10 @@ class RepCounterSession:
             "selected_angle": None,
             "selected_config": None,
             "peak_detector": None,
+            "rep_count_offset": 0,
+            "rep_count_raw_offset": 0,
+            "pending_switch_angle": None,
+            "pending_switch_detector": None,
             "tuning_params": dict(tp),
             "buffer_list_cache": {"signature": None, "data": []},
             "variance_cache": {"signature": None, "include_debug": False, "data": {}},
@@ -290,6 +403,10 @@ class RepCounterSession:
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["rep_count_offset"] = 0
+        self._run_state["rep_count_raw_offset"] = 0
+        self._run_state["pending_switch_angle"] = None
+        self._run_state["pending_switch_detector"] = None
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -309,6 +426,10 @@ class RepCounterSession:
         self._run_state["selection_detectors_by_angle"] = {}
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
+        self._run_state["rep_count_offset"] = 0
+        self._run_state["rep_count_raw_offset"] = 0
+        self._run_state["pending_switch_angle"] = None
+        self._run_state["pending_switch_detector"] = None
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -655,16 +776,11 @@ class RepCounterSession:
                 val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
                 selecting_angle_values[ak] = val
                 selecting_detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
-                min_conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
-                if (
-                    val is None
-                    or min_conf is None
-                    or min_conf < FRAME_MIN_CONFIDENCE
-                    or (isinstance(val, float) and val != val)
-                ):
-                    angle_histories[ak].append(None)
-                else:
-                    angle_histories[ak].append(float(val))
+            _update_angle_histories_for_frame(
+                angle_histories,
+                selecting_angle_values,
+                lm,
+            )
             perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
 
             rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
@@ -743,14 +859,15 @@ class RepCounterSession:
                 rs["tuning_params"] = tuning_params
                 sel = result.get("selectedAngle")
                 src = str(result.get("source") or "")
-                variance_ok = sel and sel in COMMON_ANGLES and src == "variance"
-                if variance_ok:
+                selected_key = sel if isinstance(sel, str) and sel in COMMON_ANGLES else None
+                variance_ok = selected_key is not None and src == "variance"
+                if variance_ok and selected_key is not None:
                     _apply_locked_tracking(
                         rs,
-                        sel,
+                        selected_key,
                         None,
                         tuning_params,
-                        selection_detector=sdba.get(sel),
+                        selection_detector=sdba.get(selected_key),
                     )
                     locked_this_frame = True
                     self._sync_detector_instrumentation_flags()
@@ -834,12 +951,24 @@ class RepCounterSession:
             "leaderReps": 0,
             "leaderShare": 0.0,
         }
+        active_detector: Optional[Any] = None
         raw_angle_val: Optional[float] = None
+        angle_histories = rs.get("selection_angle_histories") or {}
+        if not angle_histories:
+            angle_histories = {
+                ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
+            }
+            rs["selection_angle_histories"] = angle_histories
+        tracking_angle_values = {
+            ak: calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+            for ak, cfg in COMMON_ANGLES.items()
+        }
+        _update_angle_histories_for_frame(angle_histories, tracking_angle_values, lm)
         if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
             cfg = COMMON_ANGLES[selected_angle]
             t_det = time.perf_counter()
             raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
-            val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+            val = tracking_angle_values.get(selected_angle)
             angle_values[selected_angle] = val
             active_detector = rs.get("peak_detector") or sdba.get(selected_angle)
             if active_detector is None:
@@ -853,8 +982,47 @@ class RepCounterSession:
                 "leaderReps": rep_value,
                 "leaderShare": 1.0 if rep_value > 0 else 0.0,
             }
+        current_shown, current_raw = _detector_counts(active_detector)
+        cumulative_shown = int(rs.get("rep_count_offset") or 0) + current_shown
+        cumulative_raw = int(rs.get("rep_count_raw_offset") or 0) + current_raw
 
         switched_to: Optional[str] = None
+        pending_angle = (
+            rs.get("pending_switch_angle")
+            if isinstance(rs.get("pending_switch_angle"), str)
+            else None
+        )
+        pending_detector = rs.get("pending_switch_detector")
+        pending_calibrated = False
+        if (
+            pending_angle is not None
+            and pending_angle != selected_angle
+            and pending_angle in COMMON_ANGLES
+            and pending_detector is not None
+        ):
+            pending_val = tracking_angle_values.get(pending_angle)
+            angle_values[pending_angle] = pending_val
+            pending_output = pending_detector.update(pending_val)
+            detector_outputs[pending_angle] = pending_output
+            pending_calibrated = _is_detector_calibrated(pending_detector, pending_output)
+            if pending_calibrated:
+                _activate_joint_switch(
+                    rs,
+                    sdba,
+                    new_angle=pending_angle,
+                    detector=pending_detector,
+                    cumulative_shown=cumulative_shown,
+                    cumulative_raw=cumulative_raw,
+                    switched_at=now,
+                )
+                switched_to = pending_angle
+                selected_angle = pending_angle
+                cfg = COMMON_ANGLES[pending_angle]
+                raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                self._sync_detector_instrumentation_flags()
+        else:
+            rs["pending_switch_angle"] = None
+            rs["pending_switch_detector"] = None
         last_re_eval = rs.get("selection_last_reevaluate_at")
         re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
@@ -890,20 +1058,38 @@ class RepCounterSession:
                     or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
                 )
                 if cooldown_ok and ((not cur_ok) or stronger):
-                    rs["selected_angle"] = candidate
-                    rs["selected_config"] = COMMON_ANGLES[candidate]
-                    rs["peak_detector"] = sdba.get(candidate)
-                    rs["selection_last_switch_at"] = now
-                    switched_to = candidate
-                    selected_angle = candidate
-                    cfg = COMMON_ANGLES[candidate]
-                    raw_angle_val = calculate_from_type(
-                        cfg["type"], cfg["landmarks"], raw_landmarks
-                    )
-                    val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
-                    angle_values[candidate] = val
-                    detector_outputs[candidate] = sdba[candidate].update(val)  # type: ignore[index]
-                    self._sync_detector_instrumentation_flags()
+                    if candidate == pending_angle and pending_detector is not None:
+                        replayed = pending_detector
+                    else:
+                        replayed = _rebuild_detector_from_history(
+                            rs,
+                            candidate,
+                            rs.get("tuning_params") or DEFAULT_TUNING_PARAMS,
+                        )
+                    if replayed is not None:
+                        sdba[candidate] = replayed
+                        rs["pending_switch_angle"] = candidate
+                        rs["pending_switch_detector"] = replayed
+                        if _is_detector_calibrated(replayed):
+                            _activate_joint_switch(
+                                rs,
+                                sdba,
+                                new_angle=candidate,
+                                detector=replayed,
+                                cumulative_shown=cumulative_shown,
+                                cumulative_raw=cumulative_raw,
+                                switched_at=now,
+                            )
+                            switched_to = candidate
+                            selected_angle = candidate
+                            cfg = COMMON_ANGLES[candidate]
+                            raw_angle_val = calculate_from_type(
+                                cfg["type"], cfg["landmarks"], raw_landmarks
+                            )
+                            val = tracking_angle_values.get(candidate)
+                            angle_values[candidate] = val
+                            detector_outputs[candidate] = replayed.update(val)
+                            self._sync_detector_instrumentation_flags()
             joint_records = _collect_joint_records(sdba, variances)
 
         angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None
@@ -920,6 +1106,7 @@ class RepCounterSession:
                 "rep_dom": rep_dom,
                 "joint_records": joint_records,
                 "switched_to": switched_to,
+                "pending_switch": rs.get("pending_switch_angle"),
                 "perf_ms": perf_ms,
             },
         )
@@ -999,7 +1186,10 @@ class RepCounterSession:
         ):
             rep_count += 1
 
-        shown_rep_count = rep_count
+        shown_rep_count = rep_count + int(rs.get("rep_count_offset") or 0)
+        shown_rep_count = max(0, shown_rep_count)
+        shown_rep_count_raw = primary_rep_count + int(rs.get("rep_count_raw_offset") or 0)
+        shown_rep_count_raw = max(0, shown_rep_count_raw)
         sel_ang = rs.get("selected_angle")
         if isinstance(sel_ang, str):
             tlm = list(COMMON_ANGLES[sel_ang]["landmarks"])
@@ -1037,7 +1227,7 @@ class RepCounterSession:
 
         return StepResult(
             reps=shown_rep_count,
-            reps_raw=primary_rep_count,
+            reps_raw=shown_rep_count_raw,
             tracked_joint=sel_ang if isinstance(sel_ang, str) else None,
             tracked_joint_changed=tracked_joint_changed,
             angle_3_point_value=float(angle_value) if angle_value is not None else None,
@@ -1065,7 +1255,7 @@ class RepCounterSession:
         tuning_params: dict[str, Any],
         tracked_joint: Optional[str],
         default_tuning: dict[str, Any],
-        phase: str,
+        phase: Literal["idle", "selecting", "tracking"],
     ) -> StepResult:
         return StepResult(
             reps=0,
