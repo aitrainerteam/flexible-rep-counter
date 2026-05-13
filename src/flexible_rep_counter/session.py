@@ -125,8 +125,7 @@ def _apply_locked_tracking(
     run_state["peak_detector"] = det
     run_state["rep_count_offset"] = 0
     run_state["rep_count_raw_offset"] = 0
-    run_state["pending_switch_angle"] = None
-    run_state["pending_switch_detector"] = None
+    _clear_pending_switch(run_state)
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
 
@@ -179,6 +178,15 @@ def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
     return shown, raw
 
 
+def _clear_pending_switch(run_state: dict[str, Any]) -> None:
+    run_state["pending_switch_angle"] = None
+    run_state["pending_switch_detector"] = None
+    run_state["pending_switch_incumbent_shown_start"] = None
+    run_state["pending_switch_incumbent_raw_start"] = None
+    run_state["pending_switch_incumbent_advanced"] = False
+    run_state["pending_switch_observed"] = False
+
+
 def _rebuild_detector_from_history(
     run_state: dict[str, Any],
     angle_key: str,
@@ -225,14 +233,25 @@ def _activate_joint_switch(
 ) -> None:
     detectors_by_angle[new_angle] = detector
     shown, raw = _detector_counts(detector)
-    run_state["rep_count_offset"] = max(0, cumulative_shown - shown)
-    run_state["rep_count_raw_offset"] = max(0, cumulative_raw - raw)
+    start_shown = run_state.get("pending_switch_incumbent_shown_start")
+    start_raw = run_state.get("pending_switch_incumbent_raw_start")
+    incumbent_advanced = bool(run_state.get("pending_switch_incumbent_advanced"))
+    pending_observed = bool(run_state.get("pending_switch_observed"))
+    has_pending_baseline = isinstance(start_shown, int) and isinstance(start_raw, int)
+    include_candidate_pending_reps = (
+        has_pending_baseline and pending_observed and not incumbent_advanced
+    )
+    if include_candidate_pending_reps:
+        run_state["rep_count_offset"] = max(0, cumulative_shown)
+        run_state["rep_count_raw_offset"] = max(0, cumulative_raw)
+    else:
+        run_state["rep_count_offset"] = max(0, cumulative_shown - shown)
+        run_state["rep_count_raw_offset"] = max(0, cumulative_raw - raw)
     run_state["selected_angle"] = new_angle
     run_state["selected_config"] = COMMON_ANGLES[new_angle]
     run_state["peak_detector"] = detector
     run_state["selection_last_switch_at"] = switched_at
-    run_state["pending_switch_angle"] = None
-    run_state["pending_switch_detector"] = None
+    _clear_pending_switch(run_state)
 
 
 def _collect_joint_records(
@@ -382,6 +401,10 @@ class RepCounterSession:
             "rep_count_raw_offset": 0,
             "pending_switch_angle": None,
             "pending_switch_detector": None,
+            "pending_switch_incumbent_shown_start": None,
+            "pending_switch_incumbent_raw_start": None,
+            "pending_switch_incumbent_advanced": False,
+            "pending_switch_observed": False,
             "tuning_params": dict(tp),
             "buffer_list_cache": {"signature": None, "data": []},
             "variance_cache": {"signature": None, "include_debug": False, "data": {}},
@@ -405,8 +428,7 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["rep_count_offset"] = 0
         self._run_state["rep_count_raw_offset"] = 0
-        self._run_state["pending_switch_angle"] = None
-        self._run_state["pending_switch_detector"] = None
+        _clear_pending_switch(self._run_state)
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -428,8 +450,7 @@ class RepCounterSession:
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["rep_count_offset"] = 0
         self._run_state["rep_count_raw_offset"] = 0
-        self._run_state["pending_switch_angle"] = None
-        self._run_state["pending_switch_detector"] = None
+        _clear_pending_switch(self._run_state)
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -994,6 +1015,11 @@ class RepCounterSession:
         )
         pending_detector = rs.get("pending_switch_detector")
         pending_calibrated = False
+        start_shown = rs.get("pending_switch_incumbent_shown_start")
+        start_raw = rs.get("pending_switch_incumbent_raw_start")
+        if isinstance(start_shown, int) and isinstance(start_raw, int):
+            if current_shown > start_shown or current_raw > start_raw:
+                rs["pending_switch_incumbent_advanced"] = True
         if (
             pending_angle is not None
             and pending_angle != selected_angle
@@ -1003,6 +1029,7 @@ class RepCounterSession:
             pending_val = tracking_angle_values.get(pending_angle)
             angle_values[pending_angle] = pending_val
             pending_output = pending_detector.update(pending_val)
+            rs["pending_switch_observed"] = True
             detector_outputs[pending_angle] = pending_output
             pending_calibrated = _is_detector_calibrated(pending_detector, pending_output)
             if pending_calibrated:
@@ -1021,8 +1048,7 @@ class RepCounterSession:
                 raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
                 self._sync_detector_instrumentation_flags()
         else:
-            rs["pending_switch_angle"] = None
-            rs["pending_switch_detector"] = None
+            _clear_pending_switch(rs)
         last_re_eval = rs.get("selection_last_reevaluate_at")
         re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
@@ -1068,6 +1094,11 @@ class RepCounterSession:
                         )
                     if replayed is not None:
                         sdba[candidate] = replayed
+                        if candidate != pending_angle:
+                            rs["pending_switch_incumbent_shown_start"] = current_shown
+                            rs["pending_switch_incumbent_raw_start"] = current_raw
+                            rs["pending_switch_incumbent_advanced"] = False
+                            rs["pending_switch_observed"] = False
                         rs["pending_switch_angle"] = candidate
                         rs["pending_switch_detector"] = replayed
                         if _is_detector_calibrated(replayed):

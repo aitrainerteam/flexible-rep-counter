@@ -156,21 +156,53 @@ def test_tracking_keeps_all_angle_histories_fresh() -> None:
     assert all(len(hist) == 1 for hist in histories.values())
 
 
-def test_switch_waits_for_candidate_calibration_and_keeps_reps_monotonic(monkeypatch) -> None:
-    session = RepCounterSession(auto_started=True, use_pose_filter=False)
-    rs = session._run_state
-    rs["selected_angle"] = "RIGHT_ELBOW"
-    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
-    current_detector = _peak_detector_from_tuning(rs["tuning_params"])
-    current_detector.rep_count = 8
-    rs["peak_detector"] = current_detector
-    rs["selection_detectors_by_angle"] = {"RIGHT_ELBOW": current_detector}
-    histories = rs["selection_angle_histories"]
-    for key in COMMON_ANGLES:
-        histories[key] = deque(maxlen=400)
-    for i in range(24):
-        histories["LEFT_ELBOW"].append(float(45 + (i % 6) * 18))
+class _ScriptedDetector:
+    def __init__(
+        self,
+        rep_counts: list[int],
+        *,
+        calibration_after_updates: int = 0,
+    ) -> None:
+        self._rep_counts = list(rep_counts) if rep_counts else [0]
+        self._idx = 0
+        self._updates = 0
+        self._calibration_after_updates = calibration_after_updates
+        self.rep_count = int(self._rep_counts[0] or 0)
+        self.peaks: list[float] = [0.0] * self.rep_count
+        self.valleys: list[float] = [0.0] * self.rep_count
 
+    def update(self, _value: float | None) -> dict[str, Any]:
+        self._updates += 1
+        i = min(self._idx, len(self._rep_counts) - 1)
+        self.rep_count = int(self._rep_counts[i] or 0)
+        self.peaks = [0.0] * self.rep_count
+        self.valleys = [0.0] * self.rep_count
+        self._idx += 1
+        calibrated = self._updates >= self._calibration_after_updates
+        return {
+            "repCount": self.rep_count,
+            "state": "GOING_DOWN",
+            "smoothedValue": _value,
+            "rangeGateOpen": True,
+            "rollingRange": 70.0,
+            "calibrationComplete": calibrated,
+            "calibrationTargetReps": 3,
+            "calibrationCertainty": 1.0 if calibrated else 0.2,
+            "calibrationCertaintyTarget": 0.8,
+        }
+
+    def get_state(self) -> dict[str, Any]:
+        return {
+            "calibratedAvgPeak": None,
+            "calibratedAvgValley": None,
+            "calibrationComplete": self._updates >= self._calibration_after_updates,
+        }
+
+    def get_rep_count(self) -> int:
+        return self.rep_count
+
+
+def _install_switch_to_left_elbow(monkeypatch, rs: dict[str, Any], pending_detector: Any) -> None:
     def _fake_get_variances(_self, _rs, _frame_buffer, include_debug=False):
         return {
             "RIGHT_ELBOW": {"medianWindowVariance": 1.0},
@@ -196,43 +228,34 @@ def test_switch_waits_for_candidate_calibration_and_keeps_reps_monotonic(monkeyp
         "passes_consistent_variance_gate",
         lambda _variances, _angle_key: False,
     )
-
-    class _PendingDetector:
-        def __init__(self) -> None:
-            self.rep_count = 0
-            self.peaks: list[float] = []
-            self.valleys: list[float] = []
-            self._updates = 0
-
-        def update(self, _value: float | None) -> dict[str, Any]:
-            self._updates += 1
-            calibrated = self._updates >= 2
-            return {
-                "repCount": self.rep_count,
-                "state": "GOING_DOWN",
-                "smoothedValue": _value,
-                "rangeGateOpen": True,
-                "rollingRange": 70.0,
-                "calibrationComplete": calibrated,
-                "calibrationTargetReps": 3,
-                "calibrationCertainty": 1.0 if calibrated else 0.2,
-                "calibrationCertaintyTarget": 0.8,
-            }
-
-        def get_state(self) -> dict[str, Any]:
-            return {
-                "calibratedAvgPeak": None,
-                "calibratedAvgValley": None,
-                "calibrationComplete": self._updates >= 2,
-            }
-
-        def get_rep_count(self) -> int:
-            return self.rep_count
-
     monkeypatch.setattr(
         session_mod,
         "_rebuild_detector_from_history",
-        lambda *_args, **_kwargs: _PendingDetector(),
+        lambda *_args, **_kwargs: pending_detector,
+    )
+
+
+def _prime_histories(rs: dict[str, Any]) -> None:
+    histories = rs["selection_angle_histories"]
+    for key in COMMON_ANGLES:
+        histories[key] = deque(maxlen=400)
+    for i in range(24):
+        histories["LEFT_ELBOW"].append(float(45 + (i % 6) * 18))
+
+
+def test_switch_waits_for_candidate_calibration_and_keeps_reps_monotonic(monkeypatch) -> None:
+    session = RepCounterSession(auto_started=True, use_pose_filter=False)
+    rs = session._run_state
+    rs["selected_angle"] = "RIGHT_ELBOW"
+    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
+    current_detector = _ScriptedDetector([8, 9, 9], calibration_after_updates=0)
+    rs["peak_detector"] = current_detector
+    rs["selection_detectors_by_angle"] = {"RIGHT_ELBOW": current_detector}
+    _prime_histories(rs)
+    _install_switch_to_left_elbow(
+        monkeypatch,
+        rs,
+        _ScriptedDetector([2, 3], calibration_after_updates=2),
     )
 
     out1 = session.step_landmarks(
@@ -259,4 +282,56 @@ def test_switch_waits_for_candidate_calibration_and_keeps_reps_monotonic(monkeyp
     assert out2.reps >= out1.reps
     assert out3.tracked_joint == "LEFT_ELBOW"
     assert out3.tracked_joint_changed is True
-    assert out3.reps >= out2.reps
+    assert out2.reps == 9
+    assert out3.reps == 9
+    assert rs["pending_switch_angle"] is None
+    assert rs["pending_switch_detector"] is None
+    assert rs["pending_switch_incumbent_shown_start"] is None
+    assert rs["pending_switch_incumbent_raw_start"] is None
+    assert rs["pending_switch_incumbent_advanced"] is False
+    assert rs["pending_switch_observed"] is False
+
+
+def test_stalled_handoff_adds_candidate_precalibration_reps(monkeypatch) -> None:
+    session = RepCounterSession(auto_started=True, use_pose_filter=False)
+    rs = session._run_state
+    rs["selected_angle"] = "RIGHT_ELBOW"
+    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
+    current_detector = _ScriptedDetector([10, 10, 10], calibration_after_updates=0)
+    rs["peak_detector"] = current_detector
+    rs["selection_detectors_by_angle"] = {"RIGHT_ELBOW": current_detector}
+    _prime_histories(rs)
+    _install_switch_to_left_elbow(
+        monkeypatch,
+        rs,
+        _ScriptedDetector([2, 3], calibration_after_updates=2),
+    )
+
+    out1 = session.step_landmarks(
+        _build_pose_frame(left_elbow_deg=65.0, right_elbow_deg=120.0),
+        timestamp_ms=0.0,
+        wall_time_s=0.0,
+    )
+    out2 = session.step_landmarks(
+        _build_pose_frame(left_elbow_deg=90.0, right_elbow_deg=120.0),
+        timestamp_ms=1000.0,
+        wall_time_s=1.0,
+    )
+    out3 = session.step_landmarks(
+        _build_pose_frame(left_elbow_deg=110.0, right_elbow_deg=120.0),
+        timestamp_ms=2000.0,
+        wall_time_s=2.0,
+    )
+
+    assert out1.tracked_joint == "RIGHT_ELBOW"
+    assert out2.tracked_joint == "RIGHT_ELBOW"
+    assert out2.reps == 10
+    assert out3.tracked_joint == "LEFT_ELBOW"
+    assert out3.tracked_joint_changed is True
+    assert out3.reps == 13
+    assert rs["pending_switch_angle"] is None
+    assert rs["pending_switch_detector"] is None
+    assert rs["pending_switch_incumbent_shown_start"] is None
+    assert rs["pending_switch_incumbent_raw_start"] is None
+    assert rs["pending_switch_incumbent_advanced"] is False
+    assert rs["pending_switch_observed"] is False
