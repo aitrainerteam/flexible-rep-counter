@@ -53,6 +53,14 @@ _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
 SWITCH_REPLAY_MIN_VALID_SAMPLES = 10
+STALE_SWITCH_MIN_STALE_REEVALS = 4
+STALE_SWITCH_MIN_VAR_RATIO = 0.4
+PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG = 12.0
+STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
+STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG = 14.0
+STALE_SWITCH_MIN_CLOSED_STREAK = 10
+STALE_SWITCH_FORCE_AFTER_STALE_REEVALS = 8
+STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR = 40.0
 
 
 def _diagnose_missing_angle(
@@ -181,10 +189,57 @@ def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
 def _clear_pending_switch(run_state: dict[str, Any]) -> None:
     run_state["pending_switch_angle"] = None
     run_state["pending_switch_detector"] = None
+    run_state["pending_switch_candidate_shown_start"] = None
+    run_state["pending_switch_candidate_raw_start"] = None
     run_state["pending_switch_incumbent_shown_start"] = None
     run_state["pending_switch_incumbent_raw_start"] = None
     run_state["pending_switch_incumbent_advanced"] = False
     run_state["pending_switch_observed"] = False
+    run_state["pending_switch_incumbent_angle_min"] = None
+    run_state["pending_switch_incumbent_angle_max"] = None
+    run_state["pending_switch_incumbent_moving"] = False
+
+
+def _valid_history_count(series: Optional[deque]) -> int:
+    if not isinstance(series, deque):
+        return 0
+    return sum(1 for v in series if _is_valid_angle_value(v))
+
+
+def _recent_history_range(series: Optional[deque], window: int) -> Optional[float]:
+    if not isinstance(series, deque) or window <= 0:
+        return None
+    valid_values: list[float] = []
+    for value in reversed(series):
+        if _is_valid_angle_value(value):
+            valid_values.append(float(value))
+        if len(valid_values) >= window:
+            break
+    if len(valid_values) < 2:
+        return None
+    return max(valid_values) - min(valid_values)
+
+
+def _update_pending_incumbent_motion(
+    run_state: dict[str, Any], current_angle: Optional[float]
+) -> None:
+    if not isinstance(current_angle, (int, float)):
+        return
+    if isinstance(current_angle, float) and current_angle != current_angle:
+        return
+    current = float(current_angle)
+    angle_min = run_state.get("pending_switch_incumbent_angle_min")
+    angle_max = run_state.get("pending_switch_incumbent_angle_max")
+    if not isinstance(angle_min, (int, float)) or not isinstance(angle_max, (int, float)):
+        run_state["pending_switch_incumbent_angle_min"] = current
+        run_state["pending_switch_incumbent_angle_max"] = current
+        return
+    min_v = min(float(angle_min), current)
+    max_v = max(float(angle_max), current)
+    run_state["pending_switch_incumbent_angle_min"] = min_v
+    run_state["pending_switch_incumbent_angle_max"] = max_v
+    if (max_v - min_v) >= PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG:
+        run_state["pending_switch_incumbent_moving"] = True
 
 
 def _rebuild_detector_from_history(
@@ -236,14 +291,26 @@ def _activate_joint_switch(
     start_shown = run_state.get("pending_switch_incumbent_shown_start")
     start_raw = run_state.get("pending_switch_incumbent_raw_start")
     incumbent_advanced = bool(run_state.get("pending_switch_incumbent_advanced"))
+    incumbent_moving = bool(run_state.get("pending_switch_incumbent_moving"))
     pending_observed = bool(run_state.get("pending_switch_observed"))
+    candidate_shown_start = run_state.get("pending_switch_candidate_shown_start")
+    candidate_raw_start = run_state.get("pending_switch_candidate_raw_start")
     has_pending_baseline = isinstance(start_shown, int) and isinstance(start_raw, int)
+    has_candidate_pending_baseline = isinstance(candidate_shown_start, int) and isinstance(
+        candidate_raw_start, int
+    )
     include_candidate_pending_reps = (
-        has_pending_baseline and pending_observed and not incumbent_advanced
+        has_pending_baseline
+        and has_candidate_pending_baseline
+        and pending_observed
+        and not incumbent_advanced
+        and not incumbent_moving
     )
     if include_candidate_pending_reps:
-        run_state["rep_count_offset"] = max(0, cumulative_shown)
-        run_state["rep_count_raw_offset"] = max(0, cumulative_raw)
+        cand_shown_start = candidate_shown_start if isinstance(candidate_shown_start, int) else 0
+        cand_raw_start = candidate_raw_start if isinstance(candidate_raw_start, int) else 0
+        run_state["rep_count_offset"] = max(0, cumulative_shown - cand_shown_start)
+        run_state["rep_count_raw_offset"] = max(0, cumulative_raw - cand_raw_start)
     else:
         run_state["rep_count_offset"] = max(0, cumulative_shown - shown)
         run_state["rep_count_raw_offset"] = max(0, cumulative_raw - raw)
@@ -330,6 +397,18 @@ def _format_angle_label(angle_key: str) -> str:
     return angle_key.replace("_", " ").title()
 
 
+def _opposite_side_angle(angle_key: Optional[str]) -> Optional[str]:
+    if not isinstance(angle_key, str):
+        return None
+    if angle_key.startswith("LEFT_"):
+        other = "RIGHT_" + angle_key[len("LEFT_") :]
+        return other if other in COMMON_ANGLES else None
+    if angle_key.startswith("RIGHT_"):
+        other = "LEFT_" + angle_key[len("RIGHT_") :]
+        return other if other in COMMON_ANGLES else None
+    return None
+
+
 def _idle_result(msg: str = "Click Start to begin") -> StepResult:
     d = DEFAULT_TUNING_PARAMS
     return StepResult(
@@ -401,10 +480,15 @@ class RepCounterSession:
             "rep_count_raw_offset": 0,
             "pending_switch_angle": None,
             "pending_switch_detector": None,
+            "pending_switch_candidate_shown_start": None,
+            "pending_switch_candidate_raw_start": None,
             "pending_switch_incumbent_shown_start": None,
             "pending_switch_incumbent_raw_start": None,
             "pending_switch_incumbent_advanced": False,
             "pending_switch_observed": False,
+            "selected_raw_last_at_reeval": 0,
+            "selected_raw_stale_reeval_streak": 0,
+            "selected_range_gate_closed_streak": 0,
             "tuning_params": dict(tp),
             "buffer_list_cache": {"signature": None, "data": []},
             "variance_cache": {"signature": None, "include_debug": False, "data": {}},
@@ -429,6 +513,9 @@ class RepCounterSession:
         self._run_state["rep_count_offset"] = 0
         self._run_state["rep_count_raw_offset"] = 0
         _clear_pending_switch(self._run_state)
+        self._run_state["selected_raw_last_at_reeval"] = 0
+        self._run_state["selected_raw_stale_reeval_streak"] = 0
+        self._run_state["selected_range_gate_closed_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -451,6 +538,9 @@ class RepCounterSession:
         self._run_state["rep_count_offset"] = 0
         self._run_state["rep_count_raw_offset"] = 0
         _clear_pending_switch(self._run_state)
+        self._run_state["selected_raw_last_at_reeval"] = 0
+        self._run_state["selected_raw_stale_reeval_streak"] = 0
+        self._run_state["selected_range_gate_closed_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
         self._run_state["selection_angle_histories"] = {
@@ -499,7 +589,11 @@ class RepCounterSession:
             and (bool(cache.get("include_debug")) or not include_debug)
             and isinstance(cache.get("data"), dict)
         ):
+            hit_streak = int(rs.get("debug_variance_cache_hit_streak") or 0) + 1
+            rs["debug_variance_cache_hit_streak"] = hit_streak
+            rs["debug_last_variance_sig"] = sig
             return cache["data"]
+        rs["debug_variance_cache_hit_streak"] = 0
         variances = compute_angle_variances_from_buffer(
             self._buffer_as_list(rs, frame_buffer),
             include_debug=include_debug,
@@ -514,6 +608,7 @@ class RepCounterSession:
             "include_debug": include_debug,
             "data": variances,
         }
+        rs["debug_last_variance_sig"] = sig
         return variances
 
     def _sync_detector_instrumentation_flags(self) -> None:
@@ -1006,6 +1101,16 @@ class RepCounterSession:
         current_shown, current_raw = _detector_counts(active_detector)
         cumulative_shown = int(rs.get("rep_count_offset") or 0) + current_shown
         cumulative_raw = int(rs.get("rep_count_raw_offset") or 0) + current_raw
+        selected_output_for_eval = (
+            detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
+        )
+        if isinstance(selected_output_for_eval, dict):
+            if bool(selected_output_for_eval.get("rangeGateOpen", True)):
+                rs["selected_range_gate_closed_streak"] = 0
+            else:
+                rs["selected_range_gate_closed_streak"] = int(
+                    rs.get("selected_range_gate_closed_streak") or 0
+                ) + 1
 
         switched_to: Optional[str] = None
         pending_angle = (
@@ -1026,6 +1131,11 @@ class RepCounterSession:
             and pending_angle in COMMON_ANGLES
             and pending_detector is not None
         ):
+            if isinstance(selected_angle, str):
+                _update_pending_incumbent_motion(
+                    rs,
+                    tracking_angle_values.get(selected_angle),
+                )
             pending_val = tracking_angle_values.get(pending_angle)
             angle_values[pending_angle] = pending_val
             pending_output = pending_detector.update(pending_val)
@@ -1057,6 +1167,19 @@ class RepCounterSession:
         )
         if re_eval_due:
             rs["selection_last_reevaluate_at"] = now
+            opposite_for_re_eval = _opposite_side_angle(
+                selected_angle if isinstance(selected_angle, str) else None
+            )
+            selected_hist_valid = _valid_history_count(
+                angle_histories.get(selected_angle)
+                if isinstance(selected_angle, str)
+                else None
+            )
+            opposite_hist_valid = _valid_history_count(
+                angle_histories.get(opposite_for_re_eval)
+                if isinstance(opposite_for_re_eval, str)
+                else None
+            )
             t_var = time.perf_counter()
             variances = self._get_variances(rs, frame_buffer, include_debug=False)
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
@@ -1071,7 +1194,196 @@ class RepCounterSession:
             cand = result.get("selectedAngle")
             src = str(result.get("source") or "")
             candidate = cand if isinstance(cand, str) and cand in COMMON_ANGLES else None
-            if candidate and src == "variance" and candidate != selected_angle:
+            closed_streak = int(rs.get("selected_range_gate_closed_streak") or 0)
+            selected_var_dbg = float(
+                (variances.get(selected_angle) or {}).get("medianWindowVariance") or 0.0
+            )
+            candidate_var_dbg = (
+                float((variances.get(candidate) or {}).get("medianWindowVariance") or 0.0)
+                if candidate is not None
+                else None
+            )
+            opposite_var_dbg = (
+                float((variances.get(opposite_for_re_eval) or {}).get("medianWindowVariance") or 0.0)
+                if isinstance(opposite_for_re_eval, str)
+                else None
+            )
+            last_raw = int(rs.get("selected_raw_last_at_reeval") or 0)
+            stale_reevals = int(rs.get("selected_raw_stale_reeval_streak") or 0)
+            if current_raw > last_raw:
+                stale_reevals = 0
+            else:
+                stale_reevals += 1
+            rs["selected_raw_last_at_reeval"] = current_raw
+            rs["selected_raw_stale_reeval_streak"] = stale_reevals
+            stale_switch_ok = False
+            if (
+                isinstance(selected_angle, str)
+                and isinstance(opposite_for_re_eval, str)
+                and (candidate == selected_angle or candidate is None)
+                and stale_reevals >= STALE_SWITCH_MIN_STALE_REEVALS
+            ):
+                opposite_ok = passes_consistent_variance_gate(variances, opposite_for_re_eval)
+                opposite_active_windows = int(
+                    (variances.get(opposite_for_re_eval) or {}).get("activeWindowCount") or 0
+                )
+                opposite_hist_ok = opposite_hist_valid >= 20
+                opposite_var_ok = (
+                    opposite_var_dbg is not None
+                    and opposite_var_dbg >= max(40.0, selected_var_dbg * STALE_SWITCH_MIN_VAR_RATIO)
+                )
+                selected_recent_range = _recent_history_range(
+                    angle_histories.get(selected_angle),
+                    STALE_SWITCH_SELECTED_RECENT_WINDOW,
+                )
+                selected_recent_motion_low = (
+                    selected_recent_range is not None
+                    and selected_recent_range <= STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+                )
+                selected_closed_streak_inactive = closed_streak >= STALE_SWITCH_MIN_CLOSED_STREAK
+                selected_force_stale_handoff = (
+                    stale_reevals >= STALE_SWITCH_FORCE_AFTER_STALE_REEVALS
+                )
+                # When forcing after prolonged stall, bypass the relative variance
+                # comparison.  The selected joint's historical variance is inflated by
+                # earlier active movement and can never be caught up to by the
+                # opposite side whose buffer still contains idle frames.  Require
+                # only the absolute floor so a genuinely active opposite limb passes.
+                opposite_var_force_ok = (
+                    selected_force_stale_handoff
+                    and opposite_var_dbg is not None
+                    and opposite_var_dbg >= STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR
+                )
+                stale_switch_ok = bool(
+                    opposite_active_windows >= 2
+                    and opposite_hist_ok
+                    and (opposite_var_ok or opposite_var_force_ok)
+                    and (
+                        selected_recent_motion_low
+                        or selected_closed_streak_inactive
+                        or selected_force_stale_handoff
+                    )
+                )
+                # region agent log
+                self._instr_emit(
+                    trace_context,
+                    {
+                        "event": "joint_stale_switch_eval",
+                        "selected_angle": selected_angle,
+                        "opposite_angle": opposite_for_re_eval,
+                        "stale_reevals": stale_reevals,
+                        "selected_raw": current_raw,
+                        "selected_median_variance": selected_var_dbg,
+                        "opposite_median_variance": opposite_var_dbg,
+                        "opposite_active_windows": opposite_active_windows,
+                        "opposite_hist_valid": opposite_hist_valid,
+                        "opposite_ok": opposite_ok,
+                        "opposite_var_ok": opposite_var_ok,
+                        "opposite_var_force_ok": opposite_var_force_ok,
+                        "selected_recent_range": selected_recent_range,
+                        "selected_recent_motion_low": selected_recent_motion_low,
+                        "selected_closed_streak_inactive": selected_closed_streak_inactive,
+                        "selected_force_stale_handoff": selected_force_stale_handoff,
+                        "selected_closed_streak": closed_streak,
+                        "stale_closed_streak_min": STALE_SWITCH_MIN_CLOSED_STREAK,
+                        "selected_recent_window": STALE_SWITCH_SELECTED_RECENT_WINDOW,
+                        "selected_recent_range_max": STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
+                        "stale_force_after_reevals": STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
+                        "stale_min_reevals": STALE_SWITCH_MIN_STALE_REEVALS,
+                        "stale_min_var_ratio": STALE_SWITCH_MIN_VAR_RATIO,
+                        "stale_switch_ok": stale_switch_ok,
+                    },
+                )
+                # endregion
+                if stale_switch_ok:
+                    candidate = opposite_for_re_eval
+                    src = "stale_selected_fallback"
+                    candidate_var_dbg = opposite_var_dbg
+            # region agent log
+            self._instr_emit(
+                trace_context,
+                {
+                    "event": "joint_reevaluate_snapshot",
+                    "selected_angle": selected_angle,
+                    "candidate_angle": candidate,
+                    "source": src,
+                    "opposite_angle": opposite_for_re_eval,
+                    "selected_median_variance": selected_var_dbg,
+                    "candidate_median_variance": candidate_var_dbg,
+                    "opposite_median_variance": opposite_var_dbg,
+                    "selected_hist_valid": selected_hist_valid,
+                    "opposite_hist_valid": opposite_hist_valid,
+                    "selected_filtered_angle": tracking_angle_values.get(selected_angle)
+                    if isinstance(selected_angle, str)
+                    else None,
+                    "opposite_filtered_angle": tracking_angle_values.get(opposite_for_re_eval)
+                    if isinstance(opposite_for_re_eval, str)
+                    else None,
+                    "buffer_signature": list(self._buffer_signature(frame_buffer)),
+                    "frame_buffer_len": len(frame_buffer),
+                    "variance_cache_hit_streak": int(
+                        rs.get("debug_variance_cache_hit_streak") or 0
+                    ),
+                    "selected_raw": current_raw,
+                    "selected_raw_stale_reevals": stale_reevals,
+                    "landmarks_obj_id": id(lm),
+                    "raw_landmarks_obj_id": id(raw_landmarks),
+                },
+            )
+            # endregion
+            if (
+                isinstance(selected_angle, str)
+                and (candidate is None or src != "variance")
+                and closed_streak >= 10
+            ):
+                opposite = _opposite_side_angle(selected_angle)
+                if opposite is not None:
+                    opposite_var = float(
+                        (variances.get(opposite) or {}).get("medianWindowVariance") or 0.0
+                    )
+                    opposite_active_windows = int(
+                        (variances.get(opposite) or {}).get("activeWindowCount") or 0
+                    )
+                    fast_switch_ok = opposite_active_windows >= 1 and opposite_var >= max(
+                        8.0, selected_var_dbg * 1.05
+                    )
+                    # region agent log
+                    self._instr_emit(
+                        trace_context,
+                        {
+                            "event": "joint_fast_switch_eval",
+                            "selected_angle": selected_angle,
+                            "opposite_angle": opposite,
+                            "closed_streak": closed_streak,
+                            "selected_median_variance": selected_var_dbg,
+                            "opposite_median_variance": opposite_var,
+                            "opposite_active_windows": opposite_active_windows,
+                            "fast_switch_ok": fast_switch_ok,
+                        },
+                    )
+                    # endregion
+                    if fast_switch_ok:
+                        candidate = opposite
+                        src = "range_gate_fallback"
+                        candidate_var_dbg = opposite_var
+            # region agent log
+            self._instr_emit(
+                trace_context,
+                {
+                    "event": "joint_reevaluate_result",
+                    "selected_angle": selected_angle,
+                    "candidate_angle": candidate,
+                    "source": src,
+                    "selected_median_variance": selected_var_dbg,
+                    "candidate_median_variance": candidate_var_dbg,
+                },
+            )
+            # endregion
+            if (
+                candidate
+                and src in ("variance", "range_gate_fallback", "stale_selected_fallback")
+                and candidate != selected_angle
+            ):
                 cur_ok = passes_consistent_variance_gate(variances, selected_angle)
                 cand_var = float((variances.get(candidate) or {}).get("medianWindowVariance") or 0.0)
                 cur_var = float((variances.get(selected_angle) or {}).get("medianWindowVariance") or 0.0)
@@ -1083,7 +1395,23 @@ class RepCounterSession:
                     last_switch is None
                     or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
                 )
-                if cooldown_ok and ((not cur_ok) or stronger):
+                # region agent log
+                self._instr_emit(
+                    trace_context,
+                    {
+                        "event": "joint_switch_gate_eval",
+                        "selected_angle": selected_angle,
+                        "candidate_angle": candidate,
+                        "cur_ok": cur_ok,
+                        "cand_var": cand_var,
+                        "cur_var": cur_var,
+                        "stronger": stronger,
+                        "cooldown_ok": cooldown_ok,
+                    },
+                )
+                # endregion
+                stale_override = src == "stale_selected_fallback"
+                if cooldown_ok and (stale_override or (not cur_ok) or stronger):
                     if candidate == pending_angle and pending_detector is not None:
                         replayed = pending_detector
                     else:
@@ -1093,12 +1421,28 @@ class RepCounterSession:
                             rs.get("tuning_params") or DEFAULT_TUNING_PARAMS,
                         )
                     if replayed is not None:
+                        replayed_shown, replayed_raw = _detector_counts(replayed)
                         sdba[candidate] = replayed
                         if candidate != pending_angle:
+                            current_selected_val = (
+                                tracking_angle_values.get(selected_angle)
+                                if isinstance(selected_angle, str)
+                                else None
+                            )
                             rs["pending_switch_incumbent_shown_start"] = current_shown
                             rs["pending_switch_incumbent_raw_start"] = current_raw
                             rs["pending_switch_incumbent_advanced"] = False
                             rs["pending_switch_observed"] = False
+                            rs["pending_switch_candidate_shown_start"] = replayed_shown
+                            rs["pending_switch_candidate_raw_start"] = replayed_raw
+                            if isinstance(current_selected_val, (int, float)):
+                                val_f = float(current_selected_val)
+                                rs["pending_switch_incumbent_angle_min"] = val_f
+                                rs["pending_switch_incumbent_angle_max"] = val_f
+                            else:
+                                rs["pending_switch_incumbent_angle_min"] = None
+                                rs["pending_switch_incumbent_angle_max"] = None
+                            rs["pending_switch_incumbent_moving"] = False
                         rs["pending_switch_angle"] = candidate
                         rs["pending_switch_detector"] = replayed
                         if _is_detector_calibrated(replayed):
@@ -1121,6 +1465,37 @@ class RepCounterSession:
                             angle_values[candidate] = val
                             detector_outputs[candidate] = replayed.update(val)
                             self._sync_detector_instrumentation_flags()
+                    else:
+                        # region agent log
+                        self._instr_emit(
+                            trace_context,
+                            {
+                                "event": "joint_switch_replay_unavailable",
+                                "selected_angle": selected_angle,
+                                "candidate_angle": candidate,
+                            },
+                        )
+                        # endregion
+            else:
+                reason = "no_candidate"
+                if candidate is None:
+                    reason = "candidate_missing"
+                elif src not in ("variance", "range_gate_fallback"):
+                    reason = "non_variance_source"
+                elif candidate == selected_angle:
+                    reason = "candidate_same_as_selected"
+                # region agent log
+                self._instr_emit(
+                    trace_context,
+                    {
+                        "event": "joint_switch_skip",
+                        "selected_angle": selected_angle,
+                        "candidate_angle": candidate,
+                        "source": src,
+                        "reason": reason,
+                    },
+                )
+                # endregion
             joint_records = _collect_joint_records(sdba, variances)
 
         angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None
