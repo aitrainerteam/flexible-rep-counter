@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from statistics import mean, median
+from typing import Any, Literal, Optional
+
+from flexible_rep_counter.core.math_engine import PeakDetector
+from flexible_rep_counter.core.variance_angle_selector import FRAME_MIN_CONFIDENCE
+
+_RECENT_RANGE_WINDOW = 45
+_POSE_WINDOW = 30
+_SYNC_WINDOW_MS = 4000
+
+MIN_EVIDENCE_ROM_DEG = 12.0
+MIN_EVIDENCE_RANGE_DEG = 12.0
+GOOD_RANGE_DEG = 35.0
+MIN_RANGE_DEG = 12.0
+
+UNOBSERVABLE_POSE_SCORE = 0.30
+
+CANDIDATE_MIN_SCORE = 0.62
+CANDIDATE_MIN_ACTIVITY = 0.45
+CANDIDATE_MIN_POSE_SCORE = 0.45
+CANDIDATE_MIN_COMPLETED_CYCLES = 2
+
+FORCE_SWITCH_MIN_SCORE = 0.50
+FORCE_SWITCH_MIN_ACTIVITY = 0.50
+FORCE_SWITCH_MIN_POSE_SCORE = 0.45
+
+
+@dataclass
+class JointMotionState:
+    angle_key: str
+    detector: PeakDetector
+    history: deque[Optional[float]]
+    confidence_history: deque[tuple[int, float]]
+
+    last_raw_rep_count: int = 0
+    last_rep_timestamp_ms: int | None = None
+    last_observed_timestamp_ms: int | None = None
+
+    recent_roms: deque[float] = field(default_factory=lambda: deque(maxlen=8))
+    recent_peaks: deque[float] = field(default_factory=lambda: deque(maxlen=8))
+    recent_valleys: deque[float] = field(default_factory=lambda: deque(maxlen=8))
+    recent_intervals_ms: deque[int] = field(default_factory=lambda: deque(maxlen=8))
+    cycle_log: deque[tuple[int, float]] = field(default_factory=lambda: deque(maxlen=16))
+
+    last_score: float = 0.0
+    last_score_debug: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class JointRecalibrationScore:
+    angle_key: str
+    score: float
+    debug: dict[str, Any]
+
+
+@dataclass
+class HandoffDecision:
+    kind: Literal["alternate_limb", "same_exercise", "ambiguous"]
+    rationale: dict[str, Any]
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def smoothstep(edge0: float, edge1: float, x: float) -> float:
+    if edge1 <= edge0:
+        return 0.0
+    t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = clamp(q / 100.0, 0.0, 1.0) * (len(sorted_values) - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = rank - lo
+    return float(sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac)
+
+
+def robust_std(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    med = median(values)
+    mad = median(abs(v - med) for v in values)
+    return 1.4826 * mad
+
+
+def robust_cv(values: list[float]) -> float:
+    if len(values) < 2:
+        return float("inf")
+    med = median(values)
+    return robust_std(values) / max(abs(med), 1e-6)
+
+
+def _recent_range_deg(state: JointMotionState) -> float:
+    recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
+    if len(recent_values) < 8:
+        return 0.0
+    return _percentile(recent_values, 95.0) - _percentile(recent_values, 5.0)
+
+
+def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, Any]) -> float:
+    peak = detector_output.get("peak")
+    valley = detector_output.get("valley")
+    if isinstance(peak, (int, float)) and isinstance(valley, (int, float)):
+        return abs(float(peak) - float(valley))
+    peaks = list(getattr(state.detector, "peaks", []) or [])
+    valleys = list(getattr(state.detector, "valleys", []) or [])
+    if peaks and valleys:
+        return abs(float(peaks[-1]) - float(valleys[-1]))
+    rolling = detector_output.get("rollingRange")
+    if isinstance(rolling, (int, float)):
+        return float(rolling)
+    return 0.0
+
+
+def cycle_is_evidence(state: JointMotionState, rom: float, recent_range_deg: float) -> bool:
+    return (
+        rom >= MIN_EVIDENCE_ROM_DEG
+        and recent_range_deg >= MIN_EVIDENCE_RANGE_DEG
+        and state.last_observed_timestamp_ms is not None
+    )
+
+
+def update_joint_motion_state(
+    state: JointMotionState,
+    val: Optional[float],
+    conf: Optional[float],
+    timestamp_ms: int,
+) -> dict[str, Any]:
+    confidence = float(conf) if isinstance(conf, (int, float)) else 0.0
+    state.confidence_history.append((timestamp_ms, confidence))
+    if val is None or conf is None or conf < FRAME_MIN_CONFIDENCE:
+        state.history.append(None)
+        return {"advanced": False, "detectorOutput": state.detector.update(None), "gatedCycle": False}
+
+    value = float(val)
+    state.history.append(value)
+    state.last_observed_timestamp_ms = timestamp_ms
+
+    prev_raw = int(state.detector.get_rep_count() or 0)
+    detector_output = state.detector.update(value)
+    new_raw = int(state.detector.get_rep_count() or 0)
+    advanced = new_raw > prev_raw
+    gated_cycle = False
+
+    peak = detector_output.get("peak")
+    valley = detector_output.get("valley")
+    if isinstance(peak, (int, float)):
+        state.recent_peaks.append(float(peak))
+    if isinstance(valley, (int, float)):
+        state.recent_valleys.append(float(valley))
+
+    if advanced:
+        if state.last_rep_timestamp_ms is not None:
+            state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
+        state.last_rep_timestamp_ms = timestamp_ms
+        rom = _latest_cycle_rom_deg(state, detector_output)
+        range_deg = _recent_range_deg(state)
+        if cycle_is_evidence(state, rom, range_deg):
+            state.recent_roms.append(float(rom))
+            state.cycle_log.append((timestamp_ms, float(rom)))
+            gated_cycle = True
+
+    state.last_raw_rep_count = new_raw
+    return {"advanced": advanced, "detectorOutput": detector_output, "gatedCycle": gated_cycle}
+
+
+def normalize_variance_prior(variance_data: Optional[dict[str, Any]]) -> float:
+    data = variance_data or {}
+    variance = float(data.get("medianWindowVariance") or 0.0)
+    active_windows = float(data.get("activeWindowCount") or 0.0)
+    smoothed_range = float(data.get("smoothedRangeDeg") or 0.0)
+    variance_score = clamp(variance / 120.0, 0.0, 1.0)
+    active_score = clamp(active_windows / 4.0, 0.0, 1.0)
+    range_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, smoothed_range)
+    return 0.45 * variance_score + 0.20 * active_score + 0.35 * range_score
+
+
+def compute_joint_recalibration_score(
+    state: JointMotionState,
+    variance_data: Optional[dict[str, Any]],
+    now_ms: int,
+) -> tuple[float, dict[str, Any]]:
+    recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
+    recent_range = (
+        _percentile(recent_values, 95.0) - _percentile(recent_values, 5.0)
+        if len(recent_values) >= 8
+        else 0.0
+    )
+
+    variance_prior = normalize_variance_prior(variance_data)
+    activity_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, recent_range)
+
+    roms = list(state.recent_roms)
+    peaks = list(state.recent_peaks)
+    valleys = list(state.recent_valleys)
+    intervals = list(state.recent_intervals_ms)
+
+    completed_cycles = len(roms)
+    evidence = 1.0 - math.exp(-completed_cycles / 2.0)
+    rom_cv = robust_cv(roms) if completed_cycles >= 2 else None
+    rom_score = math.exp(-rom_cv / 0.25) if rom_cv is not None else 0.0
+
+    extrema_jitter = None
+    if len(peaks) >= 2 and len(valleys) >= 2 and roms:
+        extrema_jitter = (robust_std(peaks) + robust_std(valleys)) / max(median(roms), 1e-6)
+        extrema_score = math.exp(-extrema_jitter / 0.35)
+    else:
+        extrema_score = 0.0
+
+    interval_cv = robust_cv(intervals) if len(intervals) >= 2 else None
+    cadence_score = (
+        math.exp(-interval_cv / 0.40)
+        if interval_cv is not None
+        else (0.5 if completed_cycles >= 1 else 0.0)
+    )
+
+    recent_confs = [c for _, c in list(state.confidence_history)[-_POSE_WINDOW:]]
+    avg_conf = mean(recent_confs) if recent_confs else 0.0
+    visible_fraction = (
+        sum(c >= FRAME_MIN_CONFIDENCE for c in recent_confs) / len(recent_confs)
+        if recent_confs
+        else 0.0
+    )
+    pose_score = clamp((avg_conf - 0.35) / 0.40, 0.0, 1.0)
+    observable = (
+        visible_fraction >= 0.50
+        and state.last_observed_timestamp_ms is not None
+        and (now_ms - state.last_observed_timestamp_ms) <= 750
+        and pose_score >= UNOBSERVABLE_POSE_SCORE
+    )
+
+    cycle_quality = (
+        0.25 * activity_score
+        + 0.30 * rom_score
+        + 0.15 * extrema_score
+        + 0.15 * cadence_score
+        + 0.15 * pose_score
+    )
+    score = evidence * cycle_quality + (1.0 - evidence) * variance_prior
+    debug = {
+        "score": score,
+        "evidence": evidence,
+        "completedCycles": completed_cycles,
+        "activityScore": activity_score,
+        "variancePrior": variance_prior,
+        "romScore": rom_score,
+        "romCv": rom_cv,
+        "extremaScore": extrema_score,
+        "extremaJitter": extrema_jitter,
+        "cadenceScore": cadence_score,
+        "intervalCv": interval_cv,
+        "poseScore": pose_score,
+        "visibleFraction": visible_fraction,
+        "recentRange": recent_range,
+        "observable": observable,
+    }
+    state.last_score = float(score)
+    state.last_score_debug = {
+        "activityScore": float(activity_score),
+        "romScore": float(rom_score),
+        "cadenceScore": float(cadence_score),
+        "poseScore": float(pose_score),
+        "evidence": float(evidence),
+    }
+    return score, debug
+
+
+def select_recalibration_candidate(
+    scores: dict[str, tuple[float, dict[str, Any]]],
+    selected_angle: Optional[str],
+) -> tuple[str | None, dict[str, Any]]:
+    best_key: Optional[str] = None
+    best_score = -1.0
+    best_debug: dict[str, Any] = {}
+    for angle_key, (score, debug) in scores.items():
+        if angle_key == selected_angle:
+            continue
+        if float(debug.get("poseScore") or 0.0) < UNOBSERVABLE_POSE_SCORE:
+            continue
+        if score > best_score:
+            best_key = angle_key
+            best_score = float(score)
+            best_debug = debug
+    return best_key, {"candidateScore": best_score, "candidateDebug": best_debug}
+
+
+def should_switch_to_candidate(
+    *,
+    cooldown_ok: bool,
+    stale_reevals: int,
+    stale_switch_force_after_reevals: int,
+    selected_recent_range: float,
+    stale_switch_max_selected_recent_range_deg: float,
+    selected_range_gate_closed_streak: int,
+    stale_switch_min_closed_streak: int,
+    selected_score: float,
+    selected_pose_score: float,
+    candidate_score: float,
+    candidate_activity_score: float,
+    candidate_pose_score: float,
+    candidate_completed_cycles: int,
+) -> tuple[bool, bool, dict[str, Any]]:
+    incumbent_bad = (
+        stale_reevals >= 1
+        or selected_recent_range < stale_switch_max_selected_recent_range_deg
+        or selected_range_gate_closed_streak >= stale_switch_min_closed_streak
+        or selected_score < 0.35
+        or selected_pose_score < UNOBSERVABLE_POSE_SCORE
+    )
+    candidate_good = (
+        candidate_score >= CANDIDATE_MIN_SCORE
+        and candidate_activity_score >= CANDIDATE_MIN_ACTIVITY
+        and candidate_pose_score >= CANDIDATE_MIN_POSE_SCORE
+        and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+    )
+    candidate_clearly_better = (
+        candidate_score >= selected_score + 0.18
+        or candidate_score >= selected_score * 1.35
+    )
+    should_switch = cooldown_ok and incumbent_bad and candidate_good and candidate_clearly_better
+
+    force_switch = (
+        stale_reevals >= stale_switch_force_after_reevals
+        and candidate_score >= FORCE_SWITCH_MIN_SCORE
+        and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
+        and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
+        and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+    )
+    return bool(should_switch), bool(force_switch), {
+        "incumbentBad": bool(incumbent_bad),
+        "candidateGood": bool(candidate_good),
+        "candidateClearlyBetter": bool(candidate_clearly_better),
+        "shouldSwitch": bool(should_switch),
+        "forceSwitch": bool(force_switch),
+    }
+
+
+def is_same_joint_family(a: Optional[str], b: Optional[str]) -> bool:
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    base_a = a[5:] if a.startswith("LEFT_") else a[6:] if a.startswith("RIGHT_") else a
+    base_b = b[5:] if b.startswith("LEFT_") else b[6:] if b.startswith("RIGHT_") else b
+    return base_a == base_b
+
+
+def is_mirrored_pair(a: Optional[str], b: Optional[str]) -> bool:
+    if not is_same_joint_family(a, b):
+        return False
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return (a.startswith("LEFT_") and b.startswith("RIGHT_")) or (
+        a.startswith("RIGHT_") and b.startswith("LEFT_")
+    )
+
+
+def cycle_sync_score_last_4s(
+    incumbent: JointMotionState,
+    candidate: JointMotionState,
+    now_ms: int,
+) -> float:
+    lo = now_ms - _SYNC_WINDOW_MS
+    inc_cycles = [ts for ts, _ in incumbent.cycle_log if ts >= lo]
+    cand_cycles = [ts for ts, _ in candidate.cycle_log if ts >= lo]
+    if not inc_cycles or not cand_cycles:
+        return 0.0
+    count_ratio = min(len(inc_cycles), len(cand_cycles)) / max(len(inc_cycles), len(cand_cycles))
+    ts_gap = abs(inc_cycles[-1] - cand_cycles[-1])
+    ts_score = 1.0 - clamp(ts_gap / 1500.0, 0.0, 1.0)
+    return 0.6 * count_ratio + 0.4 * ts_score
+
+
+def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
+    incumbent_motion_span = float(pending_state.get("incumbent_motion_span_deg") or 0.0)
+    candidate_pending_rom = float(pending_state.get("candidate_pending_rom_estimate_deg") or 0.0)
+    if (
+        bool(pending_state.get("incumbent_advanced"))
+        or bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
+        or incumbent_motion_span >= max(12.0, 0.40 * candidate_pending_rom)
+    ):
+        return HandoffDecision(
+            kind="same_exercise",
+            rationale={"rule": "incumbent_active_during_pending"},
+        )
+
+    incumbent_last_obs = pending_state.get("incumbent_last_observed_ts_at_start")
+    pending_start_ts = int(pending_state.get("pending_start_ts") or 0)
+    incumbent_disappeared = (
+        not bool(pending_state.get("incumbent_observable_during_pending"))
+        or float(pending_state.get("incumbent_pose_score_at_start") or 0.0) < UNOBSERVABLE_POSE_SCORE
+        or (
+            isinstance(incumbent_last_obs, int)
+            and (pending_start_ts - incumbent_last_obs) > 750
+        )
+    )
+    candidate_last_cycle = pending_state.get("candidate_last_cycle_ts_before_start")
+    candidate_had_prior_cycles = (
+        int(pending_state.get("candidate_completed_cycles_at_start") or 0) >= 2
+        and isinstance(candidate_last_cycle, int)
+        and (pending_start_ts - candidate_last_cycle) <= _SYNC_WINDOW_MS
+        and float(pending_state.get("candidate_rom_score_at_start") or 0.0) >= 0.50
+        and bool(pending_state.get("same_joint_family"))
+        and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
+    )
+    if incumbent_disappeared and candidate_had_prior_cycles:
+        return HandoffDecision(
+            kind="same_exercise",
+            rationale={"rule": "incumbent_disappeared_with_prior_sync_cycles"},
+        )
+
+    incumbent_quiet_but_visible = (
+        bool(pending_state.get("incumbent_observable_during_pending"))
+        and incumbent_motion_span < 12.0
+        and not bool(pending_state.get("incumbent_advanced"))
+    )
+    if (
+        incumbent_quiet_but_visible
+        and bool(pending_state.get("mirrored_pair"))
+        and (
+            bool(pending_state.get("candidate_advanced_during_pending"))
+            or bool(pending_state.get("candidate_completed_gated_cycle_during_pending"))
+        )
+    ):
+        return HandoffDecision(
+            kind="alternate_limb",
+            rationale={"rule": "mirrored_quiet_incumbent_candidate_active"},
+        )
+
+    return HandoffDecision(kind="ambiguous", rationale={"rule": "insufficient_or_cross_family_evidence"})

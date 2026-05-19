@@ -19,6 +19,17 @@ from flexible_rep_counter.core.math_engine import (
     get_min_confidence_for_landmarks,
     replay_angle_series_on_peak_detector,
 )
+from flexible_rep_counter.core.recalibration_confidence import (
+    JointMotionState,
+    classify_handoff,
+    compute_joint_recalibration_score,
+    cycle_sync_score_last_4s,
+    is_mirrored_pair,
+    is_same_joint_family,
+    select_recalibration_candidate,
+    should_switch_to_candidate,
+    update_joint_motion_state,
+)
 from flexible_rep_counter.core.pose_filters import PoseFilterPipeline
 from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_DOMINANCE_FRACTION,
@@ -30,7 +41,6 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_RETRY_INTERVAL_SEC,
     ANGLE_SELECTION_REEVALUATE_EVERY_SEC,
     ANGLE_SELECTION_SWITCH_MIN_SEC,
-    ANGLE_SELECTION_SWITCH_VARIANCE_RATIO,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     get_default_tuning_params,
 )
@@ -40,7 +50,6 @@ from flexible_rep_counter.core.variance_angle_selector import (
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
-    passes_consistent_variance_gate,
     summarize_rep_dominance,
 )
 from flexible_rep_counter.types import StepResult
@@ -54,13 +63,13 @@ _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 DYNAMIC_RECALIBRATION_ENABLED = True
 SWITCH_REPLAY_MIN_VALID_SAMPLES = 10
 STALE_SWITCH_MIN_STALE_REEVALS = 4
-STALE_SWITCH_MIN_VAR_RATIO = 0.4
 PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG = 12.0
 STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
 STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG = 14.0
 STALE_SWITCH_MIN_CLOSED_STREAK = 10
 STALE_SWITCH_FORCE_AFTER_STALE_REEVALS = 8
-STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR = 40.0
+PENDING_SWITCH_MIN_OBSERVATION_MS = 300
+PENDING_SWITCH_MAX_OBSERVATION_MS = 600
 
 
 def _diagnose_missing_angle(
@@ -105,6 +114,22 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
         ),
         min_rep_interval_ms=float(tp.get("minRepIntervalMs", d["minRepIntervalMs"])),
     )
+
+
+def _build_joint_motion_states(
+    tuning_params: dict[str, Any],
+    *,
+    history_maxlen: int = ANGLE_SELECTION_MAX_BUFFER_FRAMES,
+) -> dict[str, JointMotionState]:
+    states: dict[str, JointMotionState] = {}
+    for angle_key in COMMON_ANGLES:
+        states[angle_key] = JointMotionState(
+            angle_key=angle_key,
+            detector=_peak_detector_from_tuning(tuning_params),
+            history=deque(maxlen=history_maxlen),
+            confidence_history=deque(maxlen=history_maxlen),
+        )
+    return states
 
 
 def _apply_locked_tracking(
@@ -189,15 +214,36 @@ def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
 def _clear_pending_switch(run_state: dict[str, Any]) -> None:
     run_state["pending_switch_angle"] = None
     run_state["pending_switch_detector"] = None
+    run_state["pending_switch_started_at_ms"] = None
     run_state["pending_switch_candidate_shown_start"] = None
     run_state["pending_switch_candidate_raw_start"] = None
     run_state["pending_switch_incumbent_shown_start"] = None
     run_state["pending_switch_incumbent_raw_start"] = None
+    run_state["pending_switch_incumbent_pose_score_at_start"] = 0.0
+    run_state["pending_switch_incumbent_completed_cycles_at_start"] = 0
+    run_state["pending_switch_incumbent_recent_range_at_start"] = 0.0
+    run_state["pending_switch_incumbent_last_observed_ts_at_start"] = None
+    run_state["pending_switch_candidate_completed_cycles_at_start"] = 0
+    run_state["pending_switch_candidate_last_cycle_ts_before_start"] = None
+    run_state["pending_switch_candidate_rom_score_at_start"] = 0.0
+    run_state["pending_switch_candidate_carryover_start_shown"] = 0
+    run_state["pending_switch_candidate_carryover_start_raw"] = 0
+    run_state["pending_switch_candidate_carryover_start_ts"] = 0
+    run_state["pending_switch_incumbent_cycles_last_4s"] = 0
+    run_state["pending_switch_candidate_cycles_last_4s"] = 0
+    run_state["pending_switch_cycle_sync_score_last_4s"] = 0.0
+    run_state["pending_switch_same_joint_family"] = False
+    run_state["pending_switch_mirrored_pair"] = False
     run_state["pending_switch_incumbent_advanced"] = False
     run_state["pending_switch_observed"] = False
     run_state["pending_switch_incumbent_angle_min"] = None
     run_state["pending_switch_incumbent_angle_max"] = None
-    run_state["pending_switch_incumbent_moving"] = False
+    run_state["pending_switch_incumbent_motion_span_deg"] = 0.0
+    run_state["pending_switch_incumbent_observable_during_pending"] = False
+    run_state["pending_switch_incumbent_completed_gated_cycle_during_pending"] = False
+    run_state["pending_switch_candidate_advanced_during_pending"] = False
+    run_state["pending_switch_candidate_completed_gated_cycle_during_pending"] = False
+    run_state["pending_switch_candidate_pending_rom_estimate_deg"] = 0.0
 
 
 def _valid_history_count(series: Optional[deque]) -> int:
@@ -238,8 +284,7 @@ def _update_pending_incumbent_motion(
     max_v = max(float(angle_max), current)
     run_state["pending_switch_incumbent_angle_min"] = min_v
     run_state["pending_switch_incumbent_angle_max"] = max_v
-    if (max_v - min_v) >= PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG:
-        run_state["pending_switch_incumbent_moving"] = True
+    run_state["pending_switch_incumbent_motion_span_deg"] = max_v - min_v
 
 
 def _rebuild_detector_from_history(
@@ -287,33 +332,69 @@ def _activate_joint_switch(
     switched_at: float,
 ) -> None:
     detectors_by_angle[new_angle] = detector
-    shown, raw = _detector_counts(detector)
-    start_shown = run_state.get("pending_switch_incumbent_shown_start")
-    start_raw = run_state.get("pending_switch_incumbent_raw_start")
-    incumbent_advanced = bool(run_state.get("pending_switch_incumbent_advanced"))
-    incumbent_moving = bool(run_state.get("pending_switch_incumbent_moving"))
-    pending_observed = bool(run_state.get("pending_switch_observed"))
-    candidate_shown_start = run_state.get("pending_switch_candidate_shown_start")
-    candidate_raw_start = run_state.get("pending_switch_candidate_raw_start")
-    has_pending_baseline = isinstance(start_shown, int) and isinstance(start_raw, int)
-    has_candidate_pending_baseline = isinstance(candidate_shown_start, int) and isinstance(
-        candidate_raw_start, int
-    )
-    include_candidate_pending_reps = (
-        has_pending_baseline
-        and has_candidate_pending_baseline
-        and pending_observed
-        and not incumbent_advanced
-        and not incumbent_moving
-    )
-    if include_candidate_pending_reps:
-        cand_shown_start = candidate_shown_start if isinstance(candidate_shown_start, int) else 0
-        cand_raw_start = candidate_raw_start if isinstance(candidate_raw_start, int) else 0
-        run_state["rep_count_offset"] = max(0, cumulative_shown - cand_shown_start)
-        run_state["rep_count_raw_offset"] = max(0, cumulative_raw - cand_raw_start)
+    candidate_current_shown, candidate_current_raw = _detector_counts(detector)
+    pending_state = {
+        "incumbent_advanced": bool(run_state.get("pending_switch_incumbent_advanced")),
+        "incumbent_completed_gated_cycle_during_pending": bool(
+            run_state.get("pending_switch_incumbent_completed_gated_cycle_during_pending")
+        ),
+        "incumbent_motion_span_deg": float(run_state.get("pending_switch_incumbent_motion_span_deg") or 0.0),
+        "candidate_pending_rom_estimate_deg": float(
+            run_state.get("pending_switch_candidate_pending_rom_estimate_deg") or 0.0
+        ),
+        "incumbent_observable_during_pending": bool(
+            run_state.get("pending_switch_incumbent_observable_during_pending")
+        ),
+        "incumbent_pose_score_at_start": float(
+            run_state.get("pending_switch_incumbent_pose_score_at_start") or 0.0
+        ),
+        "incumbent_last_observed_ts_at_start": run_state.get(
+            "pending_switch_incumbent_last_observed_ts_at_start"
+        ),
+        "pending_start_ts": int(run_state.get("pending_switch_started_at_ms") or 0),
+        "candidate_completed_cycles_at_start": int(
+            run_state.get("pending_switch_candidate_completed_cycles_at_start") or 0
+        ),
+        "candidate_last_cycle_ts_before_start": run_state.get(
+            "pending_switch_candidate_last_cycle_ts_before_start"
+        ),
+        "candidate_rom_score_at_start": float(
+            run_state.get("pending_switch_candidate_rom_score_at_start") or 0.0
+        ),
+        "same_joint_family": bool(run_state.get("pending_switch_same_joint_family")),
+        "cycle_sync_score_last_4s": float(run_state.get("pending_switch_cycle_sync_score_last_4s") or 0.0),
+        "mirrored_pair": bool(run_state.get("pending_switch_mirrored_pair")),
+        "candidate_advanced_during_pending": bool(
+            run_state.get("pending_switch_candidate_advanced_during_pending")
+        ),
+        "candidate_completed_gated_cycle_during_pending": bool(
+            run_state.get("pending_switch_candidate_completed_gated_cycle_during_pending")
+        ),
+    }
+    decision = classify_handoff(pending_state)
+
+    carryover_start_shown = int(run_state.get("pending_switch_candidate_carryover_start_shown") or 0)
+    carryover_start_raw = int(run_state.get("pending_switch_candidate_carryover_start_raw") or 0)
+    candidate_delta_shown = max(0, candidate_current_shown - carryover_start_shown)
+    candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
+    if decision.kind == "alternate_limb":
+        target_display_shown = cumulative_shown + candidate_delta_shown
+        target_display_raw = cumulative_raw + candidate_delta_raw
     else:
-        run_state["rep_count_offset"] = max(0, cumulative_shown - shown)
-        run_state["rep_count_raw_offset"] = max(0, cumulative_raw - raw)
+        target_display_shown = cumulative_shown
+        target_display_raw = cumulative_raw
+
+    before_activation_shown = cumulative_shown
+    run_state["rep_count_offset"] = target_display_shown - candidate_current_shown
+    run_state["rep_count_raw_offset"] = target_display_raw - candidate_current_raw
+    after_activation_shown = candidate_current_shown + int(run_state["rep_count_offset"])
+    assert after_activation_shown == target_display_shown
+    assert after_activation_shown >= before_activation_shown
+    if decision.kind in ("same_exercise", "ambiguous"):
+        assert after_activation_shown == cumulative_shown
+
+    run_state["pending_switch_handoff_kind"] = decision.kind
+    run_state["pending_switch_handoff_rationale"] = decision.rationale
     run_state["selected_angle"] = new_angle
     run_state["selected_config"] = COMMON_ANGLES[new_angle]
     run_state["peak_detector"] = detector
@@ -471,6 +552,7 @@ class RepCounterSession:
             "selection_last_reevaluate_at": None,
             "selection_last_switch_at": None,
             "selection_detectors_by_angle": {},
+            "joint_motion_states": _build_joint_motion_states(dict(tp)),
             "selection_dominance_key": None,
             "selection_dominance_streak": 0,
             "selected_angle": None,
@@ -480,12 +562,6 @@ class RepCounterSession:
             "rep_count_raw_offset": 0,
             "pending_switch_angle": None,
             "pending_switch_detector": None,
-            "pending_switch_candidate_shown_start": None,
-            "pending_switch_candidate_raw_start": None,
-            "pending_switch_incumbent_shown_start": None,
-            "pending_switch_incumbent_raw_start": None,
-            "pending_switch_incumbent_advanced": False,
-            "pending_switch_observed": False,
             "selected_raw_last_at_reeval": 0,
             "selected_raw_stale_reeval_streak": 0,
             "selected_range_gate_closed_streak": 0,
@@ -496,6 +572,7 @@ class RepCounterSession:
                 ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
             },
         }
+        _clear_pending_switch(self._run_state)
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
         self._sync_detector_instrumentation_flags()
@@ -507,7 +584,12 @@ class RepCounterSession:
         self._run_state["selection_last_attempt"] = None
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
-        self._run_state["selection_detectors_by_angle"] = {}
+        self._run_state["joint_motion_states"] = _build_joint_motion_states(
+            self._run_state["tuning_params"]
+        )
+        self._run_state["selection_detectors_by_angle"] = {
+            k: s.detector for k, s in self._run_state["joint_motion_states"].items()
+        }
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["rep_count_offset"] = 0
@@ -532,7 +614,12 @@ class RepCounterSession:
         self._run_state["selection_last_attempt"] = None
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
-        self._run_state["selection_detectors_by_angle"] = {}
+        self._run_state["joint_motion_states"] = _build_joint_motion_states(
+            self._run_state["tuning_params"]
+        )
+        self._run_state["selection_detectors_by_angle"] = {
+            k: s.detector for k, s in self._run_state["joint_motion_states"].items()
+        }
         self._run_state["selection_dominance_key"] = None
         self._run_state["selection_dominance_streak"] = 0
         self._run_state["rep_count_offset"] = 0
@@ -613,7 +700,8 @@ class RepCounterSession:
 
     def _sync_detector_instrumentation_flags(self) -> None:
         rs = self._run_state
-        sdba = rs.get("selection_detectors_by_angle") or {}
+        states = rs.get("joint_motion_states") or {}
+        sdba = {k: s.detector for k, s in states.items()} if states else rs.get("selection_detectors_by_angle") or {}
         en = self._instr_sink is not None
         for det in sdba.values():
             try:
@@ -645,6 +733,8 @@ class RepCounterSession:
         self, trace_context: Optional[dict[str, Any]], event: dict[str, Any]
     ) -> None:
         if not self._instrumentation_should_emit(trace_context):
+            return
+        if self._instr_sink is None or trace_context is None:
             return
         self._instr_sink.emit(merge_trace(event, trace_context))
 
@@ -860,15 +950,17 @@ class RepCounterSession:
             "selection_logic_ms": 0.0,
         }
 
-        sdba: dict[str, Any] = rs.get("selection_detectors_by_angle") or {}
-        if not sdba:
-            sdba = {ak: _peak_detector_from_tuning(tuning_params) for ak in COMMON_ANGLES}
-            for ak, det in sdba.items():
-                try:
-                    setattr(det, "debug_label", ak)
-                except Exception:
-                    pass
-            rs["selection_detectors_by_angle"] = sdba
+        joint_states: dict[str, JointMotionState] = rs.get("joint_motion_states") or {}
+        if not joint_states:
+            joint_states = _build_joint_motion_states(tuning_params)
+            rs["joint_motion_states"] = joint_states
+        sdba: dict[str, Any] = {k: s.detector for k, s in joint_states.items()}
+        rs["selection_detectors_by_angle"] = sdba
+        for ak, det in sdba.items():
+            try:
+                setattr(det, "debug_label", ak)
+            except Exception:
+                pass
         self._sync_detector_instrumentation_flags()
 
         selected_angle = rs["selected_angle"]
@@ -891,7 +983,14 @@ class RepCounterSession:
                 selecting_raw_angle_values[ak] = raw_av
                 val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
                 selecting_angle_values[ak] = val
-                selecting_detector_outputs[ak] = sdba[ak].update(val)  # type: ignore[union-attr]
+                conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
+                upd = update_joint_motion_state(
+                    joint_states[ak],
+                    val,
+                    conf,
+                    int(ts),
+                )
+                selecting_detector_outputs[ak] = upd.get("detectorOutput") or {}
             _update_angle_histories_for_frame(
                 angle_histories,
                 selecting_angle_values,
@@ -1056,7 +1155,7 @@ class RepCounterSession:
             )
             return out
 
-        # Tracking phase: update only the selected detector each frame.
+        # Tracking phase: update all joint motion states every frame.
         angle_values: dict[str, Optional[float]] = {}
         detector_outputs: dict[str, dict[str, Any]] = {}
         variances: dict[str, dict[str, Any]] = {}
@@ -1080,17 +1179,38 @@ class RepCounterSession:
             for ak, cfg in COMMON_ANGLES.items()
         }
         _update_angle_histories_for_frame(angle_histories, tracking_angle_values, lm)
+        t_det = time.perf_counter()
+        for ak, cfg in COMMON_ANGLES.items():
+            val = tracking_angle_values.get(ak)
+            conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
+            upd = update_joint_motion_state(joint_states[ak], val, conf, int(ts))
+            detector_outputs[ak] = upd.get("detectorOutput") or {}
+            angle_values[ak] = val
+            if isinstance(selected_angle, str) and ak == selected_angle:
+                if upd.get("advanced"):
+                    rs["pending_switch_incumbent_advanced"] = True
+                if upd.get("gatedCycle"):
+                    rs["pending_switch_incumbent_completed_gated_cycle_during_pending"] = True
+            pending_angle_for_updates = rs.get("pending_switch_angle")
+            if isinstance(pending_angle_for_updates, str) and ak == pending_angle_for_updates:
+                rs["pending_switch_observed"] = True
+                if upd.get("advanced"):
+                    rs["pending_switch_candidate_advanced_during_pending"] = True
+                if upd.get("gatedCycle"):
+                    rs["pending_switch_candidate_completed_gated_cycle_during_pending"] = True
+                pending_rolling = (upd.get("detectorOutput") or {}).get("rollingRange")
+                if isinstance(pending_rolling, (int, float)):
+                    rs["pending_switch_candidate_pending_rom_estimate_deg"] = max(
+                        float(rs.get("pending_switch_candidate_pending_rom_estimate_deg") or 0.0),
+                        float(pending_rolling),
+                    )
+        perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
         if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
             cfg = COMMON_ANGLES[selected_angle]
-            t_det = time.perf_counter()
             raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
-            val = tracking_angle_values.get(selected_angle)
-            angle_values[selected_angle] = val
             active_detector = rs.get("peak_detector") or sdba.get(selected_angle)
             if active_detector is None:
                 active_detector = sdba[selected_angle]
-            detector_outputs[selected_angle] = active_detector.update(val)  # type: ignore[union-attr]
-            perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
             rep_value = int(active_detector.get_rep_count() or 0) if active_detector is not None else 0
             rep_dom = {
                 "totalReps": rep_value,
@@ -1119,7 +1239,6 @@ class RepCounterSession:
             else None
         )
         pending_detector = rs.get("pending_switch_detector")
-        pending_calibrated = False
         start_shown = rs.get("pending_switch_incumbent_shown_start")
         start_raw = rs.get("pending_switch_incumbent_raw_start")
         if isinstance(start_shown, int) and isinstance(start_raw, int):
@@ -1136,13 +1255,36 @@ class RepCounterSession:
                     rs,
                     tracking_angle_values.get(selected_angle),
                 )
-            pending_val = tracking_angle_values.get(pending_angle)
-            angle_values[pending_angle] = pending_val
-            pending_output = pending_detector.update(pending_val)
-            rs["pending_switch_observed"] = True
-            detector_outputs[pending_angle] = pending_output
-            pending_calibrated = _is_detector_calibrated(pending_detector, pending_output)
-            if pending_calibrated:
+                selected_conf = get_min_confidence_for_landmarks(
+                    lm, COMMON_ANGLES[selected_angle]["landmarks"]
+                )
+                if isinstance(selected_conf, (int, float)) and selected_conf >= FRAME_MIN_CONFIDENCE:
+                    rs["pending_switch_incumbent_observable_during_pending"] = True
+            if pending_angle in detector_outputs:
+                pending_calibrated = _is_detector_calibrated(
+                    pending_detector, detector_outputs.get(pending_angle)
+                )
+            else:
+                pending_calibrated = _is_detector_calibrated(pending_detector)
+            pending_started_at_ms = int(rs.get("pending_switch_started_at_ms") or int(ts))
+            rs["pending_switch_started_at_ms"] = pending_started_at_ms
+            pending_elapsed_ms = int(ts) - pending_started_at_ms
+            if pending_calibrated and pending_elapsed_ms >= PENDING_SWITCH_MIN_OBSERVATION_MS:
+                _activate_joint_switch(
+                    rs,
+                    sdba,
+                    new_angle=pending_angle,
+                    detector=pending_detector,
+                    cumulative_shown=cumulative_shown,
+                    cumulative_raw=cumulative_raw,
+                    switched_at=now,
+                )
+                switched_to = pending_angle
+                selected_angle = pending_angle
+                cfg = COMMON_ANGLES[pending_angle]
+                raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                self._sync_detector_instrumentation_flags()
+            elif pending_elapsed_ms > PENDING_SWITCH_MAX_OBSERVATION_MS:
                 _activate_joint_switch(
                     rs,
                     sdba,
@@ -1167,47 +1309,32 @@ class RepCounterSession:
         )
         if re_eval_due:
             rs["selection_last_reevaluate_at"] = now
-            opposite_for_re_eval = _opposite_side_angle(
-                selected_angle if isinstance(selected_angle, str) else None
-            )
-            selected_hist_valid = _valid_history_count(
-                angle_histories.get(selected_angle)
-                if isinstance(selected_angle, str)
-                else None
-            )
-            opposite_hist_valid = _valid_history_count(
-                angle_histories.get(opposite_for_re_eval)
-                if isinstance(opposite_for_re_eval, str)
-                else None
-            )
             t_var = time.perf_counter()
             variances = self._get_variances(rs, frame_buffer, include_debug=False)
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
-            t_sel = time.perf_counter()
-            buf_list = self._buffer_as_list(rs, frame_buffer)
-            result = determine_best_angle(
-                buf_list,
-                variances=variances,
-                include_debug=False,
+            now_ms = int(ts)
+            score_by_joint: dict[str, tuple[float, dict[str, Any]]] = {}
+            for angle_key, state in joint_states.items():
+                score_by_joint[angle_key] = compute_joint_recalibration_score(
+                    state,
+                    variances.get(angle_key),
+                    now_ms,
+                )
+
+            candidate, candidate_sel_debug = select_recalibration_candidate(
+                score_by_joint, selected_angle if isinstance(selected_angle, str) else None
             )
-            perf_ms["selection_logic_ms"] = (time.perf_counter() - t_sel) * 1000.0
-            cand = result.get("selectedAngle")
-            src = str(result.get("source") or "")
-            candidate = cand if isinstance(cand, str) and cand in COMMON_ANGLES else None
-            closed_streak = int(rs.get("selected_range_gate_closed_streak") or 0)
-            selected_var_dbg = float(
-                (variances.get(selected_angle) or {}).get("medianWindowVariance") or 0.0
-            )
-            candidate_var_dbg = (
-                float((variances.get(candidate) or {}).get("medianWindowVariance") or 0.0)
-                if candidate is not None
-                else None
-            )
-            opposite_var_dbg = (
-                float((variances.get(opposite_for_re_eval) or {}).get("medianWindowVariance") or 0.0)
-                if isinstance(opposite_for_re_eval, str)
-                else None
-            )
+
+            selected_score = 0.0
+            selected_debug: dict[str, Any] = {}
+            if isinstance(selected_angle, str):
+                selected_score, selected_debug = score_by_joint.get(selected_angle, (0.0, {}))
+
+            candidate_score = 0.0
+            candidate_debug: dict[str, Any] = {}
+            if isinstance(candidate, str):
+                candidate_score, candidate_debug = score_by_joint.get(candidate, (0.0, {}))
+
             last_raw = int(rs.get("selected_raw_last_at_reeval") or 0)
             stale_reevals = int(rs.get("selected_raw_stale_reeval_streak") or 0)
             if current_raw > last_raw:
@@ -1216,286 +1343,106 @@ class RepCounterSession:
                 stale_reevals += 1
             rs["selected_raw_last_at_reeval"] = current_raw
             rs["selected_raw_stale_reeval_streak"] = stale_reevals
-            stale_switch_ok = False
-            if (
-                isinstance(selected_angle, str)
-                and isinstance(opposite_for_re_eval, str)
-                and (candidate == selected_angle or candidate is None)
-                and stale_reevals >= STALE_SWITCH_MIN_STALE_REEVALS
-            ):
-                opposite_ok = passes_consistent_variance_gate(variances, opposite_for_re_eval)
-                opposite_active_windows = int(
-                    (variances.get(opposite_for_re_eval) or {}).get("activeWindowCount") or 0
-                )
-                opposite_hist_ok = opposite_hist_valid >= 20
-                opposite_var_ok = (
-                    opposite_var_dbg is not None
-                    and opposite_var_dbg >= max(40.0, selected_var_dbg * STALE_SWITCH_MIN_VAR_RATIO)
-                )
-                selected_recent_range = _recent_history_range(
-                    angle_histories.get(selected_angle),
-                    STALE_SWITCH_SELECTED_RECENT_WINDOW,
-                )
-                selected_recent_motion_low = (
-                    selected_recent_range is not None
-                    and selected_recent_range <= STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
-                )
-                selected_closed_streak_inactive = closed_streak >= STALE_SWITCH_MIN_CLOSED_STREAK
-                selected_force_stale_handoff = (
-                    stale_reevals >= STALE_SWITCH_FORCE_AFTER_STALE_REEVALS
-                )
-                # When forcing after prolonged stall, bypass the relative variance
-                # comparison.  The selected joint's historical variance is inflated by
-                # earlier active movement and can never be caught up to by the
-                # opposite side whose buffer still contains idle frames.  Require
-                # only the absolute floor so a genuinely active opposite limb passes.
-                opposite_var_force_ok = (
-                    selected_force_stale_handoff
-                    and opposite_var_dbg is not None
-                    and opposite_var_dbg >= STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR
-                )
-                stale_switch_ok = bool(
-                    opposite_active_windows >= 2
-                    and opposite_hist_ok
-                    and (opposite_var_ok or opposite_var_force_ok)
-                    and (
-                        selected_recent_motion_low
-                        or selected_closed_streak_inactive
-                        or selected_force_stale_handoff
-                    )
-                )
-                # region agent log
-                self._instr_emit(
-                    trace_context,
-                    {
-                        "event": "joint_stale_switch_eval",
-                        "selected_angle": selected_angle,
-                        "opposite_angle": opposite_for_re_eval,
-                        "stale_reevals": stale_reevals,
-                        "selected_raw": current_raw,
-                        "selected_median_variance": selected_var_dbg,
-                        "opposite_median_variance": opposite_var_dbg,
-                        "opposite_active_windows": opposite_active_windows,
-                        "opposite_hist_valid": opposite_hist_valid,
-                        "opposite_ok": opposite_ok,
-                        "opposite_var_ok": opposite_var_ok,
-                        "opposite_var_force_ok": opposite_var_force_ok,
-                        "selected_recent_range": selected_recent_range,
-                        "selected_recent_motion_low": selected_recent_motion_low,
-                        "selected_closed_streak_inactive": selected_closed_streak_inactive,
-                        "selected_force_stale_handoff": selected_force_stale_handoff,
-                        "selected_closed_streak": closed_streak,
-                        "stale_closed_streak_min": STALE_SWITCH_MIN_CLOSED_STREAK,
-                        "selected_recent_window": STALE_SWITCH_SELECTED_RECENT_WINDOW,
-                        "selected_recent_range_max": STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
-                        "stale_force_after_reevals": STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
-                        "stale_min_reevals": STALE_SWITCH_MIN_STALE_REEVALS,
-                        "stale_min_var_ratio": STALE_SWITCH_MIN_VAR_RATIO,
-                        "stale_switch_ok": stale_switch_ok,
-                    },
-                )
-                # endregion
-                if stale_switch_ok:
-                    candidate = opposite_for_re_eval
-                    src = "stale_selected_fallback"
-                    candidate_var_dbg = opposite_var_dbg
-            # region agent log
+            selected_recent_range = float(selected_debug.get("recentRange") or 0.0)
+            selected_pose_score = float(selected_debug.get("poseScore") or 0.0)
+            candidate_activity_score = float(candidate_debug.get("activityScore") or 0.0)
+            candidate_pose_score = float(candidate_debug.get("poseScore") or 0.0)
+            candidate_completed_cycles = int(candidate_debug.get("completedCycles") or 0)
+            last_switch = rs.get("selection_last_switch_at")
+            cooldown_ok = (
+                last_switch is None or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
+            )
+            should_switch, force_switch, switch_debug = should_switch_to_candidate(
+                cooldown_ok=cooldown_ok,
+                stale_reevals=stale_reevals,
+                stale_switch_force_after_reevals=STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
+                selected_recent_range=selected_recent_range,
+                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
+                selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
+                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                selected_score=float(selected_score),
+                selected_pose_score=selected_pose_score,
+                candidate_score=float(candidate_score),
+                candidate_activity_score=candidate_activity_score,
+                candidate_pose_score=candidate_pose_score,
+                candidate_completed_cycles=candidate_completed_cycles,
+            )
             self._instr_emit(
                 trace_context,
                 {
-                    "event": "joint_reevaluate_snapshot",
+                    "event": "joint_recalibration_snapshot",
                     "selected_angle": selected_angle,
                     "candidate_angle": candidate,
-                    "source": src,
-                    "opposite_angle": opposite_for_re_eval,
-                    "selected_median_variance": selected_var_dbg,
-                    "candidate_median_variance": candidate_var_dbg,
-                    "opposite_median_variance": opposite_var_dbg,
-                    "selected_hist_valid": selected_hist_valid,
-                    "opposite_hist_valid": opposite_hist_valid,
-                    "selected_filtered_angle": tracking_angle_values.get(selected_angle)
-                    if isinstance(selected_angle, str)
-                    else None,
-                    "opposite_filtered_angle": tracking_angle_values.get(opposite_for_re_eval)
-                    if isinstance(opposite_for_re_eval, str)
-                    else None,
-                    "buffer_signature": list(self._buffer_signature(frame_buffer)),
-                    "frame_buffer_len": len(frame_buffer),
-                    "variance_cache_hit_streak": int(
-                        rs.get("debug_variance_cache_hit_streak") or 0
-                    ),
-                    "selected_raw": current_raw,
-                    "selected_raw_stale_reevals": stale_reevals,
-                    "landmarks_obj_id": id(lm),
-                    "raw_landmarks_obj_id": id(raw_landmarks),
+                    "selected_score": selected_score,
+                    "candidate_score": candidate_score,
+                    "switch_debug": switch_debug,
+                    "candidate_selector_debug": candidate_sel_debug,
                 },
             )
-            # endregion
             if (
-                isinstance(selected_angle, str)
-                and (candidate is None or src != "variance")
-                and closed_streak >= 10
-            ):
-                opposite = _opposite_side_angle(selected_angle)
-                if opposite is not None:
-                    opposite_var = float(
-                        (variances.get(opposite) or {}).get("medianWindowVariance") or 0.0
-                    )
-                    opposite_active_windows = int(
-                        (variances.get(opposite) or {}).get("activeWindowCount") or 0
-                    )
-                    fast_switch_ok = opposite_active_windows >= 1 and opposite_var >= max(
-                        8.0, selected_var_dbg * 1.05
-                    )
-                    # region agent log
-                    self._instr_emit(
-                        trace_context,
-                        {
-                            "event": "joint_fast_switch_eval",
-                            "selected_angle": selected_angle,
-                            "opposite_angle": opposite,
-                            "closed_streak": closed_streak,
-                            "selected_median_variance": selected_var_dbg,
-                            "opposite_median_variance": opposite_var,
-                            "opposite_active_windows": opposite_active_windows,
-                            "fast_switch_ok": fast_switch_ok,
-                        },
-                    )
-                    # endregion
-                    if fast_switch_ok:
-                        candidate = opposite
-                        src = "range_gate_fallback"
-                        candidate_var_dbg = opposite_var
-            # region agent log
-            self._instr_emit(
-                trace_context,
-                {
-                    "event": "joint_reevaluate_result",
-                    "selected_angle": selected_angle,
-                    "candidate_angle": candidate,
-                    "source": src,
-                    "selected_median_variance": selected_var_dbg,
-                    "candidate_median_variance": candidate_var_dbg,
-                },
-            )
-            # endregion
-            if (
-                candidate
-                and src in ("variance", "range_gate_fallback", "stale_selected_fallback")
+                isinstance(candidate, str)
+                and candidate in joint_states
                 and candidate != selected_angle
+                and (should_switch or force_switch)
             ):
-                cur_ok = passes_consistent_variance_gate(variances, selected_angle)
-                cand_var = float((variances.get(candidate) or {}).get("medianWindowVariance") or 0.0)
-                cur_var = float((variances.get(selected_angle) or {}).get("medianWindowVariance") or 0.0)
-                stronger = (cur_var <= 0.0 and cand_var > 0.0) or (
-                    cur_var > 0.0 and cand_var >= cur_var * ANGLE_SELECTION_SWITCH_VARIANCE_RATIO
-                )
-                last_switch = rs.get("selection_last_switch_at")
-                cooldown_ok = (
-                    last_switch is None
-                    or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
-                )
-                # region agent log
-                self._instr_emit(
-                    trace_context,
-                    {
-                        "event": "joint_switch_gate_eval",
-                        "selected_angle": selected_angle,
-                        "candidate_angle": candidate,
-                        "cur_ok": cur_ok,
-                        "cand_var": cand_var,
-                        "cur_var": cur_var,
-                        "stronger": stronger,
-                        "cooldown_ok": cooldown_ok,
-                    },
-                )
-                # endregion
-                stale_override = src == "stale_selected_fallback"
-                if cooldown_ok and (stale_override or (not cur_ok) or stronger):
-                    if candidate == pending_angle and pending_detector is not None:
-                        replayed = pending_detector
-                    else:
-                        replayed = _rebuild_detector_from_history(
-                            rs,
-                            candidate,
-                            rs.get("tuning_params") or DEFAULT_TUNING_PARAMS,
-                        )
-                    if replayed is not None:
-                        replayed_shown, replayed_raw = _detector_counts(replayed)
-                        sdba[candidate] = replayed
-                        if candidate != pending_angle:
-                            current_selected_val = (
-                                tracking_angle_values.get(selected_angle)
-                                if isinstance(selected_angle, str)
-                                else None
-                            )
-                            rs["pending_switch_incumbent_shown_start"] = current_shown
-                            rs["pending_switch_incumbent_raw_start"] = current_raw
-                            rs["pending_switch_incumbent_advanced"] = False
-                            rs["pending_switch_observed"] = False
-                            rs["pending_switch_candidate_shown_start"] = replayed_shown
-                            rs["pending_switch_candidate_raw_start"] = replayed_raw
-                            if isinstance(current_selected_val, (int, float)):
-                                val_f = float(current_selected_val)
-                                rs["pending_switch_incumbent_angle_min"] = val_f
-                                rs["pending_switch_incumbent_angle_max"] = val_f
-                            else:
-                                rs["pending_switch_incumbent_angle_min"] = None
-                                rs["pending_switch_incumbent_angle_max"] = None
-                            rs["pending_switch_incumbent_moving"] = False
-                        rs["pending_switch_angle"] = candidate
-                        rs["pending_switch_detector"] = replayed
-                        if _is_detector_calibrated(replayed):
-                            _activate_joint_switch(
-                                rs,
-                                sdba,
-                                new_angle=candidate,
-                                detector=replayed,
-                                cumulative_shown=cumulative_shown,
-                                cumulative_raw=cumulative_raw,
-                                switched_at=now,
-                            )
-                            switched_to = candidate
-                            selected_angle = candidate
-                            cfg = COMMON_ANGLES[candidate]
-                            raw_angle_val = calculate_from_type(
-                                cfg["type"], cfg["landmarks"], raw_landmarks
-                            )
-                            val = tracking_angle_values.get(candidate)
-                            angle_values[candidate] = val
-                            detector_outputs[candidate] = replayed.update(val)
-                            self._sync_detector_instrumentation_flags()
-                    else:
-                        # region agent log
-                        self._instr_emit(
-                            trace_context,
-                            {
-                                "event": "joint_switch_replay_unavailable",
-                                "selected_angle": selected_angle,
-                                "candidate_angle": candidate,
-                            },
-                        )
-                        # endregion
-            else:
-                reason = "no_candidate"
-                if candidate is None:
-                    reason = "candidate_missing"
-                elif src not in ("variance", "range_gate_fallback"):
-                    reason = "non_variance_source"
-                elif candidate == selected_angle:
-                    reason = "candidate_same_as_selected"
-                # region agent log
-                self._instr_emit(
-                    trace_context,
-                    {
-                        "event": "joint_switch_skip",
-                        "selected_angle": selected_angle,
-                        "candidate_angle": candidate,
-                        "source": src,
-                        "reason": reason,
-                    },
-                )
-                # endregion
+                candidate_state = joint_states[candidate]
+                if rs.get("pending_switch_angle") != candidate:
+                    rs["pending_switch_started_at_ms"] = int(ts)
+                    rs["pending_switch_angle"] = candidate
+                    rs["pending_switch_detector"] = candidate_state.detector
+                    rs["pending_switch_incumbent_shown_start"] = current_shown
+                    rs["pending_switch_incumbent_raw_start"] = current_raw
+                    rs["pending_switch_incumbent_advanced"] = False
+                    rs["pending_switch_observed"] = False
+                    rs["pending_switch_incumbent_angle_min"] = tracking_angle_values.get(selected_angle)
+                    rs["pending_switch_incumbent_angle_max"] = tracking_angle_values.get(selected_angle)
+                    rs["pending_switch_incumbent_motion_span_deg"] = 0.0
+                    rs["pending_switch_incumbent_observable_during_pending"] = False
+                    rs["pending_switch_incumbent_completed_gated_cycle_during_pending"] = False
+                    rs["pending_switch_candidate_advanced_during_pending"] = False
+                    rs["pending_switch_candidate_completed_gated_cycle_during_pending"] = False
+                    rs["pending_switch_candidate_pending_rom_estimate_deg"] = float(
+                        candidate_debug.get("recentRange") or 0.0
+                    )
+                    rs["pending_switch_incumbent_pose_score_at_start"] = selected_pose_score
+                    rs["pending_switch_incumbent_completed_cycles_at_start"] = int(
+                        selected_debug.get("completedCycles") or 0
+                    )
+                    rs["pending_switch_incumbent_recent_range_at_start"] = selected_recent_range
+                    rs["pending_switch_incumbent_last_observed_ts_at_start"] = joint_states[
+                        selected_angle
+                    ].last_observed_timestamp_ms if isinstance(selected_angle, str) else None
+                    rs["pending_switch_candidate_completed_cycles_at_start"] = candidate_completed_cycles
+                    rs["pending_switch_candidate_rom_score_at_start"] = float(
+                        candidate_debug.get("romScore") or 0.0
+                    )
+                    candidate_cycles = list(candidate_state.cycle_log)
+                    cycle_before_start = [
+                        entry for entry in candidate_cycles if entry[0] < int(rs["pending_switch_started_at_ms"])
+                    ]
+                    rs["pending_switch_candidate_last_cycle_ts_before_start"] = (
+                        int(cycle_before_start[-1][0]) if cycle_before_start else None
+                    )
+                    cand_shown, cand_raw = _detector_counts(candidate_state.detector)
+                    rs["pending_switch_candidate_carryover_start_shown"] = cand_shown
+                    rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
+                    rs["pending_switch_candidate_carryover_start_ts"] = int(ts)
+                    now_ms = int(ts)
+                    inc_cycles_4s = [
+                        ts_cycle
+                        for ts_cycle, _ in joint_states[selected_angle].cycle_log
+                        if isinstance(selected_angle, str) and ts_cycle >= now_ms - 4000
+                    ] if isinstance(selected_angle, str) else []
+                    cand_cycles_4s = [
+                        ts_cycle for ts_cycle, _ in candidate_state.cycle_log if ts_cycle >= now_ms - 4000
+                    ]
+                    rs["pending_switch_incumbent_cycles_last_4s"] = len(inc_cycles_4s)
+                    rs["pending_switch_candidate_cycles_last_4s"] = len(cand_cycles_4s)
+                    rs["pending_switch_cycle_sync_score_last_4s"] = cycle_sync_score_last_4s(
+                        joint_states[selected_angle], candidate_state, now_ms
+                    ) if isinstance(selected_angle, str) else 0.0
+                    rs["pending_switch_same_joint_family"] = is_same_joint_family(selected_angle, candidate)
+                    rs["pending_switch_mirrored_pair"] = is_mirrored_pair(selected_angle, candidate)
             joint_records = _collect_joint_records(sdba, variances)
 
         angle_value = angle_values.get(selected_angle) if isinstance(selected_angle, str) else None

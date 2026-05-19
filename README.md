@@ -96,6 +96,71 @@ Optional flags: `--no-health-check`, `--benchmark-log FILE`, `--resize-width W`,
 2. **Calibration**: First reps establish peak/valley baselines; the buffer is **replayed** through the same detectors so displayed reps include motion from the selection window. Locking uses `rep.calibration_certainty` and optionally `rep.calibration_force_extra_reps`.
 3. **Tracking**: Counts with margins, range gate, and `rep.min_interval_ms`. Quit with `q` or Escape in the video window.
 
+## Dynamic recalibration internals
+
+This section is the shortest "how it works" map for first-joint selection, confidence math, and runtime handoff to a recalibrated candidate joint.
+
+### 1) First joint selection (variance-window regulator)
+
+- The selector computes per-joint smoothed angle histories and scores each joint with:
+  - `medianWindowVariance` (consistent movement across windows)
+  - `activeWindowCount` (how many windows are truly active)
+  - `smoothedRangeDeg` (effective ROM in degrees)
+- A joint is eligible only when all gates pass:
+  - `activeWindowCount >= angle_selection.min_active_windows`
+  - `medianWindowVariance >= angle_selection.min_variance` (or joint override)
+  - `smoothedRangeDeg >= angle_selection.min_range_deg` (or joint override)
+- The top candidate must also beat runner-up ambiguity using `second_best_ratio` (with a relaxed ratio for across-body runner-ups).
+- Final lock also requires keypoint confidence:
+  - `avg_confidence(selected_joint_landmarks) >= 0.5`
+- During initial selection, rep-dominance can also lock the joint when one joint leads rep share for enough frames (`dominance_fraction`, `dominance_streak_frames`, `min_leading_reps`).
+
+### 2) Math-engine confidence and calibration lock
+
+- The peak detector computes calibration certainty from extrema stability:
+  - `amplitude = avgPeak - avgValley`
+  - `combined_jitter_ratio = (peakStd + valleyStd) / amplitude`
+  - `certainty = clamp(1 - combined_jitter_ratio, 0, 1)`
+- Calibration locks when either condition passes:
+  - `rep_count >= calibration_reps` **and** `certainty >= calibration_certainty`
+  - or force-lock at `rep_count >= calibration_reps + calibration_force_extra_reps`
+- After calibration, rep acceptance is stricter:
+  - Peak/valley must pass margin gates (`peak_margin_pct`, `valley_margin_pct`) relative to calibrated ROM.
+  - Rolling range gate must be open: p95-p5 spread over `range_window_frames` is at least `min_range_gate`.
+  - Fast duplicate reps are blocked by `min_interval_ms`.
+
+### 3) Runtime candidate recalibration and switch
+
+- Reevaluation runs every `angle_selection.reevaluate_every_sec`.
+- Candidate source is usually variance, with two fallback paths:
+  - **stale-selected fallback**: selected joint is stale for repeated reevaluations and opposite side shows consistent variance activity.
+  - **range-gate fallback**: selected joint range gate stays closed and opposite side variance is stronger.
+- Pre-switch gate requires cooldown and strength checks:
+  - `now - last_switch >= angle_selection.switch_min_sec`
+  - Candidate variance must be stronger by `angle_selection.switch_variance_ratio` (unless stale override path applies).
+- Candidate detector is rebuilt by replaying its recent history. If already calibrated, switch is immediate; otherwise candidate becomes pending and is updated until calibration completes.
+
+### 4) Candidate pre-calibrated reps and bend-switch fine tuning
+
+- While a candidate is pending, the session stores both baselines:
+  - incumbent shown/raw counts at pending start
+  - candidate shown/raw counts at pending start
+- On activation, pending candidate reps are added only when all are true:
+  - candidate was observed
+  - incumbent did **not** advance rep count during pending
+  - incumbent did **not** show meaningful motion (`pending_switch_incumbent_moving == False`)
+- "Meaningful motion" is flagged when incumbent angle span during pending reaches:
+  - `PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG` (default `12.0` deg)
+- Stale/bend inactivity forcing variables:
+  - `STALE_SWITCH_MIN_STALE_REEVALS`
+  - `STALE_SWITCH_SELECTED_RECENT_WINDOW`
+  - `STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG`
+  - `STALE_SWITCH_MIN_CLOSED_STREAK`
+  - `STALE_SWITCH_FORCE_AFTER_STALE_REEVALS`
+  - `STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR`
+
+These gates are covered by `tests/test_dynamic_recalibration.py`, including monotonic-count handoff, pending-candidate rep carryover, and stale/range-gate fallback switching.
+
 ## Configuration
 
 **Source of truth:** [`rep_counter.toml`](rep_counter.toml) in the repo root, or the current working directory, or any parent directory. Set `FLEXIBLE_REP_COUNTER_CONFIG` to an absolute path to use a different file.

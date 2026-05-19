@@ -9,10 +9,18 @@ from flexible_rep_counter.core.math_engine import (
 )
 from flexible_rep_counter.core.pose_filters import PoseFilterPipeline
 from flexible_rep_counter.core.settings import get_default_tuning_params
+from flexible_rep_counter.core.recalibration_confidence import (
+    HandoffDecision,
+    JointMotionState,
+    JointRecalibrationScore,
+)
 from flexible_rep_counter.core.variance_angle_selector import COMMON_ANGLES
 
 __all__ = [
     "COMMON_ANGLES",
+    "HandoffDecision",
+    "JointMotionState",
+    "JointRecalibrationScore",
     "PeakDetector",
     "PoseFilterPipeline",
     "calculate_angle",
