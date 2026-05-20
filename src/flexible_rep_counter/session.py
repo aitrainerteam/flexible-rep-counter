@@ -70,6 +70,10 @@ STALE_SWITCH_MIN_CLOSED_STREAK = 10
 STALE_SWITCH_FORCE_AFTER_STALE_REEVALS = 8
 PENDING_SWITCH_MIN_OBSERVATION_MS = 300
 PENDING_SWITCH_MAX_OBSERVATION_MS = 600
+HANDOFF_OBSERVATION_MIN_COMPLETED_CYCLES = 2
+HANDOFF_OBSERVATION_MIN_ACTIVITY_SCORE = 0.45
+HANDOFF_OBSERVATION_MIN_POSE_SCORE = 0.45
+HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE = 0.45
 
 
 def _diagnose_missing_angle(
@@ -244,6 +248,16 @@ def _clear_pending_switch(run_state: dict[str, Any]) -> None:
     run_state["pending_switch_candidate_advanced_during_pending"] = False
     run_state["pending_switch_candidate_completed_gated_cycle_during_pending"] = False
     run_state["pending_switch_candidate_pending_rom_estimate_deg"] = 0.0
+    run_state["pending_switch_forced"] = False
+
+
+def _clear_handoff_observation(run_state: dict[str, Any]) -> None:
+    run_state["handoff_observation_candidate_angle"] = None
+    run_state["handoff_observation_selected_angle"] = None
+    run_state["handoff_observation_started_at_ms"] = None
+    run_state["handoff_observation_candidate_carryover_start_shown"] = 0
+    run_state["handoff_observation_candidate_carryover_start_raw"] = 0
+    run_state["handoff_observation_candidate_carryover_start_ts"] = 0
 
 
 def _valid_history_count(series: Optional[deque]) -> int:
@@ -362,6 +376,8 @@ def _activate_joint_switch(
             run_state.get("pending_switch_candidate_rom_score_at_start") or 0.0
         ),
         "same_joint_family": bool(run_state.get("pending_switch_same_joint_family")),
+        "incumbent_cycles_last_4s": int(run_state.get("pending_switch_incumbent_cycles_last_4s") or 0),
+        "candidate_cycles_last_4s": int(run_state.get("pending_switch_candidate_cycles_last_4s") or 0),
         "cycle_sync_score_last_4s": float(run_state.get("pending_switch_cycle_sync_score_last_4s") or 0.0),
         "mirrored_pair": bool(run_state.get("pending_switch_mirrored_pair")),
         "candidate_advanced_during_pending": bool(
@@ -370,6 +386,11 @@ def _activate_joint_switch(
         "candidate_completed_gated_cycle_during_pending": bool(
             run_state.get("pending_switch_candidate_completed_gated_cycle_during_pending")
         ),
+        "candidate_current_raw": candidate_current_raw,
+        "candidate_carryover_start_raw": int(
+            run_state.get("pending_switch_candidate_carryover_start_raw") or 0
+        ),
+        "switch_forced": bool(run_state.get("pending_switch_forced")),
     }
     decision = classify_handoff(pending_state)
 
@@ -395,11 +416,29 @@ def _activate_joint_switch(
 
     run_state["pending_switch_handoff_kind"] = decision.kind
     run_state["pending_switch_handoff_rationale"] = decision.rationale
+    run_state["pending_switch_handoff_candidate_delta_shown"] = candidate_delta_shown
+    run_state["pending_switch_handoff_candidate_delta_raw"] = candidate_delta_raw
+    run_state["pending_switch_handoff_candidate_current_shown"] = candidate_current_shown
+    run_state["pending_switch_handoff_candidate_current_raw"] = candidate_current_raw
+    run_state["pending_switch_handoff_cumulative_shown_before"] = cumulative_shown
+    run_state["pending_switch_handoff_cumulative_raw_before"] = cumulative_raw
+    run_state["pending_switch_handoff_target_shown"] = target_display_shown
+    run_state["pending_switch_handoff_target_raw"] = target_display_raw
+    run_state["pending_switch_handoff_incumbent_motion_span_deg"] = float(
+        run_state.get("pending_switch_incumbent_motion_span_deg") or 0.0
+    )
+    run_state["pending_switch_handoff_candidate_pending_rom_estimate_deg"] = float(
+        run_state.get("pending_switch_candidate_pending_rom_estimate_deg") or 0.0
+    )
+    run_state["pending_switch_handoff_switch_forced"] = bool(
+        run_state.get("pending_switch_forced")
+    )
     run_state["selected_angle"] = new_angle
     run_state["selected_config"] = COMMON_ANGLES[new_angle]
     run_state["peak_detector"] = detector
     run_state["selection_last_switch_at"] = switched_at
     _clear_pending_switch(run_state)
+    _clear_handoff_observation(run_state)
 
 
 def _collect_joint_records(
@@ -573,6 +612,7 @@ class RepCounterSession:
             },
         }
         _clear_pending_switch(self._run_state)
+        _clear_handoff_observation(self._run_state)
         if self._pose_pipeline is not None:
             self._pose_pipeline = PoseFilterPipeline()
         self._sync_detector_instrumentation_flags()
@@ -604,6 +644,7 @@ class RepCounterSession:
             ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
         }
         self._sync_detector_instrumentation_flags()
+        _clear_handoff_observation(self._run_state)
 
     def clear_tracking_keep_started(self) -> None:
         """Second Start click: clear selection/tracking but keep started=True."""
@@ -634,6 +675,7 @@ class RepCounterSession:
             ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
         }
         self._sync_detector_instrumentation_flags()
+        _clear_handoff_observation(self._run_state)
 
     @property
     def started(self) -> bool:
@@ -866,6 +908,35 @@ class RepCounterSession:
                 "filtered_angle": filtered_angle_value,
                 "deadband_angle": feed_v,
                 "smoothed_angle": smooth_v,
+                "handoff_kind": self._run_state.get("pending_switch_handoff_kind"),
+                "handoff_rationale": self._run_state.get("pending_switch_handoff_rationale"),
+                "handoff_candidate_delta_shown": self._run_state.get(
+                    "pending_switch_handoff_candidate_delta_shown"
+                ),
+                "handoff_candidate_delta_raw": self._run_state.get(
+                    "pending_switch_handoff_candidate_delta_raw"
+                ),
+                "handoff_candidate_current_shown": self._run_state.get(
+                    "pending_switch_handoff_candidate_current_shown"
+                ),
+                "handoff_candidate_current_raw": self._run_state.get(
+                    "pending_switch_handoff_candidate_current_raw"
+                ),
+                "handoff_cumulative_shown_before": self._run_state.get(
+                    "pending_switch_handoff_cumulative_shown_before"
+                ),
+                "handoff_cumulative_raw_before": self._run_state.get(
+                    "pending_switch_handoff_cumulative_raw_before"
+                ),
+                "handoff_target_shown": self._run_state.get("pending_switch_handoff_target_shown"),
+                "handoff_target_raw": self._run_state.get("pending_switch_handoff_target_raw"),
+                "handoff_incumbent_motion_span_deg": self._run_state.get(
+                    "pending_switch_handoff_incumbent_motion_span_deg"
+                ),
+                "handoff_candidate_pending_rom_estimate_deg": self._run_state.get(
+                    "pending_switch_handoff_candidate_pending_rom_estimate_deg"
+                ),
+                "handoff_switch_forced": self._run_state.get("pending_switch_handoff_switch_forced"),
             },
         )
 
@@ -964,8 +1035,10 @@ class RepCounterSession:
         self._sync_detector_instrumentation_flags()
 
         selected_angle = rs["selected_angle"]
-        if selected_angle is not None and rs.get("peak_detector") is None:
-            rs["peak_detector"] = sdba.get(selected_angle)
+        if isinstance(selected_angle, str) and selected_angle in sdba:
+            selected_detector = sdba[selected_angle]
+            if rs.get("peak_detector") is not selected_detector:
+                rs["peak_detector"] = selected_detector
 
         if selected_angle is None:
             selecting_angle_values: dict[str, Optional[float]] = {}
@@ -1347,6 +1420,7 @@ class RepCounterSession:
             selected_pose_score = float(selected_debug.get("poseScore") or 0.0)
             candidate_activity_score = float(candidate_debug.get("activityScore") or 0.0)
             candidate_pose_score = float(candidate_debug.get("poseScore") or 0.0)
+            candidate_observable = bool(candidate_debug.get("observable"))
             candidate_completed_cycles = int(candidate_debug.get("completedCycles") or 0)
             last_switch = rs.get("selection_last_switch_at")
             cooldown_ok = (
@@ -1365,8 +1439,37 @@ class RepCounterSession:
                 candidate_score=float(candidate_score),
                 candidate_activity_score=candidate_activity_score,
                 candidate_pose_score=candidate_pose_score,
+                candidate_observable=candidate_observable,
                 candidate_completed_cycles=candidate_completed_cycles,
             )
+            if (
+                isinstance(selected_angle, str)
+                and isinstance(candidate, str)
+                and candidate in joint_states
+                and candidate != selected_angle
+                and is_mirrored_pair(selected_angle, candidate)
+            ):
+                observation_trigger = (
+                    candidate_completed_cycles >= HANDOFF_OBSERVATION_MIN_COMPLETED_CYCLES
+                    and candidate_activity_score >= HANDOFF_OBSERVATION_MIN_ACTIVITY_SCORE
+                    and candidate_pose_score >= HANDOFF_OBSERVATION_MIN_POSE_SCORE
+                    and (
+                        stale_reevals >= 1
+                        or selected_recent_range < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+                        or selected_pose_score < HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE
+                    )
+                )
+                if observation_trigger:
+                    obs_candidate = rs.get("handoff_observation_candidate_angle")
+                    obs_selected = rs.get("handoff_observation_selected_angle")
+                    if obs_candidate != candidate or obs_selected != selected_angle:
+                        cand_shown, cand_raw = _detector_counts(joint_states[candidate].detector)
+                        rs["handoff_observation_candidate_angle"] = candidate
+                        rs["handoff_observation_selected_angle"] = selected_angle
+                        rs["handoff_observation_started_at_ms"] = int(ts)
+                        rs["handoff_observation_candidate_carryover_start_shown"] = cand_shown
+                        rs["handoff_observation_candidate_carryover_start_raw"] = cand_raw
+                        rs["handoff_observation_candidate_carryover_start_ts"] = int(ts)
             self._instr_emit(
                 trace_context,
                 {
@@ -1404,6 +1507,7 @@ class RepCounterSession:
                     rs["pending_switch_candidate_pending_rom_estimate_deg"] = float(
                         candidate_debug.get("recentRange") or 0.0
                     )
+                    rs["pending_switch_forced"] = bool(force_switch)
                     rs["pending_switch_incumbent_pose_score_at_start"] = selected_pose_score
                     rs["pending_switch_incumbent_completed_cycles_at_start"] = int(
                         selected_debug.get("completedCycles") or 0
@@ -1424,9 +1528,26 @@ class RepCounterSession:
                         int(cycle_before_start[-1][0]) if cycle_before_start else None
                     )
                     cand_shown, cand_raw = _detector_counts(candidate_state.detector)
-                    rs["pending_switch_candidate_carryover_start_shown"] = cand_shown
-                    rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
-                    rs["pending_switch_candidate_carryover_start_ts"] = int(ts)
+                    obs_candidate = rs.get("handoff_observation_candidate_angle")
+                    obs_selected = rs.get("handoff_observation_selected_angle")
+                    obs_shown = rs.get("handoff_observation_candidate_carryover_start_shown")
+                    obs_raw = rs.get("handoff_observation_candidate_carryover_start_raw")
+                    obs_ts = rs.get("handoff_observation_candidate_carryover_start_ts")
+                    if (
+                        obs_candidate == candidate
+                        and obs_selected == selected_angle
+                        and isinstance(obs_shown, int)
+                        and isinstance(obs_raw, int)
+                    ):
+                        rs["pending_switch_candidate_carryover_start_shown"] = obs_shown
+                        rs["pending_switch_candidate_carryover_start_raw"] = obs_raw
+                        rs["pending_switch_candidate_carryover_start_ts"] = (
+                            int(obs_ts) if isinstance(obs_ts, int) else int(ts)
+                        )
+                    else:
+                        rs["pending_switch_candidate_carryover_start_shown"] = cand_shown
+                        rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
+                        rs["pending_switch_candidate_carryover_start_ts"] = int(ts)
                     now_ms = int(ts)
                     inc_cycles_4s = [
                         ts_cycle

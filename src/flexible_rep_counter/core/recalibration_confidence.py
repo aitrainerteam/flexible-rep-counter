@@ -19,6 +19,8 @@ GOOD_RANGE_DEG = 35.0
 MIN_RANGE_DEG = 12.0
 
 UNOBSERVABLE_POSE_SCORE = 0.30
+INCUMBENT_ACTIVE_MOTION_MIN_SPAN_DEG = 18.0
+INCUMBENT_ACTIVE_MOTION_ROM_RATIO = 0.60
 
 CANDIDATE_MIN_SCORE = 0.62
 CANDIDATE_MIN_ACTIVITY = 0.45
@@ -313,6 +315,7 @@ def should_switch_to_candidate(
     candidate_score: float,
     candidate_activity_score: float,
     candidate_pose_score: float,
+    candidate_observable: bool,
     candidate_completed_cycles: int,
 ) -> tuple[bool, bool, dict[str, Any]]:
     incumbent_bad = (
@@ -326,6 +329,7 @@ def should_switch_to_candidate(
         candidate_score >= CANDIDATE_MIN_SCORE
         and candidate_activity_score >= CANDIDATE_MIN_ACTIVITY
         and candidate_pose_score >= CANDIDATE_MIN_POSE_SCORE
+        and candidate_observable
         and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
     )
     candidate_clearly_better = (
@@ -344,6 +348,7 @@ def should_switch_to_candidate(
     return bool(should_switch), bool(force_switch), {
         "incumbentBad": bool(incumbent_bad),
         "candidateGood": bool(candidate_good),
+        "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),
         "shouldSwitch": bool(should_switch),
         "forceSwitch": bool(force_switch),
@@ -385,16 +390,36 @@ def cycle_sync_score_last_4s(
 
 
 def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
+    prior_synchronized_same_exercise = (
+        bool(pending_state.get("same_joint_family"))
+        and int(pending_state.get("incumbent_cycles_last_4s") or 0) >= 2
+        and int(pending_state.get("candidate_cycles_last_4s") or 0) >= 2
+        and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
+    )
+    if prior_synchronized_same_exercise:
+        return HandoffDecision(
+            kind="same_exercise",
+            rationale={"rule": "prior_synchronized_same_exercise"},
+        )
+
     incumbent_motion_span = float(pending_state.get("incumbent_motion_span_deg") or 0.0)
     candidate_pending_rom = float(pending_state.get("candidate_pending_rom_estimate_deg") or 0.0)
+    incumbent_active_motion_threshold = max(
+        INCUMBENT_ACTIVE_MOTION_MIN_SPAN_DEG,
+        INCUMBENT_ACTIVE_MOTION_ROM_RATIO * candidate_pending_rom,
+    )
     if (
         bool(pending_state.get("incumbent_advanced"))
         or bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
-        or incumbent_motion_span >= max(12.0, 0.40 * candidate_pending_rom)
+        or incumbent_motion_span >= incumbent_active_motion_threshold
     ):
         return HandoffDecision(
             kind="same_exercise",
-            rationale={"rule": "incumbent_active_during_pending"},
+            rationale={
+                "rule": "incumbent_active_during_pending",
+                "incumbentMotionSpanDeg": incumbent_motion_span,
+                "incumbentActiveMotionThresholdDeg": incumbent_active_motion_threshold,
+            },
         )
 
     incumbent_last_obs = pending_state.get("incumbent_last_observed_ts_at_start")
@@ -415,6 +440,7 @@ def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
         and float(pending_state.get("candidate_rom_score_at_start") or 0.0) >= 0.50
         and bool(pending_state.get("same_joint_family"))
         and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
+        and int(pending_state.get("candidate_cycles_last_4s") or 0) >= 2
     )
     if incumbent_disappeared and candidate_had_prior_cycles:
         return HandoffDecision(
@@ -427,17 +453,49 @@ def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
         and incumbent_motion_span < 12.0
         and not bool(pending_state.get("incumbent_advanced"))
     )
+    candidate_delta_since_observation_start = max(
+        0,
+        int(pending_state.get("candidate_current_raw") or 0)
+        - int(pending_state.get("candidate_carryover_start_raw") or 0),
+    )
+    forced_mirrored_candidate_ready_at_start = (
+        bool(pending_state.get("switch_forced"))
+        and bool(pending_state.get("mirrored_pair"))
+        and bool(pending_state.get("same_joint_family"))
+        and int(pending_state.get("candidate_completed_cycles_at_start") or 0) >= 2
+        and float(pending_state.get("candidate_rom_score_at_start") or 0.0) >= 0.50
+    )
     if (
-        incumbent_quiet_but_visible
+        bool(pending_state.get("switch_forced"))
         and bool(pending_state.get("mirrored_pair"))
         and (
-            bool(pending_state.get("candidate_advanced_during_pending"))
-            or bool(pending_state.get("candidate_completed_gated_cycle_during_pending"))
+            candidate_delta_since_observation_start >= 1
+            or forced_mirrored_candidate_ready_at_start
         )
+        and not bool(pending_state.get("incumbent_advanced"))
+        and not bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
+        and not prior_synchronized_same_exercise
     ):
         return HandoffDecision(
             kind="alternate_limb",
-            rationale={"rule": "mirrored_quiet_incumbent_candidate_active"},
+            rationale={
+                "rule": "forced_switch_mirrored_candidate_ready_or_delta",
+                "candidateDeltaSinceObservationStart": candidate_delta_since_observation_start,
+                "candidateReadyAtStart": forced_mirrored_candidate_ready_at_start,
+            },
+        )
+    if (
+        incumbent_quiet_but_visible
+        and bool(pending_state.get("mirrored_pair"))
+        and candidate_delta_since_observation_start >= 1
+        and not prior_synchronized_same_exercise
+    ):
+        return HandoffDecision(
+            kind="alternate_limb",
+            rationale={
+                "rule": "mirrored_quiet_incumbent_candidate_delta_since_observation_start",
+                "candidateDeltaSinceObservationStart": candidate_delta_since_observation_start,
+            },
         )
 
     return HandoffDecision(kind="ambiguous", rationale={"rule": "insufficient_or_cross_family_evidence"})

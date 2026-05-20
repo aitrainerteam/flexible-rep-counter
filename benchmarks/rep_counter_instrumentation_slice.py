@@ -64,6 +64,11 @@ def main() -> int:
         help="If set, only lines whose session_id equals this string",
     )
     p.add_argument(
+        "--user-uid",
+        default="",
+        help="If set, only lines whose user_uid equals this string",
+    )
+    p.add_argument(
         "--events",
         default="",
         help="Comma-separated event types to keep (empty = all). "
@@ -74,6 +79,7 @@ def main() -> int:
 
     event_filter = _parse_events(args.events)
     sid = args.session_id.strip()
+    uid = args.user_uid.strip()
     lo = int(args.start)
     hi = int(args.end)
     if hi < lo:
@@ -96,6 +102,8 @@ def main() -> int:
             except json.JSONDecodeError:
                 continue
             if sid and str(obj.get("session_id", "")) != sid:
+                continue
+            if uid and str(obj.get("user_uid", "")) != uid:
                 continue
             ev = str(obj.get("event", ""))
             if event_filter is not None and ev not in event_filter:
