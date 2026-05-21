@@ -398,6 +398,16 @@ def _activate_joint_switch(
     carryover_start_raw = int(run_state.get("pending_switch_candidate_carryover_start_raw") or 0)
     candidate_delta_shown = max(0, candidate_current_shown - carryover_start_shown)
     candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
+    rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
+    if (
+        decision.kind == "alternate_limb"
+        and rationale.get("rule") == "forced_switch_mirrored_candidate_ready_or_delta"
+        and bool(rationale.get("candidateReadyAtStart"))
+    ):
+        # When the mirrored candidate was already ready before pending observation
+        # started, count its full calibrated reps as alternate exercise carryover.
+        candidate_delta_shown = max(0, candidate_current_shown)
+        candidate_delta_raw = max(0, candidate_current_raw)
     if decision.kind == "alternate_limb":
         target_display_shown = cumulative_shown + candidate_delta_shown
         target_display_raw = cumulative_raw + candidate_delta_raw
@@ -517,6 +527,27 @@ def _format_angle_label(angle_key: str) -> str:
     return angle_key.replace("_", " ").title()
 
 
+def _calibration_edge_flags(
+    run_state: dict[str, Any],
+    *,
+    calibration_complete: bool,
+    phase: str,
+) -> tuple[bool, bool]:
+    """One-shot flags for calibration start and lock transitions during tracking."""
+    prev = run_state.get("_prev_calibration_complete")
+    started = False
+    locked = False
+    if phase == "tracking":
+        if prev is not False and not calibration_complete:
+            started = True
+        if prev is False and calibration_complete:
+            locked = True
+        run_state["_prev_calibration_complete"] = calibration_complete
+    else:
+        run_state["_prev_calibration_complete"] = None
+    return started, locked
+
+
 def _opposite_side_angle(angle_key: Optional[str]) -> Optional[str]:
     if not isinstance(angle_key, str):
         return None
@@ -610,6 +641,7 @@ class RepCounterSession:
             "selection_angle_histories": {
                 ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
             },
+            "_prev_calibration_complete": None,
         }
         _clear_pending_switch(self._run_state)
         _clear_handoff_observation(self._run_state)
@@ -648,6 +680,7 @@ class RepCounterSession:
 
     def clear_tracking_keep_started(self) -> None:
         """Second Start click: clear selection/tracking but keep started=True."""
+        self._run_state["_prev_calibration_complete"] = None
         self._run_state["selected_angle"] = None
         self._run_state["selected_config"] = None
         self._run_state["peak_detector"] = None
@@ -825,6 +858,9 @@ class RepCounterSession:
                 "range_gate_open": out.range_gate_open,
                 "rolling_range": out.rolling_range,
                 "calibration_complete": out.calibration_complete,
+                "calibration_started": out.calibration_started,
+                "calibration_locked": out.calibration_locked,
+                "tracked_joint_changed": out.tracked_joint_changed,
                 "calibration_certainty": out.calibration_certainty,
                 "calibration_target_reps": out.calibration_target_reps,
                 "smoothed_angle": out.smoothed_value,
@@ -902,6 +938,9 @@ class RepCounterSession:
                 "range_gate_open": out.range_gate_open,
                 "rolling_range": out.rolling_range,
                 "calibration_complete": out.calibration_complete,
+                "calibration_started": out.calibration_started,
+                "calibration_locked": out.calibration_locked,
+                "tracked_joint_changed": out.tracked_joint_changed,
                 "calibration_certainty": out.calibration_certainty,
                 "calibration_target_reps": out.calibration_target_reps,
                 "raw_angle": raw_angle_value,
@@ -1699,11 +1738,19 @@ class RepCounterSession:
                     f"need at least {need_rg:.0f} deg"
                 )
 
+        calibration_started, calibration_locked = _calibration_edge_flags(
+            rs,
+            calibration_complete=calibration_complete,
+            phase="tracking",
+        )
+
         return StepResult(
             reps=shown_rep_count,
             reps_raw=shown_rep_count_raw,
             tracked_joint=sel_ang if isinstance(sel_ang, str) else None,
             tracked_joint_changed=tracked_joint_changed,
+            calibration_started=calibration_started,
+            calibration_locked=calibration_locked,
             angle_3_point_value=float(angle_value) if angle_value is not None else None,
             target_landmarks=tlm,
             tuning_params=dict(rs["tuning_params"]),

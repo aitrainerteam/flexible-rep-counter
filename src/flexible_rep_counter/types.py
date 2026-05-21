@@ -34,6 +34,10 @@ class StepResult:
     tracking_detail_message: str
     # True only on frames where the tracked joint changes during dynamic reevaluation.
     tracked_joint_changed: bool = False
+    # True only on the frame when calibration begins for the active peak detector.
+    calibration_started: bool = False
+    # True only on the frame when calibration locks (calibration_complete becomes true).
+    calibration_locked: bool = False
 
     leader_key: Optional[str] = None
     selection_debug: dict[str, Any] = field(default_factory=dict)
