@@ -100,3 +100,14 @@ min_range_deg = 15
 [angle_selection.joints.RIGHT_HIP]
 min_variance = 6
 min_range_deg = 15
+
+[low_fps_safe_mode]
+enabled = true
+enter_p50_ms = 75.0
+enter_p90_ms = 200.0
+exit_p50_ms = 67.0
+exit_p90_ms = 100.0
+enter_streak_frames = 6
+exit_streak_frames = 10
+interval_window_frames = 12
+min_samples = 8

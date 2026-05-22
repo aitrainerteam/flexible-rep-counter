@@ -172,6 +172,22 @@ ANGLE_SELECTION_SECOND_BEST_RATIO = _toml_float("angle_selection", "second_best_
 ANGLE_SELECTION_MIN_ACTIVE_WINDOWS = _toml_int("angle_selection", "min_active_windows", default=3)
 ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", default=5)
 
+LOW_FPS_SAFE_MODE_ENABLED = bool(_toml_val("low_fps_safe_mode", "enabled") is not False)
+LOW_FPS_INTERVAL_WINDOW_FRAMES = _toml_int(
+    "low_fps_safe_mode", "interval_window_frames", default=12
+)
+LOW_FPS_MIN_SAMPLES = _toml_int("low_fps_safe_mode", "min_samples", default=8)
+LOW_FPS_ENTER_P50_MS = _toml_float("low_fps_safe_mode", "enter_p50_ms", default=75.0)
+LOW_FPS_ENTER_P90_MS = _toml_float("low_fps_safe_mode", "enter_p90_ms", default=200.0)
+LOW_FPS_EXIT_P50_MS = _toml_float("low_fps_safe_mode", "exit_p50_ms", default=67.0)
+LOW_FPS_EXIT_P90_MS = _toml_float("low_fps_safe_mode", "exit_p90_ms", default=100.0)
+LOW_FPS_ENTER_STREAK_FRAMES = _toml_int(
+    "low_fps_safe_mode", "enter_streak_frames", default=6
+)
+LOW_FPS_EXIT_STREAK_FRAMES = _toml_int(
+    "low_fps_safe_mode", "exit_streak_frames", default=10
+)
+
 
 def get_angle_selection_joint_thresholds(angle_key: str) -> dict[str, float]:
     """Per-joint gates from ``[angle_selection.joints.<KEY>]``, else ``[angle_selection]`` globals."""

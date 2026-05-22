@@ -38,6 +38,13 @@ class StepResult:
     calibration_started: bool = False
     # True only on the frame when calibration locks (calibration_complete becomes true).
     calibration_locked: bool = False
+    # Approximate effective processing rate derived from median inter-frame interval.
+    effective_fps: Optional[float] = None
+    frame_interval_p50_ms: Optional[float] = None
+    frame_interval_p90_ms: Optional[float] = None
+    low_fps_safe_mode_active: bool = False
+    # One-frame pulse when low-FPS safe mode toggles.
+    low_fps_safe_mode_changed: bool = False
 
     leader_key: Optional[str] = None
     selection_debug: dict[str, Any] = field(default_factory=dict)

@@ -9,7 +9,7 @@ AI-powered fitness rep counter using computer vision pose estimation. It analyze
 - **Runtime timing HUD**: Bottom-right panel shows VM timings (`roundtrip/upload/encode/inference`) plus local CPU stage timings from the rep engine (`session`, `detector`, `variance`) so you can watch jitter spikes in real time.
 - **Concurrency**: Main thread runs capture, overlay, and angle math; one background **worker thread** sends the latest frame to the VM (queue size 1) so slow network does not block the UI loop.
 - **Angle selection**: [`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py) scores per-joint angle variance over a buffer; the main loop also tracks **rep dominance** across joints (which angle’s peak detector counts the most reps) and can lock the leader after a streak. If dominance stays ambiguous, after `angle_selection.variance_fallback_sec` (in `rep_counter.toml`) the session may lock using pure **variance** selection when the retry window allows.
-- **Tracking**: **One joint only** (one `COMMON_ANGLES` key, e.g. `LEFT_ELBOW` or `RIGHT_KNEE`). The opposite limb is not tracked and does not contribute to the count.
+- **Tracking**: The session continuously updates motion state for **all candidate joints** so handoff confidence can compare limbs safely. The user-facing count is still emitted from one active tracked joint at a time.
 - **Rep counting**: `PeakDetector` in [`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py)—hysteresis, peak/valley margins after calibration, rolling range gate, **retroactive replay** of the observation buffer through the detector, and certainty-based locking.
 - **Importable package**: Core logic lives under [`src/flexible_rep_counter/`](src/flexible_rep_counter/). OpenCV UI is in [`visualizer/opencv_runtime.py`](visualizer/opencv_runtime.py) (repo-only; run via [`main.py`](main.py)).
 - **Docs**: See [`ARCHITECTURE.md`](ARCHITECTURE.md) for full pipeline, call order, and math/selection details.
@@ -132,34 +132,26 @@ This section is the shortest "how it works" map for first-joint selection, confi
 ### 3) Runtime candidate recalibration and switch
 
 - Reevaluation runs every `angle_selection.reevaluate_every_sec`.
-- Candidate source is usually variance, with two fallback paths:
-  - **stale-selected fallback**: selected joint is stale for repeated reevaluations and opposite side shows consistent variance activity.
-  - **range-gate fallback**: selected joint range gate stays closed and opposite side variance is stronger.
-- Pre-switch gate requires cooldown and strength checks:
-  - `now - last_switch >= angle_selection.switch_min_sec`
-  - Candidate variance must be stronger by `angle_selection.switch_variance_ratio` (unless stale override path applies).
-- Candidate detector is rebuilt by replaying its recent history. If already calibrated, switch is immediate; otherwise candidate becomes pending and is updated until calibration completes.
+- Candidate selection is confidence-first:
+  - `select_recalibration_candidate(...)` proposes the strongest alternate joint from per-joint motion state.
+  - `compute_joint_recalibration_score(...)` computes cycle activity, ROM, pose quality, and readiness for each joint.
+  - `should_switch_to_candidate(...)` applies cooldown + delta thresholds to decide switch eligibility.
+- If a candidate is calibrated, switch is immediate; otherwise the candidate enters a pending observation window and keeps updating until lock or timeout.
 
-### 4) Candidate pre-calibrated reps and bend-switch fine tuning
+### 4) Handoff classification and carryover logic
 
-- While a candidate is pending, the session stores both baselines:
-  - incumbent shown/raw counts at pending start
-  - candidate shown/raw counts at pending start
-- On activation, pending candidate reps are added only when all are true:
-  - candidate was observed
-  - incumbent did **not** advance rep count during pending
-  - incumbent did **not** show meaningful motion (`pending_switch_incumbent_moving == False`)
-- "Meaningful motion" is flagged when incumbent angle span during pending reaches:
-  - `PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG` (default `12.0` deg)
-- Stale/bend inactivity forcing variables:
-  - `STALE_SWITCH_MIN_STALE_REEVALS`
-  - `STALE_SWITCH_SELECTED_RECENT_WINDOW`
-  - `STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG`
-  - `STALE_SWITCH_MIN_CLOSED_STREAK`
-  - `STALE_SWITCH_FORCE_AFTER_STALE_REEVALS`
-  - `STALE_SWITCH_FORCE_MIN_OPPOSITE_VAR`
+- On pending activation, the session classifies handoff semantics with `classify_handoff(...)`:
+  - `same_exercise` keeps monotonic display counts.
+  - `alternate_limb` allows candidate carryover when pending evidence supports independent limb work.
+  - `ambiguous` defaults to conservative carryover.
+- During pending observation the session tracks:
+  - incumbent and candidate completed cycles,
+  - motion span and pose visibility,
+  - cycle-sync score over the recent 4s window,
+  - mirrored-pair / same-joint-family relationship.
+- Low-FPS safe mode can downgrade aggressive alternate-limb carryover when capture quality is unstable.
 
-These gates are covered by `tests/test_dynamic_recalibration.py`, including monotonic-count handoff, pending-candidate rep carryover, and stale/range-gate fallback switching.
+These gates are covered by `tests/test_dynamic_recalibration.py` and `tests/test_low_fps_safe_mode.py`, including monotonic-count handoff, candidate carryover constraints, and low-FPS safeguards.
 
 ## Configuration
 
@@ -175,6 +167,7 @@ Sections:
 | `[rep]` | Peak detector tuning: hysteresis, margins, calibration, `min_interval_ms`, etc. |
 | `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds |
 | `[angle_selection.joints.<NAME>]` | Per-joint overrides (e.g. `LEFT_ELBOW`) for `min_variance`, `min_range_deg`, `second_best_ratio` |
+| `[low_fps_safe_mode]` | Frame-interval thresholds and hysteresis to enable/disable low-FPS-safe handoff behavior |
 
 The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars. Response validation for `/predict` is on by default in code; use `--no-validate-response` to disable.
 

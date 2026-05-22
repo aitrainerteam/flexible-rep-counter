@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import math
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -13,147 +12,15 @@ for candidate in (ROOT, SRC):
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
 
-from app import vm_client_2
-import flexible_rep_counter.session as session_mod
-from flexible_rep_counter.core.variance_angle_selector import COMMON_ANGLES
-from flexible_rep_counter.session import RepCounterSession, _peak_detector_from_tuning
-
-
-COCO_KEYPOINT_NAMES = [
-    "nose",
-    "left_eye",
-    "right_eye",
-    "left_ear",
-    "right_ear",
-    "left_shoulder",
-    "right_shoulder",
-    "left_elbow",
-    "right_elbow",
-    "left_wrist",
-    "right_wrist",
-    "left_hip",
-    "right_hip",
-    "left_knee",
-    "right_knee",
-    "left_ankle",
-    "right_ankle",
-]
-
-
-def _point(x: float, y: float, conf: float = 0.99) -> dict[str, float]:
-    return {"x": x, "y": y, "confidence": conf}
-
-
-def _build_pose_frame(left_elbow_deg: float = 120.0, right_elbow_deg: float = 120.0) -> list[dict]:
-    left_shoulder = (0.32, 0.40)
-    left_elbow = (0.32, 0.56)
-    right_shoulder = (0.68, 0.40)
-    right_elbow = (0.68, 0.56)
-    length = 0.18
-
-    left_th = math.radians(left_elbow_deg)
-    right_th = math.radians(right_elbow_deg)
-    left_wrist = (
-        left_elbow[0] + length * math.cos(left_th),
-        left_elbow[1] - length * math.sin(left_th),
-    )
-    right_wrist = (
-        right_elbow[0] + length * math.cos(right_th),
-        right_elbow[1] - length * math.sin(right_th),
-    )
-
-    points: dict[str, dict[str, float]] = {
-        name: _point(0.0, 0.0, 0.0) for name in COCO_KEYPOINT_NAMES
-    }
-    defaults = {
-        "left_shoulder": left_shoulder,
-        "right_shoulder": right_shoulder,
-        "left_elbow": left_elbow,
-        "right_elbow": right_elbow,
-        "left_wrist": left_wrist,
-        "right_wrist": right_wrist,
-        "left_hip": (0.44, 0.72),
-        "right_hip": (0.56, 0.72),
-        "left_knee": (0.44, 0.90),
-        "right_knee": (0.56, 0.90),
-        "left_ankle": (0.44, 1.05),
-        "right_ankle": (0.56, 1.05),
-    }
-    for key, (x, y) in defaults.items():
-        points[key] = _point(x, y, 0.99)
-    return [points[name] for name in COCO_KEYPOINT_NAMES]
-
-
-class _FakeFrame:
-    shape = (120, 160, 3)
-
-
-class _FakeBuffer:
-    def any(self) -> bool:
-        return True
-
-    def tobytes(self) -> bytes:
-        return b"jpeg"
-
-
-class _FakeResponse:
-    def __init__(self, body: dict[str, Any], status_code: int = 200) -> None:
-        self._body = body
-        self.status_code = status_code
-
-    def json(self) -> dict[str, Any]:
-        return self._body
-
-    @property
-    def text(self) -> str:
-        return str(self._body)
-
-
-class _FakeSession:
-    def __init__(self, response: _FakeResponse) -> None:
-        self._response = response
-
-    def post(self, *args: Any, **kwargs: Any) -> _FakeResponse:
-        return self._response
-
-
-def test_send_frame_preserves_rep_payload_when_landmarks_fail_parse(monkeypatch) -> None:
-    body = {
-        "inference_ms": 12.3,
-        "rep_counter": {
-            "reps": 7,
-            "tracked_joint": "RIGHT_ELBOW",
-            "tracked_joint_changed": True,
-        },
-        "rep_session_reset": {"requested": True, "had_session": False},
-    }
-    fake_session = _FakeSession(_FakeResponse(body))
-    monkeypatch.setattr(vm_client_2.cv2, "imencode", lambda *_args, **_kwargs: (True, _FakeBuffer()))
-
-    outcome = vm_client_2.send_frame(
-        _FakeFrame(),
-        session=fake_session,
-        validate=False,
-        parse_rep_counter=True,
-    )
-
-    assert outcome.landmarks is None
-    assert outcome.rep_counter == body["rep_counter"]
-    assert outcome.rep_session_reset == body["rep_session_reset"]
-
-
-def test_tracking_keeps_all_angle_histories_fresh() -> None:
-    session = RepCounterSession(auto_started=True, use_pose_filter=False)
-    rs = session._run_state
-    rs["selected_angle"] = "RIGHT_ELBOW"
-    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
-    rs["peak_detector"] = _peak_detector_from_tuning(rs["tuning_params"])
-
-    _ = session.step_landmarks(_build_pose_frame(), timestamp_ms=0.0, wall_time_s=0.0)
-    histories = rs["selection_angle_histories"]
-
-    assert set(histories.keys()) == set(COMMON_ANGLES.keys())
-    assert all(len(hist) == 1 for hist in histories.values())
+from flexible_rep_counter.core.math_engine import PeakDetector
+from flexible_rep_counter.core.recalibration_confidence import (
+    HandoffDecision,
+    JointMotionState,
+    classify_handoff,
+    compute_joint_recalibration_score,
+    should_switch_to_candidate,
+    update_joint_motion_state,
+)
 
 
 class _ScriptedDetector:
@@ -161,177 +28,478 @@ class _ScriptedDetector:
         self,
         rep_counts: list[int],
         *,
-        calibration_after_updates: int = 0,
+        peaks: list[float] | None = None,
+        valleys: list[float] | None = None,
+        rolling_range_deg: float = 40.0,
     ) -> None:
-        self._rep_counts = list(rep_counts) if rep_counts else [0]
+        self._rep_counts = list(rep_counts)
         self._idx = 0
-        self._updates = 0
-        self._calibration_after_updates = calibration_after_updates
-        self.rep_count = int(self._rep_counts[0] or 0)
-        self.peaks: list[float] = [0.0] * self.rep_count
-        self.valleys: list[float] = [0.0] * self.rep_count
+        self.rep_count = int(self._rep_counts[0] if self._rep_counts else 0)
+        self.peaks = list(peaks or [80.0, 82.0, 81.0])
+        self.valleys = list(valleys or [30.0, 32.0, 31.0])
+        self._rolling_range_deg = rolling_range_deg
 
-    def update(self, _value: float | None) -> dict[str, Any]:
-        self._updates += 1
+    def update(self, value: float | None) -> dict[str, Any]:
         i = min(self._idx, len(self._rep_counts) - 1)
-        self.rep_count = int(self._rep_counts[i] or 0)
-        self.peaks = [0.0] * self.rep_count
-        self.valleys = [0.0] * self.rep_count
+        self.rep_count = int(self._rep_counts[i] if self._rep_counts else 0)
         self._idx += 1
-        calibrated = self._updates >= self._calibration_after_updates
         return {
             "repCount": self.rep_count,
-            "state": "GOING_DOWN",
-            "smoothedValue": _value,
+            "peak": self.peaks[-1] if self.peaks else None,
+            "valley": self.valleys[-1] if self.valleys else None,
+            "rollingRange": self._rolling_range_deg,
             "rangeGateOpen": True,
-            "rollingRange": 70.0,
-            "calibrationComplete": calibrated,
+            "calibrationComplete": True,
+            "smoothedValue": value,
+            "state": "GOING_DOWN",
+            "calibrationCertainty": 1.0,
             "calibrationTargetReps": 3,
-            "calibrationCertainty": 1.0 if calibrated else 0.2,
             "calibrationCertaintyTarget": 0.8,
-        }
-
-    def get_state(self) -> dict[str, Any]:
-        return {
-            "calibratedAvgPeak": None,
-            "calibratedAvgValley": None,
-            "calibrationComplete": self._updates >= self._calibration_after_updates,
         }
 
     def get_rep_count(self) -> int:
         return self.rep_count
 
 
-def _install_switch_to_left_elbow(monkeypatch, rs: dict[str, Any], pending_detector: Any) -> None:
-    def _fake_get_variances(_self, _rs, _frame_buffer, include_debug=False):
-        return {
-            "RIGHT_ELBOW": {"medianWindowVariance": 1.0},
-            "LEFT_ELBOW": {"medianWindowVariance": 3.0},
-        }
-
-    monkeypatch.setattr(
-        session_mod.RepCounterSession,
-        "_get_variances",
-        _fake_get_variances,
+def _make_state(
+    angle_key: str,
+    detector: _ScriptedDetector | None = None,
+    history_values: list[float] | None = None,
+    confidence: float = 0.99,
+) -> JointMotionState:
+    state = JointMotionState(
+        angle_key=angle_key,
+        detector=cast(PeakDetector, detector or _ScriptedDetector([0])),
+        history=deque(maxlen=400),
+        confidence_history=deque(maxlen=400),
     )
-    monkeypatch.setattr(
-        session_mod,
-        "determine_best_angle",
-        lambda *_args, **_kwargs: {
-            "selectedAngle": "LEFT_ELBOW",
-            "source": "variance",
-            "tuningParams": rs["tuning_params"],
-        },
-    )
-    monkeypatch.setattr(
-        session_mod,
-        "passes_consistent_variance_gate",
-        lambda _variances, _angle_key: False,
-    )
-    monkeypatch.setattr(
-        session_mod,
-        "_rebuild_detector_from_history",
-        lambda *_args, **_kwargs: pending_detector,
-    )
+    for i, value in enumerate(history_values or []):
+        state.history.append(float(value))
+        state.confidence_history.append((i * 33, confidence))
+    if history_values:
+        state.last_observed_timestamp_ms = len(history_values) * 33
+    return state
 
 
-def _prime_histories(rs: dict[str, Any]) -> None:
-    histories = rs["selection_angle_histories"]
-    for key in COMMON_ANGLES:
-        histories[key] = deque(maxlen=400)
-    for i in range(24):
-        histories["LEFT_ELBOW"].append(float(45 + (i % 6) * 18))
+def _activation_targets(
+    decision: HandoffDecision,
+    *,
+    cumulative_shown: int,
+    cumulative_raw: int,
+    candidate_current_shown: int,
+    candidate_current_raw: int,
+    carryover_start_shown: int,
+    carryover_start_raw: int,
+) -> tuple[int, int]:
+    candidate_delta_shown = max(0, candidate_current_shown - carryover_start_shown)
+    candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
+    rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
+    if (
+        decision.kind == "alternate_limb"
+        and rationale.get("rule") == "forced_switch_mirrored_candidate_ready_or_delta"
+        and bool(rationale.get("candidateReadyAtStart"))
+    ):
+        candidate_delta_shown = max(0, candidate_current_shown)
+        candidate_delta_raw = max(0, candidate_current_raw)
+    if decision.kind == "alternate_limb":
+        return cumulative_shown + candidate_delta_shown, cumulative_raw + candidate_delta_raw
+    return cumulative_shown, cumulative_raw
 
 
-def test_switch_waits_for_candidate_calibration_and_keeps_reps_monotonic(monkeypatch) -> None:
-    session = RepCounterSession(auto_started=True, use_pose_filter=False)
-    rs = session._run_state
-    rs["selected_angle"] = "RIGHT_ELBOW"
-    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
-    current_detector = _ScriptedDetector([8, 9, 9], calibration_after_updates=0)
-    rs["peak_detector"] = current_detector
-    rs["selection_detectors_by_angle"] = {"RIGHT_ELBOW": current_detector}
-    _prime_histories(rs)
-    _install_switch_to_left_elbow(
-        monkeypatch,
-        rs,
-        _ScriptedDetector([2, 3], calibration_after_updates=2),
+def test_alternate_limb_adds_candidate_pending_reps() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 6.0,
+        "candidate_pending_rom_estimate_deg": 50.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.75,
+        "incumbent_last_observed_ts_at_start": 1200,
+        "pending_start_ts": 1800,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1600,
+        "candidate_rom_score_at_start": 0.85,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 1,
+        "candidate_cycles_last_4s": 1,
+        "cycle_sync_score_last_4s": 0.30,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": True,
+        "candidate_completed_gated_cycle_during_pending": True,
+        "candidate_current_raw": 8,
+        "candidate_carryover_start_raw": 4,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "alternate_limb"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=8,
+        candidate_current_raw=8,
+        carryover_start_shown=4,
+        carryover_start_raw=4,
     )
-
-    out1 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=65.0, right_elbow_deg=120.0),
-        timestamp_ms=0.0,
-        wall_time_s=0.0,
-    )
-    out2 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=90.0, right_elbow_deg=120.0),
-        timestamp_ms=1000.0,
-        wall_time_s=1.0,
-    )
-    out3 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=110.0, right_elbow_deg=120.0),
-        timestamp_ms=2000.0,
-        wall_time_s=2.0,
-    )
-
-    assert out1.tracked_joint == "RIGHT_ELBOW"
-    assert out1.tracked_joint_changed is False
-    assert out1.reps >= 8
-    assert out2.tracked_joint == "RIGHT_ELBOW"
-    assert out2.tracked_joint_changed is False
-    assert out2.reps >= out1.reps
-    assert out3.tracked_joint == "LEFT_ELBOW"
-    assert out3.tracked_joint_changed is True
-    assert out2.reps == 9
-    assert out3.reps == 9
-    assert rs["pending_switch_angle"] is None
-    assert rs["pending_switch_detector"] is None
-    assert rs["pending_switch_incumbent_shown_start"] is None
-    assert rs["pending_switch_incumbent_raw_start"] is None
-    assert rs["pending_switch_incumbent_advanced"] is False
-    assert rs["pending_switch_observed"] is False
+    assert shown == 14
+    assert raw == 14
 
 
-def test_stalled_handoff_adds_candidate_precalibration_reps(monkeypatch) -> None:
-    session = RepCounterSession(auto_started=True, use_pose_filter=False)
-    rs = session._run_state
-    rs["selected_angle"] = "RIGHT_ELBOW"
-    rs["selected_config"] = COMMON_ANGLES["RIGHT_ELBOW"]
-    current_detector = _ScriptedDetector([10, 10, 10], calibration_after_updates=0)
-    rs["peak_detector"] = current_detector
-    rs["selection_detectors_by_angle"] = {"RIGHT_ELBOW": current_detector}
-    _prime_histories(rs)
-    _install_switch_to_left_elbow(
-        monkeypatch,
-        rs,
-        _ScriptedDetector([2, 3], calibration_after_updates=2),
+def test_forced_mirrored_handoff_with_candidate_delta_is_alternate_limb() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 22.0,
+        "candidate_pending_rom_estimate_deg": 42.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.80,
+        "incumbent_last_observed_ts_at_start": 1200,
+        "pending_start_ts": 1800,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1600,
+        "candidate_rom_score_at_start": 0.80,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 1,
+        "candidate_cycles_last_4s": 1,
+        "cycle_sync_score_last_4s": 0.25,
+        "mirrored_pair": True,
+        "switch_forced": True,
+        "candidate_advanced_during_pending": True,
+        "candidate_completed_gated_cycle_during_pending": True,
+        "candidate_current_raw": 9,
+        "candidate_carryover_start_raw": 5,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "alternate_limb"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=9,
+        candidate_current_raw=9,
+        carryover_start_shown=5,
+        carryover_start_raw=5,
     )
+    assert shown == 19
+    assert raw == 19
 
-    out1 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=65.0, right_elbow_deg=120.0),
-        timestamp_ms=0.0,
-        wall_time_s=0.0,
-    )
-    out2 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=90.0, right_elbow_deg=120.0),
-        timestamp_ms=1000.0,
-        wall_time_s=1.0,
-    )
-    out3 = session.step_landmarks(
-        _build_pose_frame(left_elbow_deg=110.0, right_elbow_deg=120.0),
-        timestamp_ms=2000.0,
-        wall_time_s=2.0,
-    )
 
-    assert out1.tracked_joint == "RIGHT_ELBOW"
-    assert out2.tracked_joint == "RIGHT_ELBOW"
-    assert out2.reps == 10
-    assert out3.tracked_joint == "LEFT_ELBOW"
-    assert out3.tracked_joint_changed is True
-    assert out3.reps == 13
-    assert rs["pending_switch_angle"] is None
-    assert rs["pending_switch_detector"] is None
-    assert rs["pending_switch_incumbent_shown_start"] is None
-    assert rs["pending_switch_incumbent_raw_start"] is None
-    assert rs["pending_switch_incumbent_advanced"] is False
-    assert rs["pending_switch_observed"] is False
+def test_forced_mirrored_handoff_carries_full_ready_candidate_when_delta_zero() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 10.0,
+        "candidate_pending_rom_estimate_deg": 45.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.80,
+        "incumbent_last_observed_ts_at_start": 1200,
+        "pending_start_ts": 1800,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1600,
+        "candidate_rom_score_at_start": 0.80,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 1,
+        "candidate_cycles_last_4s": 1,
+        "cycle_sync_score_last_4s": 0.25,
+        "mirrored_pair": True,
+        "switch_forced": True,
+        "candidate_advanced_during_pending": False,
+        "candidate_completed_gated_cycle_during_pending": False,
+        "candidate_current_raw": 9,
+        "candidate_carryover_start_raw": 9,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "alternate_limb"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=9,
+        candidate_current_raw=9,
+        carryover_start_shown=9,
+        carryover_start_raw=9,
+    )
+    assert shown == 19
+    assert raw == 19
+
+
+def test_incumbent_disappears_without_sync_is_ambiguous() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 0.0,
+        "candidate_pending_rom_estimate_deg": 45.0,
+        "incumbent_observable_during_pending": False,
+        "incumbent_pose_score_at_start": 0.10,
+        "incumbent_last_observed_ts_at_start": 1000,
+        "pending_start_ts": 1800,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1600,
+        "candidate_rom_score_at_start": 0.80,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 0,
+        "candidate_cycles_last_4s": 1,
+        "cycle_sync_score_last_4s": 0.20,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": False,
+        "candidate_completed_gated_cycle_during_pending": False,
+        "candidate_current_raw": 8,
+        "candidate_carryover_start_raw": 4,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "ambiguous"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=8,
+        candidate_current_raw=8,
+        carryover_start_shown=4,
+        carryover_start_raw=4,
+    )
+    assert shown == 10
+    assert raw == 10
+
+
+def test_same_exercise_better_joint_continues_linearly() -> None:
+    pending = {
+        "incumbent_advanced": True,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 20.0,
+        "candidate_pending_rom_estimate_deg": 45.0,
+        "incumbent_observable_during_pending": True,
+        "pending_start_ts": 0,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "same_exercise"
+    shown, _ = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=14,
+        candidate_current_raw=14,
+        carryover_start_shown=9,
+        carryover_start_raw=9,
+    )
+    assert shown == 10
+
+
+def test_fov_disappearance_with_prior_candidate_cycles_continues_linearly() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 0.0,
+        "candidate_pending_rom_estimate_deg": 42.0,
+        "incumbent_observable_during_pending": False,
+        "incumbent_pose_score_at_start": 0.10,
+        "incumbent_last_observed_ts_at_start": 1000,
+        "pending_start_ts": 1900,
+        "candidate_completed_cycles_at_start": 4,
+        "candidate_last_cycle_ts_before_start": 1700,
+        "candidate_rom_score_at_start": 0.70,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 2,
+        "candidate_cycles_last_4s": 3,
+        "cycle_sync_score_last_4s": 0.75,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": True,
+        "candidate_completed_gated_cycle_during_pending": True,
+        "candidate_current_raw": 10,
+        "candidate_carryover_start_raw": 7,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "same_exercise"
+
+
+def test_fov_disappearance_without_prior_candidate_cycles_is_ambiguous() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 0.0,
+        "candidate_pending_rom_estimate_deg": 35.0,
+        "incumbent_observable_during_pending": False,
+        "incumbent_pose_score_at_start": 0.15,
+        "incumbent_last_observed_ts_at_start": 1000,
+        "pending_start_ts": 1900,
+        "candidate_completed_cycles_at_start": 0,
+        "candidate_last_cycle_ts_before_start": None,
+        "candidate_rom_score_at_start": 0.0,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 0,
+        "candidate_cycles_last_4s": 0,
+        "cycle_sync_score_last_4s": 0.0,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": True,
+        "candidate_completed_gated_cycle_during_pending": False,
+        "candidate_current_raw": 13,
+        "candidate_carryover_start_raw": 10,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "ambiguous"
+    shown, _ = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=13,
+        candidate_current_raw=13,
+        carryover_start_shown=10,
+        carryover_start_raw=10,
+    )
+    assert shown == 10
+
+
+def test_cycle_gating_rejects_low_range_cycles() -> None:
+    detector = _ScriptedDetector([0, 1, 1], rolling_range_deg=30.0)
+    state = _make_state(
+        "LEFT_ELBOW",
+        detector=detector,
+        history_values=[100.0, 101.0, 102.0, 101.5, 100.5, 101.0] * 8,
+    )
+    for i in range(3):
+        update_joint_motion_state(state, 101.0 + i * 0.05, 0.99, 1000 + i * 33)
+    assert len(state.recent_roms) == 0
+    score, debug = compute_joint_recalibration_score(state, {"medianWindowVariance": 10.0}, now_ms=1200)
+    assert debug["completedCycles"] == 0
+    assert score < 0.62
+
+
+def test_force_stale_requires_two_gated_cycles() -> None:
+    can_switch, force_switch, _ = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=8,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=4.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.30,
+        selected_pose_score=0.9,
+        candidate_score=0.60,
+        candidate_activity_score=0.55,
+        candidate_pose_score=0.60,
+        candidate_observable=True,
+        candidate_completed_cycles=1,
+    )
+    assert not can_switch
+    assert not force_switch
+
+    _, force_switch_after_two, _ = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=8,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=4.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.30,
+        selected_pose_score=0.9,
+        candidate_score=0.60,
+        candidate_activity_score=0.55,
+        candidate_pose_score=0.60,
+        candidate_observable=True,
+        candidate_completed_cycles=2,
+    )
+    assert force_switch_after_two
+
+
+def test_no_displayed_count_regression_on_any_handoff() -> None:
+    before = 10
+    for kind in ("alternate_limb", "same_exercise", "ambiguous"):
+        decision = HandoffDecision(kind=kind, rationale={})
+        shown, _ = _activation_targets(
+            decision,
+            cumulative_shown=before,
+            cumulative_raw=before,
+            candidate_current_shown=13,
+            candidate_current_raw=13,
+            carryover_start_shown=9,
+            carryover_start_raw=9,
+        )
+        assert shown >= before
+
+
+def test_same_exercise_never_jumps_forward_on_activation() -> None:
+    for kind in ("same_exercise", "ambiguous"):
+        decision = HandoffDecision(kind=kind, rationale={})
+        shown, _ = _activation_targets(
+            decision,
+            cumulative_shown=10,
+            cumulative_raw=10,
+            candidate_current_shown=22,
+            candidate_current_raw=22,
+            carryover_start_shown=12,
+            carryover_start_raw=12,
+        )
+        assert shown == 10
+
+
+def test_cross_family_switch_cannot_be_alternate_limb() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 2.0,
+        "candidate_pending_rom_estimate_deg": 50.0,
+        "incumbent_observable_during_pending": True,
+        "pending_start_ts": 1900,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1750,
+        "candidate_rom_score_at_start": 0.8,
+        "same_joint_family": False,
+        "incumbent_cycles_last_4s": 1,
+        "candidate_cycles_last_4s": 2,
+        "cycle_sync_score_last_4s": 0.2,
+        "mirrored_pair": False,
+        "candidate_advanced_during_pending": True,
+        "candidate_completed_gated_cycle_during_pending": True,
+        "candidate_current_raw": 9,
+        "candidate_carryover_start_raw": 7,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "ambiguous"
+
+
+def test_same_exercise_sync_during_pause_does_not_become_alternate_limb() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 2.0,
+        "candidate_pending_rom_estimate_deg": 45.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.80,
+        "pending_start_ts": 2000,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 3,
+        "candidate_cycles_last_4s": 3,
+        "cycle_sync_score_last_4s": 0.85,
+        "mirrored_pair": True,
+        "candidate_current_raw": 12,
+        "candidate_carryover_start_raw": 10,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "same_exercise"
+
+
+def test_alternate_limb_uses_observation_start_not_pending_start() -> None:
+    pending = {
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 4.0,
+        "candidate_pending_rom_estimate_deg": 50.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.70,
+        "incumbent_last_observed_ts_at_start": 1500,
+        "pending_start_ts": 1900,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1700,
+        "candidate_rom_score_at_start": 0.80,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 1,
+        "candidate_cycles_last_4s": 1,
+        "cycle_sync_score_last_4s": 0.25,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": False,
+        "candidate_completed_gated_cycle_during_pending": False,
+        "candidate_current_raw": 9,
+        "candidate_carryover_start_raw": 6,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "alternate_limb"

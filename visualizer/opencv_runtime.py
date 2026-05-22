@@ -242,6 +242,7 @@ class _DisplayWindow:
         self._height = height
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
+        self._frames_rendered_total = 0
         self._running = False
         self._stop_requested = threading.Event()
         self._thread: threading.Thread | None = None
@@ -254,6 +255,13 @@ class _DisplayWindow:
 
     def stop_requested(self) -> bool:
         return self._stop_requested.is_set()
+
+    @property
+    def frames_rendered_total(self) -> int:
+        return int(self._frames_rendered_total)
+
+    def is_alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
 
     def start(self) -> None:
         if self._running:
@@ -279,6 +287,7 @@ class _DisplayWindow:
                     frame = self._latest_frame.copy() if self._latest_frame is not None else None
                 display_frame = _letterbox_frame_to_canvas(frame, width=self._width, height=self._height)
                 cv2.imshow(self._window_name, display_frame)
+                self._frames_rendered_total += 1
                 update_console_window()
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
@@ -309,6 +318,320 @@ def _ascii_text(text: str) -> str:
         .encode("ascii", "replace")
         .decode("ascii")
     )
+
+
+def _unix_ts_ms() -> float:
+    return time.time() * 1000.0
+
+
+def _format_timed_event(message: str, *, ts_ms: float | None = None) -> str:
+    event_ts_ms = _unix_ts_ms() if ts_ms is None else float(ts_ms)
+    return f"ts_ms={event_ts_ms:.4f} {message}"
+
+
+def _log_timed_event(log_method: Any, message: str, *args: Any) -> None:
+    rendered = message % args if args else message
+    log_method(_format_timed_event(rendered))
+
+
+class _RecoveringCapture:
+    """Wrapper around cv2.VideoCapture that reopens the camera after repeated bad frames."""
+
+    def __init__(
+        self,
+        *,
+        camera_index: int,
+        open_capture: Any = None,
+        max_bad_frames: int = 5,
+    ) -> None:
+        self._camera_index = int(camera_index)
+        self._open_capture = open_capture or _open_webcam_capture
+        self._max_bad_frames = max(1, int(max_bad_frames))
+        self._bad_frame_streak = 0
+        self.reopen_count = 0
+        self.read_failures_total = 0
+        self.bad_frames_total = 0
+        self.good_frames_total = 0
+        self.last_good_frame_monotonic: float | None = None
+        self._cap: Any = None
+        self.backend_name = "unknown"
+        self._reopen(initial=True)
+
+    def _reopen(self, *, initial: bool = False) -> None:
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+        self._cap, self.backend_name = self._open_capture(self._camera_index)
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        self._bad_frame_streak = 0
+        if not initial:
+            self.reopen_count += 1
+        level = logger.info if initial else logger.warning
+        _log_timed_event(
+            level,
+            "webcam capture %s backend=%s index=%s",
+            "opened" if initial else "reopened",
+            self.backend_name,
+            self._camera_index,
+        )
+
+    def read(self) -> tuple[bool, Any]:
+        if self._cap is None:
+            self._reopen()
+        try:
+            ok, frame = self._cap.read()
+        except Exception as exc:
+            _log_timed_event(
+                logger.warning,
+                "webcam read failed backend=%s index=%s: %s",
+                self.backend_name,
+                self._camera_index,
+                exc,
+            )
+            self.read_failures_total += 1
+            ok, frame = False, None
+        if ok and _frame_looks_usable(frame):
+            self._bad_frame_streak = 0
+            self.good_frames_total += 1
+            self.last_good_frame_monotonic = time.monotonic()
+            return True, frame
+
+        self._bad_frame_streak += 1
+        self.bad_frames_total += 1
+        if self._bad_frame_streak >= self._max_bad_frames:
+            _log_timed_event(
+                logger.warning,
+                "webcam backend=%s index=%s produced %d consecutive unusable frames; reopening capture",
+                self.backend_name,
+                self._camera_index,
+                self._bad_frame_streak,
+            )
+            self._reopen()
+            try:
+                ok2, frame2 = self._cap.read()
+            except Exception as exc:
+                _log_timed_event(
+                    logger.warning,
+                    "webcam read after reopen failed backend=%s index=%s: %s",
+                    self.backend_name,
+                    self._camera_index,
+                    exc,
+                )
+                self.read_failures_total += 1
+                return False, None
+            if ok2 and _frame_looks_usable(frame2):
+                self.good_frames_total += 1
+                self.last_good_frame_monotonic = time.monotonic()
+                return True, frame2
+            self.bad_frames_total += 1
+        return False, None
+
+    def release(self) -> None:
+        if self._cap is None:
+            return
+        try:
+            self._cap.release()
+        finally:
+            self._cap = None
+
+
+class _RuntimeDiagnostics:
+    """Periodic health diagnostics for capture, queue pressure, and display liveness."""
+
+    def __init__(
+        self,
+        *,
+        logger_obj: Any = None,
+        heartbeat_sec: float = 5.0,
+        vm_stall_sec: float = 2.5,
+        start_monotonic: float | None = None,
+    ) -> None:
+        self._logger = logger_obj or logger
+        self._heartbeat_sec = max(1.0, float(heartbeat_sec))
+        self._vm_stall_sec = max(0.5, float(vm_stall_sec))
+        self._started_monotonic = time.monotonic() if start_monotonic is None else float(start_monotonic)
+        self._last_heartbeat_monotonic = self._started_monotonic
+        self._first_enqueue_monotonic: float | None = None
+        self._last_vm_response_monotonic: float | None = None
+        self._last_vm_token: int | None = None
+        self._last_display_frames_total = 0
+        self._queue_drop_active = False
+        self._queue_drop_streak = 0
+        self._vm_stall_active = False
+        self._display_stall_active = False
+        self._display_dead_logged = False
+        self._capture_ok_interval = 0
+        self._capture_bad_interval = 0
+        self._published_interval = 0
+        self._queue_enqueued_interval = 0
+        self._queue_dropped_interval = 0
+        self._vm_responses_interval = 0
+        self._vm_landmarks_interval = 0
+        self._last_local_reps: int | None = None
+
+    def _emit(self, level: str, message: str, *args: Any) -> None:
+        log_method = getattr(self._logger, level)
+        _log_timed_event(log_method, message, *args)
+
+    def note_capture_result(self, *, ok: bool) -> None:
+        if ok:
+            self._capture_ok_interval += 1
+        else:
+            self._capture_bad_interval += 1
+
+    def note_frame_published(self) -> None:
+        self._published_interval += 1
+
+    def note_frame_enqueued(self, *, now_monotonic: float) -> None:
+        self._queue_enqueued_interval += 1
+        if self._first_enqueue_monotonic is None:
+            self._first_enqueue_monotonic = now_monotonic
+        if self._queue_drop_active:
+            self._emit("info", "diag pose queue recovered after %d dropped frames", self._queue_drop_streak)
+            self._queue_drop_active = False
+            self._queue_drop_streak = 0
+
+    def note_frame_dropped(self) -> None:
+        self._queue_dropped_interval += 1
+        self._queue_drop_streak += 1
+        if self._queue_drop_active:
+            return
+        self._queue_drop_active = True
+        self._emit("warning", "diag pose queue saturated; dropping frames until the VM worker catches up")
+
+    def note_vm_snapshot(self, snap: dict[str, Any], *, now_monotonic: float) -> None:
+        if not isinstance(snap, dict):
+            return
+        if "benchmark" not in snap and "landmarks" not in snap and "sent_hw" not in snap:
+            return
+        token = id(snap)
+        if token == self._last_vm_token:
+            return
+
+        idle_for = None
+        if self._last_vm_response_monotonic is not None:
+            idle_for = now_monotonic - self._last_vm_response_monotonic
+        elif self._first_enqueue_monotonic is not None:
+            idle_for = now_monotonic - self._first_enqueue_monotonic
+
+        self._last_vm_token = token
+        self._last_vm_response_monotonic = now_monotonic
+        self._vm_responses_interval += 1
+        if snap.get("landmarks") is not None:
+            self._vm_landmarks_interval += 1
+        if self._vm_stall_active:
+            self._emit("info", "diag VM responses recovered after %.1fs idle", max(0.0, float(idle_for or 0.0)))
+            self._vm_stall_active = False
+
+    def note_local_rep_count(self, *, local_reps: int) -> None:
+        reps_now = max(0, int(local_reps))
+        if self._last_local_reps is None:
+            self._last_local_reps = reps_now
+            return
+        if reps_now > self._last_local_reps:
+            self._emit("info", "event=local_rep_counted local_reps=%d", reps_now)
+        self._last_local_reps = reps_now
+
+    def maybe_log(
+        self,
+        *,
+        now_monotonic: float,
+        started: bool,
+        cam_fps: float,
+        inf_fps: float,
+        capture: Any,
+        display: Any,
+    ) -> None:
+        self._maybe_log_vm_stall(now_monotonic=now_monotonic, started=started)
+
+        display_alive = bool(getattr(display, "is_alive", lambda: False)())
+        if not display_alive:
+            if not self._display_dead_logged:
+                self._emit("warning", "diag display thread is not alive")
+                self._display_dead_logged = True
+        elif self._display_dead_logged:
+            self._emit("info", "diag display thread is alive again")
+            self._display_dead_logged = False
+
+        elapsed = now_monotonic - self._last_heartbeat_monotonic
+        if elapsed < self._heartbeat_sec:
+            return
+
+        display_total = int(getattr(display, "frames_rendered_total", 0) or 0)
+        display_interval = max(0, display_total - self._last_display_frames_total)
+        self._last_display_frames_total = display_total
+
+        if started and self._published_interval > 0 and display_interval == 0:
+            if not self._display_stall_active:
+                self._emit(
+                    "warning",
+                    "diag display rendered 0 frames in the last %.1fs while %d frames were published",
+                    elapsed,
+                    self._published_interval,
+                )
+                self._display_stall_active = True
+        elif display_interval > 0 and self._display_stall_active:
+            self._emit("info", "diag display rendering recovered")
+            self._display_stall_active = False
+
+        if self._vm_responses_interval > 0:
+            landmark_ratio = f"{(100.0 * self._vm_landmarks_interval / self._vm_responses_interval):.0f}%"
+        else:
+            landmark_ratio = "n/a"
+        if self._last_vm_response_monotonic is None:
+            last_vm_age = "none"
+        else:
+            last_vm_age = f"{max(0.0, now_monotonic - self._last_vm_response_monotonic):.1f}s"
+
+        self._emit(
+            "info",
+            "diag %.1fs backend=%s cam=%.1ffps infer=%.1f/s cap ok=%d bad=%d pub=%d ui=%d q enq=%d drop=%d vm rsp=%d lm=%s reopens=%d display=%s last_vm=%s",
+            elapsed,
+            getattr(capture, "backend_name", "unknown"),
+            cam_fps,
+            inf_fps,
+            self._capture_ok_interval,
+            self._capture_bad_interval,
+            self._published_interval,
+            display_interval,
+            self._queue_enqueued_interval,
+            self._queue_dropped_interval,
+            self._vm_responses_interval,
+            landmark_ratio,
+            int(getattr(capture, "reopen_count", 0) or 0),
+            "alive" if display_alive else "dead",
+            last_vm_age,
+        )
+        self._reset_interval(now_monotonic)
+
+    def _maybe_log_vm_stall(self, *, now_monotonic: float, started: bool) -> None:
+        if not started or self._vm_stall_active or self._first_enqueue_monotonic is None:
+            return
+        last_seen = self._last_vm_response_monotonic
+        idle_since = last_seen if last_seen is not None else self._first_enqueue_monotonic
+        idle_for = now_monotonic - idle_since
+        if idle_for < self._vm_stall_sec:
+            return
+        if last_seen is None:
+            self._emit("warning", "diag no VM response received %.1fs after frames started enqueuing", idle_for)
+        else:
+            self._emit("warning", "diag no new VM response for %.1fs", idle_for)
+        self._vm_stall_active = True
+
+    def _reset_interval(self, now_monotonic: float) -> None:
+        self._last_heartbeat_monotonic = now_monotonic
+        self._capture_ok_interval = 0
+        self._capture_bad_interval = 0
+        self._published_interval = 0
+        self._queue_enqueued_interval = 0
+        self._queue_dropped_interval = 0
+        self._vm_responses_interval = 0
+        self._vm_landmarks_interval = 0
 
 
 def _draw_start_button(frame: Any, run_state: dict[str, Any]) -> None:
@@ -429,8 +752,10 @@ def _trigger_start_toggle(run_state: dict[str, Any]) -> None:
         rs.clear_tracking_keep_started()
 
 
-def _on_mouse(event: int, x: int, y: int, _flags: int, param: dict[str, Any]) -> None:
+def _on_mouse(event: int, x: int, y: int, _flags: int, param: Any | None) -> None:
     if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    if not isinstance(param, dict):
         return
     state = param
     in_rect = _start_button_hit(state, x, y)
@@ -487,7 +812,8 @@ def _merge_benchmark_peaks(peaks: dict[str, float | None], b: dict[str, Any]) ->
 
 def _extract_local_perf(step: StepResult) -> dict[str, float]:
     sd = step.selection_debug if isinstance(step.selection_debug, dict) else {}
-    perf = sd.get("perf_ms") if isinstance(sd.get("perf_ms"), dict) else {}
+    perf_obj = sd.get("perf_ms")
+    perf: dict[str, Any] = perf_obj if isinstance(perf_obj, dict) else {}
     out: dict[str, float] = {}
     for src, dst in (
         ("session_total_ms", "session_ms"),
@@ -495,6 +821,8 @@ def _extract_local_perf(step: StepResult) -> dict[str, float]:
         ("variance_ms", "variance_ms"),
     ):
         v = perf.get(src)
+        if v is None:
+            continue
         try:
             out[dst] = float(v)
         except (TypeError, ValueError):
@@ -710,8 +1038,9 @@ def _draw_overlay(frame: Any, step: StepResult) -> None:
     )
     y += line_height
     if show_sel_pulses:
-        tr = int(rep_dom_sel.get("totalReps") or 0)
-        lk = rep_dom_sel.get("leaderKey")
+        rep_dom = rep_dom_sel if isinstance(rep_dom_sel, dict) else {}
+        tr = int(rep_dom.get("totalReps") or 0)
+        lk = rep_dom.get("leaderKey")
         lk_s = str(lk) if lk else "—"
         _put_text_readable(
             frame,
@@ -780,11 +1109,7 @@ def run_webcam_loop(
         if not ok:
             raise RuntimeError(f"VM health check failed: {info}")
 
-    cap, backend_name = _open_webcam_capture(camera_index)
-    try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    except Exception:
-        pass
+    capture = _RecoveringCapture(camera_index=camera_index)
 
     rep_session = RepCounterSession(auto_started=False)
     run_state: dict[str, Any] = {
@@ -796,10 +1121,11 @@ def run_webcam_loop(
     ensure_console_window()
     display = _DisplayWindow(window_name="Rep Counter", run_state=run_state)
     display.start()
+    diag = _RuntimeDiagnostics()
     logger.debug(
         "webcam opened index=%s backend=%s, VM predict resize_width=%s jpeg_q=%s validate=%s",
         camera_index,
-        backend_name,
+        capture.backend_name,
         rw,
         jq,
         val,
@@ -835,6 +1161,8 @@ def run_webcam_loop(
     inference_fps_window = 20
     last_benchmark: Optional[dict[str, Any]] = None
     prev_resp_t: Any = None
+    cam_fps = 0.0
+    inf_fps = 0.0
     benchmark_peaks: dict[str, float | None] = {
         "roundtrip_ms": None,
         "upload_ms": None,
@@ -877,9 +1205,18 @@ def run_webcam_loop(
 
     try:
         while not display.stop_requested():
-            ret, frame_bgr = cap.read()
+            ret, frame_bgr = capture.read()
             loop_now = time.monotonic()
+            diag.note_capture_result(ok=bool(ret and frame_bgr is not None))
             if not ret or frame_bgr is None:
+                diag.maybe_log(
+                    now_monotonic=loop_now,
+                    started=bool(run_state["started"]),
+                    cam_fps=cam_fps if "cam_fps" in locals() else 0.0,
+                    inf_fps=0.0,
+                    capture=capture,
+                    display=display,
+                )
                 continue
 
             t_now = time.perf_counter()
@@ -901,6 +1238,15 @@ def run_webcam_loop(
                     OVERLAY_FONT, 0.7, OVERLAY_COLOR, 2,
                 )
                 display.publish_frame(frame_bgr)
+                diag.note_frame_published()
+                diag.maybe_log(
+                    now_monotonic=loop_now,
+                    started=False,
+                    cam_fps=cam_fps,
+                    inf_fps=0.0,
+                    capture=capture,
+                    display=display,
+                )
                 continue
 
             # Local-only sender cap: reduce upload cadence without touching VM-side limits.
@@ -908,9 +1254,11 @@ def run_webcam_loop(
                 next_send_monotonic = loop_now + LOCAL_SEND_INTERVAL_SEC
                 try:
                     frame_queue.put_nowait(frame_bgr.copy())
+                    diag.note_frame_enqueued(now_monotonic=loop_now)
                 except Full:
-                    pass
+                    diag.note_frame_dropped()
             snap = latest_pose[0]
+            diag.note_vm_snapshot(snap, now_monotonic=loop_now)
             disp_b, inf_fps, val_issues = _update_vm_metrics(snap)
             raw_landmarks = snap.get("landmarks")
             sent_hw = snap.get("sent_hw")
@@ -931,13 +1279,27 @@ def run_webcam_loop(
                     frame_bgr, disp_b, benchmark_peaks, cam_fps, inf_fps, val_issues
                 )
                 display.publish_frame(frame_bgr)
+                diag.note_frame_published()
+                diag.note_local_rep_count(local_reps=step.reps)
+                diag.maybe_log(
+                    now_monotonic=loop_now,
+                    started=True,
+                    cam_fps=cam_fps,
+                    inf_fps=inf_fps,
+                    capture=capture,
+                    display=display,
+                )
                 continue
 
             disp_h, disp_w = frame_bgr.shape[0], frame_bgr.shape[1]
-            sent_ok = isinstance(sent_hw, tuple) and len(sent_hw) >= 2
+            sent_hw_pair: tuple[int, int] | None = None
+            if isinstance(sent_hw, tuple) and len(sent_hw) >= 2:
+                first, second = sent_hw[0], sent_hw[1]
+                if isinstance(first, (int, float)) and isinstance(second, (int, float)):
+                    sent_hw_pair = (int(first), int(second))
             raw_scaled = scale_landmarks_to_display(
                 raw_landmarks,
-                sent_hw if sent_ok else None,
+                sent_hw_pair,
                 (disp_h, disp_w),
             )
             step = rs_sess.step_landmarks(raw_scaled, timestamp_ms=timestamp_ms)
@@ -963,6 +1325,16 @@ def run_webcam_loop(
                 step.peak_detector_state,
             )
             display.publish_frame(frame_bgr)
+            diag.note_frame_published()
+            diag.note_local_rep_count(local_reps=step.reps)
+            diag.maybe_log(
+                now_monotonic=loop_now,
+                started=True,
+                cam_fps=cam_fps,
+                inf_fps=inf_fps,
+                capture=capture,
+                display=display,
+            )
 
     finally:
         stop_worker.set()
@@ -971,7 +1343,7 @@ def run_webcam_loop(
         except Full:
             pass
         worker.join(timeout=VM_TIMEOUT_SEC + 1.0)
-        cap.release()
+        capture.release()
         display.stop()
         cv2.destroyAllWindows()
         if last_benchmark:

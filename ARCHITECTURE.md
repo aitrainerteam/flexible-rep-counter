@@ -14,7 +14,7 @@ Webcam (OpenCV)
     -> draw_skeleton (overlay)
     -> [selection phase OR tracking phase]
          selection: buffer landmarks, run N PeakDetectors on all COMMON_ANGLES, compute variances, lock one angle
-         tracking: one PeakDetector.update on the locked angle only
+         tracking: active joint drives displayed reps, while all joint motion states keep updating for recalibration confidence
     -> UI overlay (reps, state, status) + benchmark HUD
 ```
 
@@ -22,8 +22,9 @@ Webcam (OpenCV)
 
 | Thread        | Role |
 |---------------|------|
-| Main          | `cap.read`, UI (`imshow`, `waitKey`), pose filtering, angle math, rep logic |
+| Main          | `cap.read`, pose filtering, angle math, rep logic, frame composition |
 | `_pose_worker`| Dequeue latest frame, `send_frame` to VM, write `latest_pose[0]` |
+| `_DisplayWindow` | `imshow`/`waitKey`, keyboard + click interactions, non-blocking rendering |
 
 Only one frame is queued at a time (`Queue(maxsize=1)`), so the VM always sees a recent frame without backlog.
 
@@ -35,7 +36,8 @@ Only one frame is queued at a time (`Queue(maxsize=1)`), so the VM always sees a
 2. **`run_webcam_loop`**
    - Loads tuning via **`get_default_tuning_params()`** ([`app/config.py`](app/config.py)).
    - Optionally **`check_vm_health`** ([`app/vm_client.py`](app/vm_client.py)) → `GET {base}/health`.
-   - Opens camera, builds **`run_state`** (selection buffer, selection detectors, dominance streak, `selected_angle`, `peak_detector`, etc.).
+   - Opens camera with backend probing + bad-frame rejection and starts a display worker thread.
+   - Builds **`run_state`** and a `RepCounterSession` instance (the session owns selection/tracking internals).
    - Starts **`_pose_worker`** thread.
    - Enters the **per-frame loop** (below).
 
@@ -53,35 +55,23 @@ For each frame after the user clicks **Start**:
 6. **`PoseFilterPipeline.process(raw_scaled, timestamp_ms)`** ([`src/flexible_rep_counter/core/pose_filters.py`](src/flexible_rep_counter/core/pose_filters.py)) — temporal smoothing per keypoint, then velocity clamp, then short history interpolation for low-confidence points.
 7. **`draw_skeleton(frame_bgr, landmarks)`** ([`app/skeleton_overlay.py`](app/skeleton_overlay.py)).
 
-Then branch:
+Then branch (inside `RepCounterSession.step_landmarks`):
 
-### A) Selection phase — `run_state["selected_angle"] is None`
+### A) Selection phase — `phase == "selecting"`
 
-Goal: observe motion, then **lock exactly one** entry of **`COMMON_ANGLES`** (one joint / one side). The opposite limb is **never** tracked or displayed as a second counter.
+Goal: observe motion, then lock one active tracked joint while still collecting all-joint motion stats.
 
-1. **`frame_buffer.append(landmarks)`** — bounded by `ANGLE_SELECTION_MAX_BUFFER_FRAMES`.
-2. **Selection PeakDetectors** — lazy-init `selection_detectors_by_angle`: one **`PeakDetector`** per key in **`COMMON_ANGLES`** ([`src/flexible_rep_counter/core/variance_angle_selector.py`](src/flexible_rep_counter/core/variance_angle_selector.py)).
-3. For **each** candidate angle key, each frame:
-   - **`calculate_from_type(type, landmark_indices, landmarks)`** ([`src/flexible_rep_counter/core/math_engine.py`](src/flexible_rep_counter/core/math_engine.py)) → scalar angle (or None).
-   - **`detector.update(value)`** — same peak/valley machine as live tracking (see “PeakDetector” below). This produces **per-joint rep-like events** used only for **dominance**, not the final user count yet.
-4. **`summarize_rep_dominance(rep_counts_sel)`** — among joints with rep_count &gt; 0, find the **leader** (max count) and its **share** of total selection-phase rep events.
-5. **`compute_angle_variances_from_buffer(buf_list)`** — builds per-angle statistics from the buffered landmark sequence (see “Angle variance / joint scoring”).
-6. **`dominance_conditions_met(variances, rep_dom, ...)`** — true when:
-   - leader share &gt; `ANGLE_SELECTION_DOMINANCE_FRACTION`,
-   - leader has at least `ANGLE_SELECTION_MIN_LEADING_REPS` reps,
-   - leader passes **`passes_consistent_variance_gate`** (multi-window activity + ROM),
-   - and **`_get_top_candidate(variances)`** agrees with the leader (variance winner == rep leader), so noise on the idle arm does not steal the lock.
-7. **Dominance streak** — if conditions hold for the same `leader_key` for `ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES` consecutive frames (and wall/frame minimums are met), **lock**:
-   - **`_apply_locked_tracking(..., selection_detector=sdba.get(leader_key))`** — reuse the **same** `PeakDetector` instance that observed the selection window so counts stay continuous.
-8. **Variance fallback** (only if dominance never stabilizes): when **`can_try`** (retry interval) and elapsed ≥ `angle_selection.variance_fallback_sec`, call **`determine_best_angle(buf_list)`**. If it returns `source=="variance"`, **`_apply_locked_tracking(..., selection_detector=sdba.get(sel))`** — reuse that joint’s selection detector (same instance as dominance path).
-9. **`_selection_status_message`** drives the overlay string during this phase.
+1. Buffer landmarks and maintain one lightweight detector per candidate joint.
+2. Compute per-joint dominance and variance gates from `COMMON_ANGLES`.
+3. Lock when dominance/variance converge and streak thresholds are satisfied.
+4. If dominance remains ambiguous past the configured fallback window, allow variance fallback.
 
-### B) Tracking phase — `selected_angle` is set
+### B) Tracking phase — `phase == "tracking"`
 
-1. **`angle_value = calculate_from_type(selected_config["type"], selected_config["landmarks"], landmarks)`**.
-2. **`out = peak_detector.update(angle_value)`** — single detector, single joint; the other arm’s angles are **not** fed into any detector.
-3. **Displayed rep count** — `rep_count` from `out["repCount"]` (with session-layer adjustment for unmatched peak/valley halves); overlay shows raw count during calibration via **`reps_raw` / `calibration_target_reps`**.
-4. Status line reminds that only **left** or **right** side is locked (for `LEFT_*` / `RIGHT_*` keys).
+1. Active joint `PeakDetector` emits displayed reps and calibration status.
+2. All joint `JointMotionState` records continue updating to support reevaluation and handoff confidence.
+3. Reevaluation can trigger immediate or pending switch to a stronger candidate joint (subject to cooldown and confidence gates).
+4. `StepResult` emits edge telemetry (`tracked_joint_changed`, calibration start/lock flags, low-fps fields) for UI and instrumentation.
 
 ### Reset (second Start click)
 

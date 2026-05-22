@@ -20,6 +20,7 @@ from flexible_rep_counter.core.math_engine import (
     replay_angle_series_on_peak_detector,
 )
 from flexible_rep_counter.core.recalibration_confidence import (
+    HandoffDecision,
     JointMotionState,
     classify_handoff,
     compute_joint_recalibration_score,
@@ -43,6 +44,15 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     get_default_tuning_params,
+    LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
+    LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
+    LOW_FPS_ENTER_STREAK_FRAMES as CFG_LOW_FPS_ENTER_STREAK_FRAMES,
+    LOW_FPS_EXIT_P50_MS as CFG_LOW_FPS_EXIT_P50_MS,
+    LOW_FPS_EXIT_P90_MS as CFG_LOW_FPS_EXIT_P90_MS,
+    LOW_FPS_EXIT_STREAK_FRAMES as CFG_LOW_FPS_EXIT_STREAK_FRAMES,
+    LOW_FPS_INTERVAL_WINDOW_FRAMES as CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES,
+    LOW_FPS_MIN_SAMPLES as CFG_LOW_FPS_MIN_SAMPLES,
+    LOW_FPS_SAFE_MODE_ENABLED as CFG_LOW_FPS_SAFE_MODE_ENABLED,
 )
 from flexible_rep_counter.core.variance_angle_selector import (
     COMMON_ANGLES,
@@ -61,9 +71,6 @@ _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Temporary kill-switch: disable runtime variance-based joint recalibration/switching.
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
-SWITCH_REPLAY_MIN_VALID_SAMPLES = 10
-STALE_SWITCH_MIN_STALE_REEVALS = 4
-PENDING_SWITCH_INCUMBENT_MOVEMENT_DEG = 12.0
 STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
 STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG = 14.0
 STALE_SWITCH_MIN_CLOSED_STREAK = 10
@@ -74,6 +81,16 @@ HANDOFF_OBSERVATION_MIN_COMPLETED_CYCLES = 2
 HANDOFF_OBSERVATION_MIN_ACTIVITY_SCORE = 0.45
 HANDOFF_OBSERVATION_MIN_POSE_SCORE = 0.45
 HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE = 0.45
+LOW_FPS_SAFE_MODE_ENABLED = CFG_LOW_FPS_SAFE_MODE_ENABLED
+LOW_FPS_INTERVAL_WINDOW_FRAMES = max(1, int(CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES))
+LOW_FPS_MIN_SAMPLES = max(2, int(CFG_LOW_FPS_MIN_SAMPLES))
+LOW_FPS_ENTER_P50_MS = float(CFG_LOW_FPS_ENTER_P50_MS)
+LOW_FPS_ENTER_P90_MS = float(CFG_LOW_FPS_ENTER_P90_MS)
+LOW_FPS_EXIT_P50_MS = float(CFG_LOW_FPS_EXIT_P50_MS)
+LOW_FPS_EXIT_P90_MS = float(CFG_LOW_FPS_EXIT_P90_MS)
+LOW_FPS_ENTER_STREAK = max(1, int(CFG_LOW_FPS_ENTER_STREAK_FRAMES))
+LOW_FPS_EXIT_STREAK = max(1, int(CFG_LOW_FPS_EXIT_STREAK_FRAMES))
+LOW_FPS_GAP_SPIKE_MS = 200.0
 
 
 def _diagnose_missing_angle(
@@ -215,6 +232,84 @@ def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
     return shown, raw
 
 
+def _percentile_nearest(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if pct <= 0:
+        return float(sorted_values[0])
+    if pct >= 100:
+        return float(sorted_values[-1])
+    idx = int(round((pct / 100.0) * (len(sorted_values) - 1)))
+    idx = max(0, min(idx, len(sorted_values) - 1))
+    return float(sorted_values[idx])
+
+
+def _update_low_fps_health(run_state: dict[str, Any]) -> None:
+    run_state["low_fps_mode_changed_pulse"] = False
+    now_s = time.monotonic()
+    last_s = run_state.get("last_step_monotonic_s")
+    run_state["last_step_monotonic_s"] = now_s
+    if isinstance(last_s, (int, float)):
+        delta_ms = max(0.0, (now_s - float(last_s)) * 1000.0)
+        window = run_state.get("frame_interval_window")
+        if isinstance(window, deque):
+            window.append(delta_ms)
+    window = run_state.get("frame_interval_window")
+    if not isinstance(window, deque) or len(window) < LOW_FPS_MIN_SAMPLES:
+        run_state["low_fps_p50_ms"] = None
+        run_state["low_fps_p90_ms"] = None
+        run_state["low_fps_gaps_over_200ms"] = 0
+        run_state["low_fps_effective_fps"] = None
+        return
+
+    sorted_intervals = sorted(float(v) for v in window if isinstance(v, (int, float)))
+    if not sorted_intervals:
+        run_state["low_fps_p50_ms"] = None
+        run_state["low_fps_p90_ms"] = None
+        run_state["low_fps_gaps_over_200ms"] = 0
+        run_state["low_fps_effective_fps"] = None
+        return
+
+    p50_ms = _percentile_nearest(sorted_intervals, 50.0)
+    p90_ms = _percentile_nearest(sorted_intervals, 90.0)
+    run_state["low_fps_p50_ms"] = p50_ms
+    run_state["low_fps_p90_ms"] = p90_ms
+    run_state["low_fps_gaps_over_200ms"] = sum(
+        1 for v in sorted_intervals if v >= LOW_FPS_GAP_SPIKE_MS
+    )
+    run_state["low_fps_effective_fps"] = (1000.0 / p50_ms) if p50_ms > 0 else None
+
+    enter_cond = p50_ms >= LOW_FPS_ENTER_P50_MS or p90_ms >= LOW_FPS_ENTER_P90_MS
+    exit_cond = p50_ms < LOW_FPS_EXIT_P50_MS and p90_ms < LOW_FPS_EXIT_P90_MS
+    if not LOW_FPS_SAFE_MODE_ENABLED:
+        run_state["low_fps_mode_active"] = False
+        run_state["low_fps_enter_streak"] = 0
+        run_state["low_fps_exit_streak"] = 0
+        return
+    mode_active = bool(run_state.get("low_fps_mode_active"))
+
+    if mode_active:
+        run_state["low_fps_enter_streak"] = 0
+        if exit_cond:
+            run_state["low_fps_exit_streak"] = int(run_state.get("low_fps_exit_streak") or 0) + 1
+        else:
+            run_state["low_fps_exit_streak"] = 0
+        if int(run_state.get("low_fps_exit_streak") or 0) >= LOW_FPS_EXIT_STREAK:
+            run_state["low_fps_mode_active"] = False
+            run_state["low_fps_mode_changed_pulse"] = True
+            run_state["low_fps_exit_streak"] = 0
+    else:
+        run_state["low_fps_exit_streak"] = 0
+        if enter_cond:
+            run_state["low_fps_enter_streak"] = int(run_state.get("low_fps_enter_streak") or 0) + 1
+        else:
+            run_state["low_fps_enter_streak"] = 0
+        if int(run_state.get("low_fps_enter_streak") or 0) >= LOW_FPS_ENTER_STREAK:
+            run_state["low_fps_mode_active"] = True
+            run_state["low_fps_mode_changed_pulse"] = True
+            run_state["low_fps_enter_streak"] = 0
+
+
 def _clear_pending_switch(run_state: dict[str, Any]) -> None:
     run_state["pending_switch_angle"] = None
     run_state["pending_switch_detector"] = None
@@ -260,12 +355,6 @@ def _clear_handoff_observation(run_state: dict[str, Any]) -> None:
     run_state["handoff_observation_candidate_carryover_start_ts"] = 0
 
 
-def _valid_history_count(series: Optional[deque]) -> int:
-    if not isinstance(series, deque):
-        return 0
-    return sum(1 for v in series if _is_valid_angle_value(v))
-
-
 def _recent_history_range(series: Optional[deque], window: int) -> Optional[float]:
     if not isinstance(series, deque) or window <= 0:
         return None
@@ -299,26 +388,6 @@ def _update_pending_incumbent_motion(
     run_state["pending_switch_incumbent_angle_min"] = min_v
     run_state["pending_switch_incumbent_angle_max"] = max_v
     run_state["pending_switch_incumbent_motion_span_deg"] = max_v - min_v
-
-
-def _rebuild_detector_from_history(
-    run_state: dict[str, Any],
-    angle_key: str,
-    tuning_params: dict[str, Any],
-    *,
-    min_valid_samples: int = SWITCH_REPLAY_MIN_VALID_SAMPLES,
-) -> Optional[PeakDetector]:
-    histories = run_state.get("selection_angle_histories") or {}
-    series = histories.get(angle_key)
-    if not isinstance(series, deque):
-        return None
-    values = list(series)
-    valid = sum(1 for v in values if _is_valid_angle_value(v))
-    if valid < min_valid_samples:
-        return None
-    detector = _peak_detector_from_tuning(tuning_params)
-    replay_angle_series_on_peak_detector(detector, values)
-    return detector
 
 
 def _is_detector_calibrated(
@@ -399,6 +468,18 @@ def _activate_joint_switch(
     candidate_delta_shown = max(0, candidate_current_shown - carryover_start_shown)
     candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
     rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
+    if decision.kind == "alternate_limb" and LOW_FPS_SAFE_MODE_ENABLED and bool(
+        run_state.get("low_fps_mode_active")
+    ):
+        decision = HandoffDecision(
+            kind="same_exercise",
+            rationale={
+                **rationale,
+                "low_fps_safeguard": True,
+                "original_kind": "alternate_limb",
+            },
+        )
+        rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
     if (
         decision.kind == "alternate_limb"
         and rationale.get("rule") == "forced_switch_mirrored_candidate_ready_or_delta"
@@ -548,16 +629,26 @@ def _calibration_edge_flags(
     return started, locked
 
 
-def _opposite_side_angle(angle_key: Optional[str]) -> Optional[str]:
-    if not isinstance(angle_key, str):
-        return None
-    if angle_key.startswith("LEFT_"):
-        other = "RIGHT_" + angle_key[len("LEFT_") :]
-        return other if other in COMMON_ANGLES else None
-    if angle_key.startswith("RIGHT_"):
-        other = "LEFT_" + angle_key[len("RIGHT_") :]
-        return other if other in COMMON_ANGLES else None
-    return None
+def _low_fps_result_fields(run_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "effective_fps": (
+            float(run_state["low_fps_effective_fps"])
+            if isinstance(run_state.get("low_fps_effective_fps"), (int, float))
+            else None
+        ),
+        "frame_interval_p50_ms": (
+            float(run_state["low_fps_p50_ms"])
+            if isinstance(run_state.get("low_fps_p50_ms"), (int, float))
+            else None
+        ),
+        "frame_interval_p90_ms": (
+            float(run_state["low_fps_p90_ms"])
+            if isinstance(run_state.get("low_fps_p90_ms"), (int, float))
+            else None
+        ),
+        "low_fps_safe_mode_active": bool(run_state.get("low_fps_mode_active")),
+        "low_fps_safe_mode_changed": bool(run_state.get("low_fps_mode_changed_pulse")),
+    }
 
 
 def _idle_result(msg: str = "Click Start to begin") -> StepResult:
@@ -641,6 +732,16 @@ class RepCounterSession:
             "selection_angle_histories": {
                 ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
             },
+            "frame_interval_window": deque(maxlen=LOW_FPS_INTERVAL_WINDOW_FRAMES),
+            "last_step_monotonic_s": None,
+            "low_fps_mode_active": False,
+            "low_fps_enter_streak": 0,
+            "low_fps_exit_streak": 0,
+            "low_fps_mode_changed_pulse": False,
+            "low_fps_p50_ms": None,
+            "low_fps_p90_ms": None,
+            "low_fps_gaps_over_200ms": 0,
+            "low_fps_effective_fps": None,
             "_prev_calibration_complete": None,
         }
         _clear_pending_switch(self._run_state)
@@ -675,6 +776,16 @@ class RepCounterSession:
         self._run_state["selection_angle_histories"] = {
             ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
         }
+        self._run_state["frame_interval_window"] = deque(maxlen=LOW_FPS_INTERVAL_WINDOW_FRAMES)
+        self._run_state["last_step_monotonic_s"] = None
+        self._run_state["low_fps_mode_active"] = False
+        self._run_state["low_fps_enter_streak"] = 0
+        self._run_state["low_fps_exit_streak"] = 0
+        self._run_state["low_fps_mode_changed_pulse"] = False
+        self._run_state["low_fps_p50_ms"] = None
+        self._run_state["low_fps_p90_ms"] = None
+        self._run_state["low_fps_gaps_over_200ms"] = 0
+        self._run_state["low_fps_effective_fps"] = None
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)
 
@@ -707,6 +818,16 @@ class RepCounterSession:
         self._run_state["selection_angle_histories"] = {
             ak: deque(maxlen=ANGLE_SELECTION_MAX_BUFFER_FRAMES) for ak in COMMON_ANGLES
         }
+        self._run_state["frame_interval_window"] = deque(maxlen=LOW_FPS_INTERVAL_WINDOW_FRAMES)
+        self._run_state["last_step_monotonic_s"] = None
+        self._run_state["low_fps_mode_active"] = False
+        self._run_state["low_fps_enter_streak"] = 0
+        self._run_state["low_fps_exit_streak"] = 0
+        self._run_state["low_fps_mode_changed_pulse"] = False
+        self._run_state["low_fps_p50_ms"] = None
+        self._run_state["low_fps_p90_ms"] = None
+        self._run_state["low_fps_gaps_over_200ms"] = 0
+        self._run_state["low_fps_effective_fps"] = None
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)
 
@@ -864,6 +985,12 @@ class RepCounterSession:
                 "calibration_certainty": out.calibration_certainty,
                 "calibration_target_reps": out.calibration_target_reps,
                 "smoothed_angle": out.smoothed_value,
+                "effective_fps": out.effective_fps,
+                "frame_interval_p50_ms": out.frame_interval_p50_ms,
+                "frame_interval_p90_ms": out.frame_interval_p90_ms,
+                "frame_interval_gaps_over_200ms": self._run_state.get("low_fps_gaps_over_200ms"),
+                "low_fps_safe_mode_active": out.low_fps_safe_mode_active,
+                "low_fps_safe_mode_changed": out.low_fps_safe_mode_changed,
                 "raw_angle": raw_angle_values.get(lk) if lk else None,
                 "filtered_angle": angle_values.get(lk) if lk else None,
                 "deadband_angle": None,
@@ -943,6 +1070,12 @@ class RepCounterSession:
                 "tracked_joint_changed": out.tracked_joint_changed,
                 "calibration_certainty": out.calibration_certainty,
                 "calibration_target_reps": out.calibration_target_reps,
+                "effective_fps": out.effective_fps,
+                "frame_interval_p50_ms": out.frame_interval_p50_ms,
+                "frame_interval_p90_ms": out.frame_interval_p90_ms,
+                "frame_interval_gaps_over_200ms": self._run_state.get("low_fps_gaps_over_200ms"),
+                "low_fps_safe_mode_active": out.low_fps_safe_mode_active,
+                "low_fps_safe_mode_changed": out.low_fps_safe_mode_changed,
                 "raw_angle": raw_angle_value,
                 "filtered_angle": filtered_angle_value,
                 "deadband_angle": feed_v,
@@ -1002,6 +1135,7 @@ class RepCounterSession:
         rs = self._run_state
         tuning_params = rs["tuning_params"]
         default_tuning = DEFAULT_TUNING_PARAMS
+        _update_low_fps_health(rs)
 
         if not landmarks:
             self._last_smoothed_landmarks = None
@@ -1028,6 +1162,7 @@ class RepCounterSession:
                 tracked_joint=rs.get("selected_angle"),
                 default_tuning=default_tuning,
                 phase="selecting" if rs.get("selected_angle") is None else "tracking",
+                run_state=rs,
             )
             self._instr_emit(
                 trace_context,
@@ -1038,6 +1173,12 @@ class RepCounterSession:
                     "reps": out.reps,
                     "reps_raw": out.reps_raw,
                     "reason": "no_pose",
+                    "effective_fps": out.effective_fps,
+                    "frame_interval_p50_ms": out.frame_interval_p50_ms,
+                    "frame_interval_p90_ms": out.frame_interval_p90_ms,
+                    "frame_interval_gaps_over_200ms": rs.get("low_fps_gaps_over_200ms"),
+                    "low_fps_safe_mode_active": out.low_fps_safe_mode_active,
+                    "low_fps_safe_mode_changed": out.low_fps_safe_mode_changed,
                 },
             )
             return out
@@ -1249,6 +1390,7 @@ class RepCounterSession:
                 phase="selecting",
                 status_message=status,
                 tracking_detail_message="",
+                **_low_fps_result_fields(rs),
                 leader_key=leader_key if isinstance(leader_key, str) else None,
                 selection_debug={
                     "rep_dom": rep_dom,
@@ -1767,6 +1909,7 @@ class RepCounterSession:
             phase="tracking",
             status_message=status,
             tracking_detail_message=cal_detail if not calibration_complete else "",
+            **_low_fps_result_fields(rs),
             selection_debug=dict(selection_debug or {}),
         )
 
@@ -1777,7 +1920,9 @@ class RepCounterSession:
         tracked_joint: Optional[str],
         default_tuning: dict[str, Any],
         phase: Literal["idle", "selecting", "tracking"],
+        run_state: Optional[dict[str, Any]] = None,
     ) -> StepResult:
+        low_fps_fields = _low_fps_result_fields(run_state) if isinstance(run_state, dict) else {}
         return StepResult(
             reps=0,
             reps_raw=0,
@@ -1805,4 +1950,5 @@ class RepCounterSession:
             phase=phase,
             status_message="No pose",
             tracking_detail_message="",
+            **low_fps_fields,
         )
