@@ -18,6 +18,8 @@ from flexible_rep_counter.core.recalibration_confidence import (
     JointMotionState,
     classify_handoff,
     compute_joint_recalibration_score,
+    select_recalibration_candidate,
+    should_run_full_recalibration,
     should_switch_to_candidate,
     update_joint_motion_state,
 )
@@ -445,6 +447,113 @@ def test_healthy_incumbent_does_not_switch_on_single_stale_reeval() -> None:
     assert not can_switch
     assert debug["incumbentBad"] is False
     assert debug["incumbentRangeHealthy"] is True
+
+
+def test_skip_full_reeval_when_raw_advanced_and_incumbent_healthy() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=9,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=True,
+        selected_recent_range=34.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert should_run is False
+
+
+def test_full_reeval_when_raw_stale_even_if_range_healthy() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=9,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=False,
+        selected_recent_range=34.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert should_run is True
+
+
+def test_post_lock_grace_skips_full_reeval() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=2,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=False,
+        selected_recent_range=4.0,
+        selected_pose_score=0.1,
+        selected_range_gate_closed_streak=12,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert should_run is False
+
+
+def test_cross_family_excluded_when_incumbent_healthy() -> None:
+    scores = {
+        "LEFT_ELBOW": (0.82, {"poseScore": 0.95, "recentRange": 36.0}),
+        "RIGHT_SHOULDER_ACROSS": (0.95, {"poseScore": 0.95, "recentRange": 42.0}),
+        "RIGHT_ELBOW": (0.74, {"poseScore": 0.95, "recentRange": 37.0}),
+    }
+    candidate, selector_debug = select_recalibration_candidate(
+        scores,
+        "LEFT_ELBOW",
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert selector_debug["allowCrossFamily"] is False
+    assert candidate == "RIGHT_ELBOW"
+
+
+def test_cross_family_allowed_when_incumbent_clearly_bad() -> None:
+    scores = {
+        "LEFT_ELBOW": (0.20, {"poseScore": 0.95, "recentRange": 5.0}),
+        "RIGHT_SHOULDER_ACROSS": (0.95, {"poseScore": 0.95, "recentRange": 42.0}),
+        "RIGHT_ELBOW": (0.74, {"poseScore": 0.95, "recentRange": 37.0}),
+    }
+    candidate, selector_debug = select_recalibration_candidate(
+        scores,
+        "LEFT_ELBOW",
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert selector_debug["allowCrossFamily"] is True
+    assert candidate == "RIGHT_SHOULDER_ACROSS"
+
+
+def test_mirrored_candidate_not_blocked_by_cross_family_filter() -> None:
+    scores = {
+        "LEFT_ELBOW": (0.81, {"poseScore": 0.95, "recentRange": 33.0}),
+        "RIGHT_ELBOW": (0.84, {"poseScore": 0.95, "recentRange": 34.0}),
+    }
+    candidate, selector_debug = select_recalibration_candidate(
+        scores,
+        "LEFT_ELBOW",
+        stale_reevals=0,
+        stale_switch_force_after_reevals=8,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+    )
+    assert selector_debug["allowCrossFamily"] is False
+    assert candidate == "RIGHT_ELBOW"
 
 
 def test_brazil_style_cross_family_switch_blocked_without_rom_dominance() -> None:

@@ -21,6 +21,7 @@ from flexible_rep_counter.core.math_engine import (
 from flexible_rep_counter.core.recalibration_confidence import (
     HandoffDecision,
     JointMotionState,
+    should_run_full_recalibration,
     classify_handoff,
     compute_joint_recalibration_score,
     cycle_sync_score_last_4s,
@@ -46,6 +47,7 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_SWITCH_MIN_REPS,
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
+    DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS,
     get_default_tuning_params,
     LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
     LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
@@ -87,6 +89,7 @@ HANDOFF_OBSERVATION_MIN_COMPLETED_CYCLES = 2
 HANDOFF_OBSERVATION_MIN_ACTIVITY_SCORE = 0.45
 HANDOFF_OBSERVATION_MIN_POSE_SCORE = 0.45
 HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE = 0.45
+POST_LOCK_MIN_RAW_REPS = max(0, int(DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS))
 LOW_FPS_SAFE_MODE_ENABLED = CFG_LOW_FPS_SAFE_MODE_ENABLED
 LOW_FPS_INTERVAL_WINDOW_FRAMES = max(1, int(CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES))
 LOW_FPS_MIN_SAMPLES = max(2, int(CFG_LOW_FPS_MIN_SAMPLES))
@@ -344,6 +347,7 @@ def _apply_locked_tracking(
     run_state["peak_detector"] = det
     run_state["rep_count_offset"] = 0
     run_state["rep_count_raw_offset"] = 0
+    run_state["tracking_raw_at_joint_lock"] = 0
     _clear_pending_switch(run_state)
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
@@ -810,6 +814,7 @@ def _activate_joint_switch(
     run_state["peak_detector"] = detector
     run_state["selection_last_switch_at"] = switched_at
     run_state["selection_reps_at_last_recal_switch"] = int(cumulative_shown)
+    run_state["tracking_raw_at_joint_lock"] = candidate_current_raw
     _clear_pending_switch(run_state)
     _clear_handoff_observation(run_state)
     _mark_joint_activation_guard(run_state)
@@ -1009,6 +1014,7 @@ class RepCounterSession:
             "pending_switch_detector": None,
             "selected_raw_last_at_reeval": 0,
             "selected_raw_stale_reeval_streak": 0,
+            "tracking_raw_at_joint_lock": 0,
             "selected_range_gate_closed_streak": 0,
             "tuning_params": dict(tp),
             "buffer_list_cache": {"signature": None, "data": []},
@@ -1055,6 +1061,7 @@ class RepCounterSession:
         _clear_pending_switch(self._run_state)
         self._run_state["selected_raw_last_at_reeval"] = 0
         self._run_state["selected_raw_stale_reeval_streak"] = 0
+        self._run_state["tracking_raw_at_joint_lock"] = 0
         self._run_state["selected_range_gate_closed_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
@@ -1098,6 +1105,7 @@ class RepCounterSession:
         _clear_pending_switch(self._run_state)
         self._run_state["selected_raw_last_at_reeval"] = 0
         self._run_state["selected_raw_stale_reeval_streak"] = 0
+        self._run_state["tracking_raw_at_joint_lock"] = 0
         self._run_state["selected_range_gate_closed_streak"] = 0
         self._run_state["buffer_list_cache"] = {"signature": None, "data": []}
         self._run_state["variance_cache"] = {"signature": None, "include_debug": False, "data": {}}
@@ -1844,6 +1852,7 @@ class RepCounterSession:
             detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
         )
         selected_pose_score = 0.0
+        selected_recent_range_for_gate = 0.0
         if isinstance(selected_angle, str) and selected_angle in joint_states:
             _, selected_pose_debug = compute_joint_recalibration_score(
                 joint_states[selected_angle],
@@ -1851,6 +1860,11 @@ class RepCounterSession:
                 int(ts),
             )
             selected_pose_score = float(selected_pose_debug.get("poseScore") or 0.0)
+            selected_recent_range_for_gate = float(selected_pose_debug.get("recentRange") or 0.0)
+        if isinstance(selected_output_for_eval, dict):
+            rolling_range = selected_output_for_eval.get("rollingRange")
+            if isinstance(rolling_range, (int, float)):
+                selected_recent_range_for_gate = max(selected_recent_range_for_gate, float(rolling_range))
         if isinstance(selected_output_for_eval, dict):
             if bool(selected_output_for_eval.get("rangeGateOpen", True)):
                 rs["selected_range_gate_closed_streak"] = 0
@@ -1931,13 +1945,38 @@ class RepCounterSession:
             _clear_pending_switch(rs)
             _clear_handoff_observation(rs)
         last_re_eval = rs.get("selection_last_reevaluate_at")
-        re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
+        timer_re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
             or last_re_eval is None
             or (now - float(last_re_eval)) >= ANGLE_SELECTION_REEVALUATE_EVERY_SEC
         )
-        if re_eval_due:
+        re_eval_due = False
+        if timer_re_eval_due:
             rs["selection_last_reevaluate_at"] = now
+            last_raw = int(rs.get("selected_raw_last_at_reeval") or 0)
+            stale_reevals = int(rs.get("selected_raw_stale_reeval_streak") or 0)
+            raw_advanced_since_last_eval = current_raw > last_raw
+            if raw_advanced_since_last_eval:
+                stale_reevals = 0
+            else:
+                stale_reevals += 1
+            rs["selected_raw_last_at_reeval"] = current_raw
+            rs["selected_raw_stale_reeval_streak"] = stale_reevals
+            run_full_re_eval = should_run_full_recalibration(
+                has_pending_switch=isinstance(rs.get("pending_switch_angle"), str),
+                has_handoff_observation=isinstance(rs.get("handoff_observation_candidate_angle"), str),
+                current_raw=current_raw,
+                tracking_raw_at_joint_lock=int(rs.get("tracking_raw_at_joint_lock") or 0),
+                post_lock_min_raw_reps=POST_LOCK_MIN_RAW_REPS,
+                raw_advanced_since_last_eval=raw_advanced_since_last_eval,
+                selected_recent_range=selected_recent_range_for_gate,
+                selected_pose_score=selected_pose_score,
+                selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
+                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
+                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+            )
+            re_eval_due = bool(run_full_re_eval)
+        if re_eval_due:
             t_var = time.perf_counter()
             variances = self._get_variances(rs, frame_buffer, include_debug=False)
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
@@ -1953,6 +1992,11 @@ class RepCounterSession:
             candidate, candidate_sel_debug = select_recalibration_candidate(
                 score_by_joint, selected_angle if isinstance(selected_angle, str) else None,
                 variance_by_joint=variances,
+                stale_reevals=stale_reevals,
+                stale_switch_force_after_reevals=STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
+                selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
+                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
+                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
             )
 
             selected_score = 0.0
@@ -1965,14 +2009,6 @@ class RepCounterSession:
             if isinstance(candidate, str):
                 candidate_score, candidate_debug = score_by_joint.get(candidate, (0.0, {}))
 
-            last_raw = int(rs.get("selected_raw_last_at_reeval") or 0)
-            stale_reevals = int(rs.get("selected_raw_stale_reeval_streak") or 0)
-            if current_raw > last_raw:
-                stale_reevals = 0
-            else:
-                stale_reevals += 1
-            rs["selected_raw_last_at_reeval"] = current_raw
-            rs["selected_raw_stale_reeval_streak"] = stale_reevals
             selected_recent_range = float(selected_debug.get("recentRange") or 0.0)
             selected_pose_score = float(selected_debug.get("poseScore") or 0.0)
             candidate_activity_score = float(candidate_debug.get("activityScore") or 0.0)

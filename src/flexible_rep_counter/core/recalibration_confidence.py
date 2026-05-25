@@ -312,11 +312,105 @@ def compute_joint_recalibration_score(
     return score, debug
 
 
+def compute_incumbent_health(
+    *,
+    stale_reevals: int,
+    selected_recent_range: float,
+    stale_switch_max_selected_recent_range_deg: float,
+    selected_range_gate_closed_streak: int,
+    stale_switch_min_closed_streak: int,
+    selected_score: float,
+    selected_pose_score: float,
+) -> dict[str, Any]:
+    low_range = selected_recent_range < stale_switch_max_selected_recent_range_deg
+    gate_closed = selected_range_gate_closed_streak >= stale_switch_min_closed_streak
+    low_score = selected_score < 0.35
+    low_pose = selected_pose_score < UNOBSERVABLE_POSE_SCORE
+    incumbent_range_healthy = (
+        not low_range
+        and not gate_closed
+        and not low_pose
+    )
+    stale_threshold = STALE_REEVAL_INCUMBENT_BAD if incumbent_range_healthy else 1
+    stale_incumbent_bad = stale_reevals >= stale_threshold
+    incumbent_bad = (
+        stale_incumbent_bad
+        or low_range
+        or gate_closed
+        or low_score
+        or low_pose
+    )
+    return {
+        "incumbentBad": bool(incumbent_bad),
+        "incumbentRangeHealthy": bool(incumbent_range_healthy),
+        "staleThreshold": int(stale_threshold),
+        "staleIncumbentBad": bool(stale_incumbent_bad),
+        "lowRange": bool(low_range),
+        "gateClosed": bool(gate_closed),
+        "lowScore": bool(low_score),
+        "lowPose": bool(low_pose),
+    }
+
+
+def allow_cross_family_rescue(
+    *,
+    incumbent_health: dict[str, Any],
+    stale_reevals: int,
+    stale_switch_force_after_reevals: int,
+) -> bool:
+    if not bool(incumbent_health.get("incumbentBad")):
+        return False
+    return bool(
+        incumbent_health.get("lowRange")
+        or incumbent_health.get("gateClosed")
+        or incumbent_health.get("lowScore")
+        or incumbent_health.get("lowPose")
+        or stale_reevals >= stale_switch_force_after_reevals
+    )
+
+
+def should_run_full_recalibration(
+    *,
+    has_pending_switch: bool,
+    has_handoff_observation: bool,
+    current_raw: int,
+    tracking_raw_at_joint_lock: int,
+    post_lock_min_raw_reps: int,
+    raw_advanced_since_last_eval: bool,
+    selected_recent_range: float,
+    selected_pose_score: float,
+    selected_range_gate_closed_streak: int,
+    stale_switch_max_selected_recent_range_deg: float,
+    stale_switch_min_closed_streak: int,
+) -> bool:
+    if has_pending_switch or has_handoff_observation:
+        return True
+    if current_raw < tracking_raw_at_joint_lock + max(0, int(post_lock_min_raw_reps)):
+        return False
+    incumbent_health = compute_incumbent_health(
+        stale_reevals=0,
+        selected_recent_range=selected_recent_range,
+        stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
+        selected_range_gate_closed_streak=selected_range_gate_closed_streak,
+        stale_switch_min_closed_streak=stale_switch_min_closed_streak,
+        selected_score=1.0,
+        selected_pose_score=selected_pose_score,
+    )
+    if raw_advanced_since_last_eval and bool(incumbent_health.get("incumbentRangeHealthy")):
+        return False
+    return True
+
+
 def select_recalibration_candidate(
     scores: dict[str, tuple[float, dict[str, Any]]],
     selected_angle: Optional[str],
     *,
     variance_by_joint: Optional[dict[str, dict[str, Any]]] = None,
+    stale_reevals: int = 0,
+    stale_switch_force_after_reevals: int = 8,
+    selected_range_gate_closed_streak: int = 0,
+    stale_switch_max_selected_recent_range_deg: float = 14.0,
+    stale_switch_min_closed_streak: int = 10,
 ) -> tuple[str | None, dict[str, Any]]:
     variance_by_joint = variance_by_joint or {}
     field_median_range = median_recent_range_from_score_debug(scores)
@@ -332,12 +426,36 @@ def select_recalibration_candidate(
         if field_median_variance > 0.0
         else CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE
     )
+    selected_score = 0.0
+    selected_debug: dict[str, Any] = {}
+    if isinstance(selected_angle, str):
+        selected_score, selected_debug = scores.get(selected_angle, (0.0, {}))
+    selected_health = compute_incumbent_health(
+        stale_reevals=stale_reevals,
+        selected_recent_range=float(selected_debug.get("recentRange") or 0.0),
+        stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
+        selected_range_gate_closed_streak=selected_range_gate_closed_streak,
+        stale_switch_min_closed_streak=stale_switch_min_closed_streak,
+        selected_score=float(selected_score),
+        selected_pose_score=float(selected_debug.get("poseScore") or 0.0),
+    )
+    allow_cross_family = allow_cross_family_rescue(
+        incumbent_health=selected_health,
+        stale_reevals=stale_reevals,
+        stale_switch_force_after_reevals=stale_switch_force_after_reevals,
+    )
 
     best_key: Optional[str] = None
     best_score = -1.0
     best_debug: dict[str, Any] = {}
     for angle_key, (score, debug) in scores.items():
         if angle_key == selected_angle:
+            continue
+        if (
+            isinstance(selected_angle, str)
+            and not is_same_joint_family(selected_angle, angle_key)
+            and not allow_cross_family
+        ):
             continue
         if float(debug.get("poseScore") or 0.0) < UNOBSERVABLE_POSE_SCORE:
             continue
@@ -358,6 +476,8 @@ def select_recalibration_candidate(
         "candidateDebug": best_debug,
         "fieldMedianRange": field_median_range,
         "fieldMedianVariance": field_median_variance,
+        "allowCrossFamily": bool(allow_cross_family),
+        "incumbentHealth": selected_health,
     }
 
 
@@ -383,20 +503,16 @@ def should_switch_to_candidate(
     median_recent_range_all: float = 0.0,
     same_joint_family: bool = False,
 ) -> tuple[bool, bool, dict[str, Any]]:
-    incumbent_range_healthy = (
-        selected_recent_range >= stale_switch_max_selected_recent_range_deg
-        and selected_range_gate_closed_streak < stale_switch_min_closed_streak
-        and selected_pose_score >= UNOBSERVABLE_POSE_SCORE
+    incumbent_health = compute_incumbent_health(
+        stale_reevals=stale_reevals,
+        selected_recent_range=selected_recent_range,
+        stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
+        selected_range_gate_closed_streak=selected_range_gate_closed_streak,
+        stale_switch_min_closed_streak=stale_switch_min_closed_streak,
+        selected_score=selected_score,
+        selected_pose_score=selected_pose_score,
     )
-    stale_threshold = STALE_REEVAL_INCUMBENT_BAD if incumbent_range_healthy else 1
-    stale_incumbent_bad = stale_reevals >= stale_threshold
-    incumbent_bad = (
-        stale_incumbent_bad
-        or selected_recent_range < stale_switch_max_selected_recent_range_deg
-        or selected_range_gate_closed_streak >= stale_switch_min_closed_streak
-        or selected_score < 0.35
-        or selected_pose_score < UNOBSERVABLE_POSE_SCORE
-    )
+    incumbent_bad = bool(incumbent_health.get("incumbentBad"))
 
     range_ratio = SAME_FAMILY_MIN_RANGE_RATIO if same_joint_family else CROSS_FAMILY_MIN_RANGE_RATIO
     rom_ratio = SAME_FAMILY_ROM_DOMINANCE_RATIO if same_joint_family else CROSS_FAMILY_ROM_DOMINANCE_RATIO
@@ -446,8 +562,8 @@ def should_switch_to_candidate(
     )
     return bool(should_switch), bool(force_switch), {
         "incumbentBad": bool(incumbent_bad),
-        "incumbentRangeHealthy": bool(incumbent_range_healthy),
-        "staleThreshold": int(stale_threshold),
+        "incumbentRangeHealthy": bool(incumbent_health.get("incumbentRangeHealthy")),
+        "staleThreshold": int(incumbent_health.get("staleThreshold") or 0),
         "candidateGood": bool(candidate_good),
         "candidateMotionOk": bool(candidate_motion_ok),
         "candidateRangeVsIncumbent": bool(candidate_range_vs_incumbent),

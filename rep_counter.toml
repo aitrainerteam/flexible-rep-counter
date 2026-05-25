@@ -77,6 +77,11 @@ min_active_windows = 3
 # Moving-average window (samples) when smoothing angles for variance/ROM stats. Higher = smoother stats, slower detail; lower = noisier, more responsive.
 smooth_window = 5
 
+[dynamic_recalibration]
+# Skip full runtime re-evaluation until this many raw reps have been counted after
+# a joint lock/switch. Helps avoid early noisy candidate scans.
+post_lock_min_raw_reps = 5
+
 # Per joint: keys match COMMON_ANGLES. Omitted fields use [angle_selection] globals above.
 # min_variance / min_range_deg: override globals for noisy or small-ROM joints. Higher = harder for that joint to win; lower = easier.
 [angle_selection.joints.LEFT_ELBOW]

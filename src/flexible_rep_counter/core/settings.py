@@ -174,6 +174,9 @@ ANGLE_SELECTION_MIN_RANGE_DEG = _toml_float("angle_selection", "min_range_deg", 
 ANGLE_SELECTION_SECOND_BEST_RATIO = _toml_float("angle_selection", "second_best_ratio", default=1.15)
 ANGLE_SELECTION_MIN_ACTIVE_WINDOWS = _toml_int("angle_selection", "min_active_windows", default=3)
 ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", default=5)
+DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS = _toml_int(
+    "dynamic_recalibration", "post_lock_min_raw_reps", default=5
+)
 
 LOW_FPS_SAFE_MODE_ENABLED = bool(_toml_val("low_fps_safe_mode", "enabled") is not False)
 LOW_FPS_INTERVAL_WINDOW_FRAMES = _toml_int(
