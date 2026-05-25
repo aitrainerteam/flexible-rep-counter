@@ -39,7 +39,7 @@ calibration_certainty = 0.2
 # If certainty still low, keep calibrating up to this many extra reps beyond calibration_reps before forcing lock. Higher = more patience; lower = force lock sooner.
 calibration_force_extra_reps = 0
 # Min milliseconds between rep increments. Higher = hard cap on rep speed; lower = allow rapid reps, risk of burst double-counts.
-min_interval_ms = 500
+min_interval_ms = 300
 
 [angle_selection]
 # Minimum seconds of observation before angle lock is allowed. Slightly reduced for faster start at ~12 FPS.
@@ -62,6 +62,8 @@ variance_fallback_sec = 10.0
 reevaluate_every_sec = 0.75
 # After a switch, wait at least this many seconds before allowing another switch. Higher = stabler lock, lower = more reactive.
 switch_min_sec = 1.5
+# Minimum displayed reps on the current joint before another runtime recalibration switch is allowed.
+switch_min_reps = 10
 # Candidate variance must beat current tracked joint by this ratio to switch (unless current fails gate). Higher = stricter switching.
 # switch_variance_ratio = 1.2  # Temporarily disabled along with runtime recalibration/switching.
 # Min median window variance for a joint to qualify. Higher = only very active angles pass; lower = weaker motion can win.

@@ -179,7 +179,7 @@ class PeakDetector:
         calibration_reps: int = 3,
         calibration_certainty: float = 0.65,
         calibration_force_extra_reps: int = 2,
-        min_rep_interval_ms: float = 400.0,
+        min_rep_interval_ms: float = 300.0,
     ):
         self.smoothing_factor = smoothing_factor
         self.hysteresis = hysteresis
@@ -410,13 +410,20 @@ class PeakDetector:
                     }
                 )
             elif not interval_ok:
+                # Half-cycle preview already surfaced this rep; commit it instead of
+                # blocking and letting the display snap back on the next frame.
+                self.rep_count = new_rep_count
+                rep_completed = True
+                self._last_rep_time_ms = now_ms
                 self._instr_emit(
                     {
-                        "event": "rep_block",
+                        "event": "rep_increment",
                         "kind": "peak",
-                        "reason": "min_rep_interval_block",
-                        "rep_count_after_extrema": new_rep_count,
                         "rep_count": self.rep_count,
+                        "peak_value": float(detected_peak) if detected_peak is not None else None,
+                        "rolling_range": self._last_rolling_range,
+                        "range_gate_open": gate_ok,
+                        "min_interval_relaxed": True,
                     }
                 )
         else:
@@ -515,13 +522,18 @@ class PeakDetector:
                     }
                 )
             elif not interval_ok:
+                self.rep_count = new_rep_count
+                rep_completed = True
+                self._last_rep_time_ms = now_ms
                 self._instr_emit(
                     {
-                        "event": "rep_block",
+                        "event": "rep_increment",
                         "kind": "valley",
-                        "reason": "min_rep_interval_block",
-                        "rep_count_after_extrema": new_rep_count,
                         "rep_count": self.rep_count,
+                        "valley_value": float(detected_valley) if detected_valley is not None else None,
+                        "rolling_range": self._last_rolling_range,
+                        "range_gate_open": gate_ok,
+                        "min_interval_relaxed": True,
                     }
                 )
         else:

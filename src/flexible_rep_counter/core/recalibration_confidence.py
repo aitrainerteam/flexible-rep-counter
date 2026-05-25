@@ -31,6 +31,20 @@ FORCE_SWITCH_MIN_SCORE = 0.50
 FORCE_SWITCH_MIN_ACTIVITY = 0.50
 FORCE_SWITCH_MIN_POSE_SCORE = 0.45
 
+# Incumbent must go stale for several re-evals before a healthy-range joint is "bad".
+STALE_REEVAL_INCUMBENT_BAD = 3
+# Candidate must exceed these motion thresholds vs incumbent / field (not just cadence).
+CANDIDATE_MIN_MEDIAN_RANGE_RATIO = 0.90
+SAME_FAMILY_MIN_RANGE_RATIO = 0.92
+CROSS_FAMILY_MIN_RANGE_RATIO = 1.05
+SAME_FAMILY_ROM_DOMINANCE_RATIO = 0.95
+CROSS_FAMILY_ROM_DOMINANCE_RATIO = 1.0
+SAME_FAMILY_SCORE_MARGIN = 0.18
+CROSS_FAMILY_SCORE_MARGIN = 0.25
+SAME_FAMILY_SCORE_RATIO = 1.35
+CROSS_FAMILY_SCORE_RATIO = 1.45
+CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE = 6.0
+
 
 @dataclass
 class JointMotionState:
@@ -112,6 +126,22 @@ def _recent_range_deg(state: JointMotionState) -> float:
     if len(recent_values) < 8:
         return 0.0
     return _percentile(recent_values, 95.0) - _percentile(recent_values, 5.0)
+
+
+def median_recent_range_from_score_debug(
+    scores: dict[str, tuple[float, dict[str, Any]]],
+) -> float:
+    ranges = [
+        float(debug.get("recentRange") or 0.0)
+        for _, (_, debug) in scores.items()
+        if float(debug.get("recentRange") or 0.0) > 0.0
+    ]
+    return float(median(ranges)) if ranges else 0.0
+
+
+def median_cycle_rom_deg(state: JointMotionState) -> float:
+    roms = [float(v) for v in list(state.recent_roms) if isinstance(v, (int, float))]
+    return float(median(roms)) if roms else 0.0
 
 
 def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, Any]) -> float:
@@ -285,7 +315,24 @@ def compute_joint_recalibration_score(
 def select_recalibration_candidate(
     scores: dict[str, tuple[float, dict[str, Any]]],
     selected_angle: Optional[str],
+    *,
+    variance_by_joint: Optional[dict[str, dict[str, Any]]] = None,
 ) -> tuple[str | None, dict[str, Any]]:
+    variance_by_joint = variance_by_joint or {}
+    field_median_range = median_recent_range_from_score_debug(scores)
+    variance_values = [
+        float((variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0)
+        for angle_key in scores
+        if float((variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0) > 0.0
+    ]
+    field_median_variance = float(median(variance_values)) if variance_values else 0.0
+    min_range = field_median_range * CANDIDATE_MIN_MEDIAN_RANGE_RATIO if field_median_range > 0.0 else 0.0
+    min_variance = (
+        max(CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE, field_median_variance * CANDIDATE_MIN_MEDIAN_RANGE_RATIO)
+        if field_median_variance > 0.0
+        else CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE
+    )
+
     best_key: Optional[str] = None
     best_score = -1.0
     best_debug: dict[str, Any] = {}
@@ -294,11 +341,24 @@ def select_recalibration_candidate(
             continue
         if float(debug.get("poseScore") or 0.0) < UNOBSERVABLE_POSE_SCORE:
             continue
+        recent_range = float(debug.get("recentRange") or 0.0)
+        if min_range > 0.0 and recent_range < min_range:
+            continue
+        joint_variance = float(
+            (variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0
+        )
+        if joint_variance > 0.0 and joint_variance < min_variance:
+            continue
         if score > best_score:
             best_key = angle_key
             best_score = float(score)
             best_debug = debug
-    return best_key, {"candidateScore": best_score, "candidateDebug": best_debug}
+    return best_key, {
+        "candidateScore": best_score,
+        "candidateDebug": best_debug,
+        "fieldMedianRange": field_median_range,
+        "fieldMedianVariance": field_median_variance,
+    }
 
 
 def should_switch_to_candidate(
@@ -317,24 +377,62 @@ def should_switch_to_candidate(
     candidate_pose_score: float,
     candidate_observable: bool,
     candidate_completed_cycles: int,
+    candidate_recent_range: float = 0.0,
+    candidate_median_rom_deg: float = 0.0,
+    selected_median_rom_deg: float = 0.0,
+    median_recent_range_all: float = 0.0,
+    same_joint_family: bool = False,
 ) -> tuple[bool, bool, dict[str, Any]]:
+    incumbent_range_healthy = (
+        selected_recent_range >= stale_switch_max_selected_recent_range_deg
+        and selected_range_gate_closed_streak < stale_switch_min_closed_streak
+        and selected_pose_score >= UNOBSERVABLE_POSE_SCORE
+    )
+    stale_threshold = STALE_REEVAL_INCUMBENT_BAD if incumbent_range_healthy else 1
+    stale_incumbent_bad = stale_reevals >= stale_threshold
     incumbent_bad = (
-        stale_reevals >= 1
+        stale_incumbent_bad
         or selected_recent_range < stale_switch_max_selected_recent_range_deg
         or selected_range_gate_closed_streak >= stale_switch_min_closed_streak
         or selected_score < 0.35
         or selected_pose_score < UNOBSERVABLE_POSE_SCORE
     )
+
+    range_ratio = SAME_FAMILY_MIN_RANGE_RATIO if same_joint_family else CROSS_FAMILY_MIN_RANGE_RATIO
+    rom_ratio = SAME_FAMILY_ROM_DOMINANCE_RATIO if same_joint_family else CROSS_FAMILY_ROM_DOMINANCE_RATIO
+    score_margin = SAME_FAMILY_SCORE_MARGIN if same_joint_family else CROSS_FAMILY_SCORE_MARGIN
+    score_ratio = SAME_FAMILY_SCORE_RATIO if same_joint_family else CROSS_FAMILY_SCORE_RATIO
+
+    candidate_range_vs_incumbent = (
+        candidate_recent_range <= 0.0
+        or selected_recent_range <= 0.0
+        or candidate_recent_range >= selected_recent_range * range_ratio
+    )
+    candidate_range_vs_field = (
+        median_recent_range_all <= 0.0
+        or candidate_recent_range <= 0.0
+        or candidate_recent_range >= median_recent_range_all * CANDIDATE_MIN_MEDIAN_RANGE_RATIO
+    )
+    candidate_rom_dominates = (
+        candidate_median_rom_deg <= 0.0
+        or selected_median_rom_deg <= 0.0
+        or candidate_median_rom_deg >= selected_median_rom_deg * rom_ratio
+    )
+    candidate_motion_ok = (
+        candidate_range_vs_incumbent and candidate_range_vs_field and candidate_rom_dominates
+    )
+
     candidate_good = (
         candidate_score >= CANDIDATE_MIN_SCORE
         and candidate_activity_score >= CANDIDATE_MIN_ACTIVITY
         and candidate_pose_score >= CANDIDATE_MIN_POSE_SCORE
         and candidate_observable
         and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+        and candidate_motion_ok
     )
     candidate_clearly_better = (
-        candidate_score >= selected_score + 0.18
-        or candidate_score >= selected_score * 1.35
+        candidate_score >= selected_score + score_margin
+        or candidate_score >= selected_score * score_ratio
     )
     should_switch = cooldown_ok and incumbent_bad and candidate_good and candidate_clearly_better
 
@@ -344,12 +442,20 @@ def should_switch_to_candidate(
         and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
         and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
         and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+        and candidate_motion_ok
     )
     return bool(should_switch), bool(force_switch), {
         "incumbentBad": bool(incumbent_bad),
+        "incumbentRangeHealthy": bool(incumbent_range_healthy),
+        "staleThreshold": int(stale_threshold),
         "candidateGood": bool(candidate_good),
+        "candidateMotionOk": bool(candidate_motion_ok),
+        "candidateRangeVsIncumbent": bool(candidate_range_vs_incumbent),
+        "candidateRangeVsField": bool(candidate_range_vs_field),
+        "candidateRomDominates": bool(candidate_rom_dominates),
         "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),
+        "sameJointFamily": bool(same_joint_family),
         "shouldSwitch": bool(should_switch),
         "forceSwitch": bool(force_switch),
     }
@@ -390,27 +496,55 @@ def cycle_sync_score_last_4s(
 
 
 def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
-    prior_synchronized_same_exercise = (
-        bool(pending_state.get("same_joint_family"))
-        and int(pending_state.get("incumbent_cycles_last_4s") or 0) >= 2
-        and int(pending_state.get("candidate_cycles_last_4s") or 0) >= 2
-        and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
-    )
-    if prior_synchronized_same_exercise:
-        return HandoffDecision(
-            kind="same_exercise",
-            rationale={"rule": "prior_synchronized_same_exercise"},
-        )
-
     incumbent_motion_span = float(pending_state.get("incumbent_motion_span_deg") or 0.0)
     candidate_pending_rom = float(pending_state.get("candidate_pending_rom_estimate_deg") or 0.0)
     incumbent_active_motion_threshold = max(
         INCUMBENT_ACTIVE_MOTION_MIN_SPAN_DEG,
         INCUMBENT_ACTIVE_MOTION_ROM_RATIO * candidate_pending_rom,
     )
+    incumbent_stopped = (
+        not bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
+        and incumbent_motion_span < incumbent_active_motion_threshold
+    )
+    candidate_delta_since_observation_start = max(
+        0,
+        int(pending_state.get("candidate_current_raw") or 0)
+        - int(pending_state.get("candidate_carryover_start_raw") or 0),
+    )
+    candidate_has_background_reps = int(pending_state.get("candidate_current_raw") or 0) > 0
+    candidate_active_now = (
+        candidate_delta_since_observation_start >= 1
+        or bool(pending_state.get("candidate_completed_gated_cycle_during_pending"))
+    )
     if (
-        bool(pending_state.get("incumbent_advanced"))
-        or bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
+        bool(pending_state.get("mirrored_pair"))
+        and bool(pending_state.get("same_joint_family"))
+        and incumbent_stopped
+        and (candidate_active_now or candidate_has_background_reps)
+    ):
+        return HandoffDecision(
+            kind="alternate_limb",
+            rationale={
+                "rule": "mirrored_incumbent_stopped",
+                "candidateDeltaSinceObservationStart": candidate_delta_since_observation_start,
+                "candidateCurrentRaw": int(pending_state.get("candidate_current_raw") or 0),
+            },
+        )
+
+    prior_synchronized_same_exercise = (
+        bool(pending_state.get("same_joint_family"))
+        and int(pending_state.get("incumbent_cycles_last_4s") or 0) >= 2
+        and int(pending_state.get("candidate_cycles_last_4s") or 0) >= 2
+        and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
+        and not incumbent_stopped
+    )
+    if prior_synchronized_same_exercise:
+        return HandoffDecision(
+            kind="same_exercise",
+            rationale={"rule": "prior_synchronized_same_exercise"},
+        )
+    if (
+        bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
         or incumbent_motion_span >= incumbent_active_motion_threshold
     ):
         return HandoffDecision(
@@ -442,7 +576,15 @@ def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
         and float(pending_state.get("cycle_sync_score_last_4s") or 0.0) >= 0.60
         and int(pending_state.get("candidate_cycles_last_4s") or 0) >= 2
     )
-    if incumbent_disappeared and candidate_had_prior_cycles:
+    if (
+        incumbent_disappeared
+        and candidate_had_prior_cycles
+        and not (
+            bool(pending_state.get("mirrored_pair"))
+            and bool(pending_state.get("same_joint_family"))
+            and incumbent_stopped
+        )
+    ):
         return HandoffDecision(
             kind="same_exercise",
             rationale={"rule": "incumbent_disappeared_with_prior_sync_cycles"},
@@ -451,12 +593,7 @@ def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
     incumbent_quiet_but_visible = (
         bool(pending_state.get("incumbent_observable_during_pending"))
         and incumbent_motion_span < 12.0
-        and not bool(pending_state.get("incumbent_advanced"))
-    )
-    candidate_delta_since_observation_start = max(
-        0,
-        int(pending_state.get("candidate_current_raw") or 0)
-        - int(pending_state.get("candidate_carryover_start_raw") or 0),
+        and not bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
     )
     forced_mirrored_candidate_ready_at_start = (
         bool(pending_state.get("switch_forced"))
@@ -472,7 +609,6 @@ def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
             candidate_delta_since_observation_start >= 1
             or forced_mirrored_candidate_ready_at_start
         )
-        and not bool(pending_state.get("incumbent_advanced"))
         and not bool(pending_state.get("incumbent_completed_gated_cycle_during_pending"))
         and not prior_synchronized_same_exercise
     ):

@@ -143,7 +143,7 @@ DEFAULT_ANGLE_DELTA_DEADBAND = _toml_float("rep", "angle_delta_deadband", defaul
 DEFAULT_CALIBRATION_REPS = _toml_int("rep", "calibration_reps", default=3)
 DEFAULT_CALIBRATION_CERTAINTY = _toml_float("rep", "calibration_certainty", default=0.5)
 DEFAULT_CALIBRATION_FORCE_EXTRA_REPS = _toml_int("rep", "calibration_force_extra_reps", default=2)
-DEFAULT_MIN_REP_INTERVAL_MS = _toml_float("rep", "min_interval_ms", default=400.0)
+DEFAULT_MIN_REP_INTERVAL_MS = _toml_float("rep", "min_interval_ms", default=300.0)
 
 ANGLE_SELECTION_MIN_SEC = _toml_float("angle_selection", "min_sec", default=7.0)
 ANGLE_SELECTION_MIN_FRAMES = _toml_int("angle_selection", "min_frames", default=70)
@@ -162,6 +162,9 @@ ANGLE_SELECTION_REEVALUATE_EVERY_SEC = _toml_float(
 )
 ANGLE_SELECTION_SWITCH_MIN_SEC = _toml_float(
     "angle_selection", "switch_min_sec", default=1.5
+)
+ANGLE_SELECTION_SWITCH_MIN_REPS = _toml_int(
+    "angle_selection", "switch_min_reps", default=10
 )
 ANGLE_SELECTION_SWITCH_VARIANCE_RATIO = _toml_float(
     "angle_selection", "switch_variance_ratio", default=1.2

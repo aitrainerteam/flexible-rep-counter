@@ -96,13 +96,21 @@ def _activation_targets(
     rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
     if (
         decision.kind == "alternate_limb"
-        and rationale.get("rule") == "forced_switch_mirrored_candidate_ready_or_delta"
-        and bool(rationale.get("candidateReadyAtStart"))
+        and rationale.get("rule") in (
+            "forced_switch_mirrored_candidate_ready_or_delta",
+            "mirrored_incumbent_stopped",
+        )
+        and (
+            bool(rationale.get("candidateReadyAtStart"))
+            or rationale.get("rule") == "mirrored_incumbent_stopped"
+        )
     ):
         candidate_delta_shown = max(0, candidate_current_shown)
         candidate_delta_raw = max(0, candidate_current_raw)
     if decision.kind == "alternate_limb":
-        return cumulative_shown + candidate_delta_shown, cumulative_raw + candidate_delta_raw
+        shown = cumulative_shown + candidate_delta_shown
+        raw = cumulative_raw + candidate_delta_raw
+        return max(shown, cumulative_shown), max(raw, cumulative_raw)
     return cumulative_shown, cumulative_raw
 
 
@@ -140,8 +148,8 @@ def test_alternate_limb_adds_candidate_pending_reps() -> None:
         carryover_start_shown=4,
         carryover_start_raw=4,
     )
-    assert shown == 14
-    assert raw == 14
+    assert shown == 18
+    assert raw == 18
 
 
 def test_forced_mirrored_handoff_with_candidate_delta_is_alternate_limb() -> None:
@@ -222,7 +230,7 @@ def test_forced_mirrored_handoff_carries_full_ready_candidate_when_delta_zero() 
     assert raw == 19
 
 
-def test_incumbent_disappears_without_sync_is_ambiguous() -> None:
+def test_incumbent_disappears_without_sync_is_alternate_limb_when_mirrored() -> None:
     pending = {
         "incumbent_advanced": False,
         "incumbent_completed_gated_cycle_during_pending": False,
@@ -246,7 +254,8 @@ def test_incumbent_disappears_without_sync_is_ambiguous() -> None:
         "candidate_carryover_start_raw": 4,
     }
     decision = classify_handoff(pending)
-    assert decision.kind == "ambiguous"
+    assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
     shown, raw = _activation_targets(
         decision,
         cumulative_shown=10,
@@ -256,14 +265,14 @@ def test_incumbent_disappears_without_sync_is_ambiguous() -> None:
         carryover_start_shown=4,
         carryover_start_raw=4,
     )
-    assert shown == 10
-    assert raw == 10
+    assert shown == 18
+    assert raw == 18
 
 
 def test_same_exercise_better_joint_continues_linearly() -> None:
     pending = {
-        "incumbent_advanced": True,
-        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_advanced": False,
+        "incumbent_completed_gated_cycle_during_pending": True,
         "incumbent_motion_span_deg": 20.0,
         "candidate_pending_rom_estimate_deg": 45.0,
         "incumbent_observable_during_pending": True,
@@ -283,7 +292,7 @@ def test_same_exercise_better_joint_continues_linearly() -> None:
     assert shown == 10
 
 
-def test_fov_disappearance_with_prior_candidate_cycles_continues_linearly() -> None:
+def test_fov_disappearance_with_prior_candidate_cycles_is_alternate_limb_when_mirrored() -> None:
     pending = {
         "incumbent_advanced": False,
         "incumbent_completed_gated_cycle_during_pending": False,
@@ -307,10 +316,11 @@ def test_fov_disappearance_with_prior_candidate_cycles_continues_linearly() -> N
         "candidate_carryover_start_raw": 7,
     }
     decision = classify_handoff(pending)
-    assert decision.kind == "same_exercise"
+    assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
 
 
-def test_fov_disappearance_without_prior_candidate_cycles_is_ambiguous() -> None:
+def test_fov_disappearance_without_prior_candidate_cycles_is_alternate_limb_when_mirrored() -> None:
     pending = {
         "incumbent_advanced": False,
         "incumbent_completed_gated_cycle_during_pending": False,
@@ -334,7 +344,8 @@ def test_fov_disappearance_without_prior_candidate_cycles_is_ambiguous() -> None
         "candidate_carryover_start_raw": 10,
     }
     decision = classify_handoff(pending)
-    assert decision.kind == "ambiguous"
+    assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
     shown, _ = _activation_targets(
         decision,
         cumulative_shown=10,
@@ -344,7 +355,7 @@ def test_fov_disappearance_without_prior_candidate_cycles_is_ambiguous() -> None
         carryover_start_shown=10,
         carryover_start_raw=10,
     )
-    assert shown == 10
+    assert shown == 23
 
 
 def test_cycle_gating_rejects_low_range_cycles() -> None:
@@ -378,6 +389,10 @@ def test_force_stale_requires_two_gated_cycles() -> None:
         candidate_pose_score=0.60,
         candidate_observable=True,
         candidate_completed_cycles=1,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=30.0,
+        selected_median_rom_deg=10.0,
+        median_recent_range_all=35.0,
     )
     assert not can_switch
     assert not force_switch
@@ -397,8 +412,119 @@ def test_force_stale_requires_two_gated_cycles() -> None:
         candidate_pose_score=0.60,
         candidate_observable=True,
         candidate_completed_cycles=2,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=30.0,
+        selected_median_rom_deg=10.0,
+        median_recent_range_all=35.0,
     )
     assert force_switch_after_two
+
+
+def test_healthy_incumbent_does_not_switch_on_single_stale_reeval() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=38.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.66,
+        selected_pose_score=0.95,
+        candidate_score=0.84,
+        candidate_activity_score=1.0,
+        candidate_pose_score=1.0,
+        candidate_observable=True,
+        candidate_completed_cycles=8,
+        candidate_recent_range=51.0,
+        candidate_median_rom_deg=45.0,
+        selected_median_rom_deg=38.0,
+        median_recent_range_all=40.0,
+        same_joint_family=False,
+    )
+    assert not can_switch
+    assert debug["incumbentBad"] is False
+    assert debug["incumbentRangeHealthy"] is True
+
+
+def test_brazil_style_cross_family_switch_blocked_without_rom_dominance() -> None:
+    """Knee tracking squats: elbow looks regular but per-rep ROM is smaller."""
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=3,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=39.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.66,
+        selected_pose_score=0.95,
+        candidate_score=0.84,
+        candidate_activity_score=1.0,
+        candidate_pose_score=1.0,
+        candidate_observable=True,
+        candidate_completed_cycles=8,
+        candidate_recent_range=51.0,
+        candidate_median_rom_deg=28.0,
+        selected_median_rom_deg=42.0,
+        median_recent_range_all=40.0,
+        same_joint_family=False,
+    )
+    assert not can_switch
+    assert debug["candidateMotionOk"] is False
+    assert debug["candidateRomDominates"] is False
+
+
+def test_cross_family_switch_requires_higher_score_margin() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=4,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=20.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.70,
+        selected_pose_score=0.80,
+        candidate_score=0.82,
+        candidate_activity_score=0.70,
+        candidate_pose_score=0.80,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=45.0,
+        candidate_median_rom_deg=40.0,
+        selected_median_rom_deg=30.0,
+        median_recent_range_all=35.0,
+        same_joint_family=False,
+    )
+    assert not can_switch
+    assert debug["candidateClearlyBetter"] is False
+
+
+def test_same_family_mirrored_switch_still_allowed_with_strong_motion() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=3,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.55,
+        selected_pose_score=0.80,
+        candidate_score=0.80,
+        candidate_activity_score=0.70,
+        candidate_pose_score=0.80,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=38.0,
+        selected_median_rom_deg=35.0,
+        median_recent_range_all=35.0,
+        same_joint_family=True,
+    )
+    assert can_switch
+    assert debug["shouldSwitch"] is True
 
 
 def test_no_displayed_count_regression_on_any_handoff() -> None:
@@ -457,7 +583,7 @@ def test_cross_family_switch_cannot_be_alternate_limb() -> None:
     assert decision.kind == "ambiguous"
 
 
-def test_same_exercise_sync_during_pause_does_not_become_alternate_limb() -> None:
+def test_same_exercise_sync_during_pause_becomes_alternate_limb_when_incumbent_stopped() -> None:
     pending = {
         "incumbent_advanced": False,
         "incumbent_completed_gated_cycle_during_pending": False,
@@ -475,7 +601,48 @@ def test_same_exercise_sync_during_pause_does_not_become_alternate_limb() -> Non
         "candidate_carryover_start_raw": 10,
     }
     decision = classify_handoff(pending)
-    assert decision.kind == "same_exercise"
+    assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
+
+
+def test_brazil_series2_style_handoff_is_alternate_limb_with_full_carryover() -> None:
+    """Right set finished, left had background reps; must not drop count or skip carryover."""
+    pending = {
+        "incumbent_advanced": True,
+        "incumbent_completed_gated_cycle_during_pending": False,
+        "incumbent_motion_span_deg": 4.0,
+        "candidate_pending_rom_estimate_deg": 42.0,
+        "incumbent_observable_during_pending": True,
+        "incumbent_pose_score_at_start": 0.80,
+        "incumbent_last_observed_ts_at_start": 1200,
+        "pending_start_ts": 1800,
+        "candidate_completed_cycles_at_start": 3,
+        "candidate_last_cycle_ts_before_start": 1600,
+        "candidate_rom_score_at_start": 0.80,
+        "same_joint_family": True,
+        "incumbent_cycles_last_4s": 3,
+        "candidate_cycles_last_4s": 3,
+        "cycle_sync_score_last_4s": 0.85,
+        "mirrored_pair": True,
+        "candidate_advanced_during_pending": False,
+        "candidate_completed_gated_cycle_during_pending": False,
+        "candidate_current_raw": 3,
+        "candidate_carryover_start_raw": 3,
+    }
+    decision = classify_handoff(pending)
+    assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=9,
+        candidate_current_shown=3,
+        candidate_current_raw=3,
+        carryover_start_shown=3,
+        carryover_start_raw=3,
+    )
+    assert shown == 13
+    assert raw == 12
 
 
 def test_alternate_limb_uses_observation_start_not_pending_start() -> None:
@@ -503,3 +670,15 @@ def test_alternate_limb_uses_observation_start_not_pending_start() -> None:
     }
     decision = classify_handoff(pending)
     assert decision.kind == "alternate_limb"
+    assert decision.rationale.get("rule") == "mirrored_incumbent_stopped"
+    shown, raw = _activation_targets(
+        decision,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        candidate_current_shown=9,
+        candidate_current_raw=9,
+        carryover_start_shown=6,
+        carryover_start_raw=6,
+    )
+    assert shown == 19
+    assert raw == 19

@@ -17,7 +17,6 @@ from flexible_rep_counter.core.math_engine import (
     calculate_from_type,
     create_peak_detector,
     get_min_confidence_for_landmarks,
-    replay_angle_series_on_peak_detector,
 )
 from flexible_rep_counter.core.recalibration_confidence import (
     HandoffDecision,
@@ -27,6 +26,8 @@ from flexible_rep_counter.core.recalibration_confidence import (
     cycle_sync_score_last_4s,
     is_mirrored_pair,
     is_same_joint_family,
+    median_cycle_rom_deg,
+    median_recent_range_from_score_debug,
     select_recalibration_candidate,
     should_switch_to_candidate,
     update_joint_motion_state,
@@ -36,11 +37,13 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_DOMINANCE_FRACTION,
     ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES,
     ANGLE_SELECTION_MAX_BUFFER_FRAMES,
+    ANGLE_SELECTION_MIN_ACTIVE_WINDOWS,
     ANGLE_SELECTION_MIN_FRAMES,
     ANGLE_SELECTION_MIN_LEADING_REPS,
     ANGLE_SELECTION_MIN_SEC,
     ANGLE_SELECTION_RETRY_INTERVAL_SEC,
     ANGLE_SELECTION_REEVALUATE_EVERY_SEC,
+    ANGLE_SELECTION_SWITCH_MIN_REPS,
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     get_default_tuning_params,
@@ -60,6 +63,7 @@ from flexible_rep_counter.core.variance_angle_selector import (
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
+    passes_consistent_variance_gate,
     summarize_rep_dominance,
 )
 from flexible_rep_counter.types import StepResult
@@ -68,13 +72,15 @@ DEFAULT_TUNING_PARAMS = get_default_tuning_params()
 
 # Match yolo-deploy / angles.py gate so pose_dropped aligns with omitted angles in JSON.
 _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
-# Temporary kill-switch: disable runtime variance-based joint recalibration/switching.
+# Temporary kill-switch: disable runtime variance-based joint recalibration/switching,
+# pending handoff observation, and classify_handoff carryover.
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
 STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
 STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG = 14.0
 STALE_SWITCH_MIN_CLOSED_STREAK = 10
 STALE_SWITCH_FORCE_AFTER_STALE_REEVALS = 8
+JOINT_SWITCH_MIN_REPS_SINCE_LAST = max(1, int(ANGLE_SELECTION_SWITCH_MIN_REPS))
 PENDING_SWITCH_MIN_OBSERVATION_MS = 300
 PENDING_SWITCH_MAX_OBSERVATION_MS = 600
 HANDOFF_OBSERVATION_MIN_COMPLETED_CYCLES = 2
@@ -91,6 +97,16 @@ LOW_FPS_EXIT_P90_MS = float(CFG_LOW_FPS_EXIT_P90_MS)
 LOW_FPS_ENTER_STREAK = max(1, int(CFG_LOW_FPS_ENTER_STREAK_FRAMES))
 LOW_FPS_EXIT_STREAK = max(1, int(CFG_LOW_FPS_EXIT_STREAK_FRAMES))
 LOW_FPS_GAP_SPIKE_MS = 200.0
+JOINT_SWITCH_SUPPRESS_RETROACTIVE_STEPS = 45
+REFERENCE_FPS_FOR_PEAK_DISTANCE = 12.0
+MIN_PEAK_DISTANCE_FLOOR = 2
+SELECTION_RELAX_MAX_SEC = 6.0
+SELECTION_MIN_DOMINANCE_FRACTION = 0.54
+SELECTION_MIN_FAMILY_DOMINANCE_FRACTION = 0.50
+SELECTION_MIN_STREAK_FRAMES = 8
+SELECTION_MIN_ACTIVE_WINDOWS_RELAXED = 2
+SELECTION_MIN_MEDIAN_VARIANCE_ABS = 3.0
+SELECTION_MIN_RANGE_DEG_ABS = 10.0
 
 
 def _diagnose_missing_angle(
@@ -137,6 +153,156 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
     )
 
 
+def _normalized_angle_family(angle_key: str) -> str:
+    base = angle_key
+    if base.startswith("LEFT_"):
+        base = base[len("LEFT_") :]
+    elif base.startswith("RIGHT_"):
+        base = base[len("RIGHT_") :]
+    if base.endswith("_ACROSS"):
+        base = base[: -len("_ACROSS")]
+    return base
+
+
+def _selection_relax_progress(elapsed_s: float) -> float:
+    if elapsed_s <= ANGLE_SELECTION_MIN_SEC:
+        return 0.0
+    return min(
+        1.0,
+        max(0.0, (elapsed_s - ANGLE_SELECTION_MIN_SEC) / max(0.1, SELECTION_RELAX_MAX_SEC)),
+    )
+
+
+def _selection_dominance_thresholds(elapsed_s: float) -> dict[str, Any]:
+    progress = _selection_relax_progress(elapsed_s)
+    joint_fraction = max(
+        SELECTION_MIN_DOMINANCE_FRACTION,
+        float(ANGLE_SELECTION_DOMINANCE_FRACTION) - 0.12 * progress,
+    )
+    family_fraction = max(
+        SELECTION_MIN_FAMILY_DOMINANCE_FRACTION,
+        min(joint_fraction, float(ANGLE_SELECTION_DOMINANCE_FRACTION) - 0.16 * progress),
+    )
+    streak_required = int(
+        round(
+            max(
+                float(SELECTION_MIN_STREAK_FRAMES),
+                float(ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES)
+                - (float(ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES) - float(SELECTION_MIN_STREAK_FRAMES))
+                * progress,
+            )
+        )
+    )
+    min_leading_reps = max(
+        1,
+        int(round(float(ANGLE_SELECTION_MIN_LEADING_REPS) - progress)),
+    )
+    return {
+        "progress": progress,
+        "joint_fraction": joint_fraction,
+        "family_fraction": family_fraction,
+        "streak_required": streak_required,
+        "min_leading_reps": min_leading_reps,
+    }
+
+
+def _adaptive_variance_gate(
+    angle_key: str,
+    variances: dict[str, dict[str, Any]],
+    *,
+    elapsed_s: float,
+) -> bool:
+    if passes_consistent_variance_gate(variances, angle_key):
+        return True
+    row = variances.get(angle_key) or {}
+    active_windows = int(row.get("activeWindowCount") or 0)
+    median_var = float(row.get("medianWindowVariance") or 0.0)
+    range_deg = float(row.get("smoothedRangeDeg") or 0.0)
+    if active_windows <= 0 or median_var <= 0.0 or range_deg <= 0.0:
+        return False
+    progress = _selection_relax_progress(elapsed_s)
+    all_variances = [
+        float(v.get("medianWindowVariance") or 0.0)
+        for v in variances.values()
+        if float(v.get("medianWindowVariance") or 0.0) > 0.0
+    ]
+    all_ranges = [
+        float(v.get("smoothedRangeDeg") or 0.0)
+        for v in variances.values()
+        if float(v.get("smoothedRangeDeg") or 0.0) > 0.0
+    ]
+    med_variance = sorted(all_variances)[len(all_variances) // 2] if all_variances else 0.0
+    med_range = sorted(all_ranges)[len(all_ranges) // 2] if all_ranges else 0.0
+    min_windows = max(
+        SELECTION_MIN_ACTIVE_WINDOWS_RELAXED,
+        int(round(ANGLE_SELECTION_MIN_ACTIVE_WINDOWS - progress)),
+    )
+    required_variance = max(
+        SELECTION_MIN_MEDIAN_VARIANCE_ABS,
+        med_variance * (0.95 - 0.35 * progress),
+    )
+    required_range = max(
+        SELECTION_MIN_RANGE_DEG_ABS,
+        med_range * (0.92 - 0.32 * progress),
+    )
+    return (
+        active_windows >= min_windows
+        and median_var >= required_variance
+        and range_deg >= required_range
+    )
+
+
+def _family_rep_dominance(rep_counts: dict[str, int]) -> dict[str, Any]:
+    by_family: dict[str, int] = {}
+    for angle_key, reps in rep_counts.items():
+        count = int(reps or 0)
+        if count <= 0:
+            continue
+        family = _normalized_angle_family(angle_key)
+        by_family[family] = by_family.get(family, 0) + count
+    total = sum(by_family.values())
+    if total <= 0 or not by_family:
+        return {
+            "totalReps": 0,
+            "leaderFamily": None,
+            "leaderReps": 0,
+            "leaderShare": 0.0,
+        }
+    leader_family = max(by_family.keys(), key=lambda k: by_family[k])
+    leader_reps = int(by_family[leader_family])
+    return {
+        "totalReps": int(total),
+        "leaderFamily": leader_family,
+        "leaderReps": leader_reps,
+        "leaderShare": float(leader_reps / total),
+    }
+
+
+def _select_family_joint_candidate(
+    *,
+    leader_family: str,
+    rep_counts: dict[str, int],
+    variances: dict[str, dict[str, Any]],
+    elapsed_s: float,
+) -> Optional[str]:
+    best: Optional[tuple[int, float, float, str]] = None
+    for angle_key in COMMON_ANGLES:
+        if _normalized_angle_family(angle_key) != leader_family:
+            continue
+        if not _adaptive_variance_gate(angle_key, variances, elapsed_s=elapsed_s):
+            continue
+        row = variances.get(angle_key) or {}
+        reps = int(rep_counts.get(angle_key) or 0)
+        var_score = float(row.get("medianWindowVariance") or 0.0)
+        range_score = float(row.get("smoothedRangeDeg") or 0.0)
+        candidate = (reps, var_score, range_score, angle_key)
+        if best is None or candidate > best:
+            best = candidate
+    if best is None:
+        return None
+    return best[3]
+
+
 def _build_joint_motion_states(
     tuning_params: dict[str, Any],
     *,
@@ -160,28 +326,28 @@ def _apply_locked_tracking(
     tuning_params: dict[str, Any],
     *,
     selection_detector: Optional[Any] = None,
+    initial_angle_value: Optional[float] = None,
 ) -> None:
     run_state["selected_angle"] = selected_angle
     run_state["selected_config"] = COMMON_ANGLES[selected_angle]
     run_state["selection_last_attempt"] = None
     run_state["selection_last_reevaluate_at"] = time.time()
     run_state["selection_last_switch_at"] = time.time()
-    det: Any
-    if selection_detector is not None:
-        det = selection_detector
-    else:
-        det = _peak_detector_from_tuning(tuning_params)
-        cfg = COMMON_ANGLES[selected_angle]
-        series = []
-        for lm in buf_list or []:
-            series.append(calculate_from_type(cfg["type"], cfg["landmarks"], lm))
-        replay_angle_series_on_peak_detector(det, series)
+    # Never carry rep debt from selection detectors into tracking lock.
+    # Selection may run for many frames while outputs remain hidden (reps=0),
+    # so reusing the detector would surface a sudden jump on first lock.
+    det: Any = _peak_detector_from_tuning(tuning_params)
+    if isinstance(initial_angle_value, (int, float)):
+        angle_seed = float(initial_angle_value)
+        if angle_seed == angle_seed:
+            det.update(angle_seed)
     run_state["peak_detector"] = det
     run_state["rep_count_offset"] = 0
     run_state["rep_count_raw_offset"] = 0
     _clear_pending_switch(run_state)
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
+    _mark_joint_activation_guard(run_state)
 
 
 def _is_valid_angle_value(value: Optional[float]) -> bool:
@@ -230,6 +396,112 @@ def _detector_counts(detector: Optional[Any]) -> tuple[int, int]:
     if peaks and valleys and len(peaks) != len(valleys):
         shown += 1
     return shown, raw
+
+
+def _detector_raw_count(detector: Optional[Any]) -> int:
+    if detector is None:
+        return 0
+    return int(detector.get_rep_count() or 0)
+
+
+def _trim_incomplete_extremum(detector: Optional[Any]) -> None:
+    """Drop a trailing half-cycle so handoff offsets are not inflated by peak/valley skew."""
+    if detector is None:
+        return
+    peaks = getattr(detector, "peaks", None)
+    valleys = getattr(detector, "valleys", None)
+    if not isinstance(peaks, list) or not isinstance(valleys, list):
+        return
+    if not peaks or not valleys:
+        return
+    if len(peaks) > len(valleys):
+        peaks.pop()
+    elif len(valleys) > len(peaks):
+        valleys.pop()
+
+
+def _retroactive_credit_eligible(detector: Optional[Any], run_state: dict[str, Any]) -> bool:
+    if detector is None:
+        return False
+    suppress_until = int(run_state.get("suppress_retroactive_credit_until_step") or 0)
+    step = int(run_state.get("tracking_step_count") or 0)
+    if step < suppress_until:
+        return False
+    peaks = list(getattr(detector, "peaks", []) or [])
+    valleys = list(getattr(detector, "valleys", []) or [])
+    return bool(peaks and valleys and len(peaks) != len(valleys))
+
+
+def _mark_joint_activation_guard(run_state: dict[str, Any]) -> None:
+    step = int(run_state.get("tracking_step_count") or 0)
+    run_state["suppress_retroactive_credit_until_step"] = (
+        step + JOINT_SWITCH_SUPPRESS_RETROACTIVE_STEPS
+    )
+    run_state["last_joint_switch_step"] = step
+
+
+def _apply_monotonic_shown_floor(run_state: dict[str, Any], cumulative_shown: int) -> int:
+    floor = int(run_state.get("rep_count_shown_floor") or 0)
+    shown = max(int(cumulative_shown), floor)
+    if shown > floor:
+        run_state["rep_count_shown_floor"] = shown
+    return shown
+
+
+def _ledger_cumulative_reps(
+    run_state: dict[str, Any],
+    detector: Optional[Any],
+    *,
+    include_retroactive: bool,
+) -> tuple[int, int]:
+    raw = _detector_raw_count(detector)
+    cumulative_raw = int(run_state.get("rep_count_raw_offset") or 0) + raw
+    retro = 1 if include_retroactive and _retroactive_credit_eligible(detector, run_state) else 0
+    cumulative_shown = _apply_monotonic_shown_floor(
+        run_state,
+        int(run_state.get("rep_count_offset") or 0) + raw + retro,
+    )
+    return cumulative_shown, cumulative_raw
+
+
+def _effective_min_peak_distance(base: int, run_state: dict[str, Any]) -> int:
+    fps = run_state.get("low_fps_effective_fps")
+    if not isinstance(fps, (int, float)) or fps <= 0:
+        return base
+    scaled = int(round(base * REFERENCE_FPS_FOR_PEAK_DISTANCE / float(fps)))
+    return max(MIN_PEAK_DISTANCE_FLOOR, scaled)
+
+
+def _apply_fps_scaled_peak_distance(
+    run_state: dict[str, Any],
+    joint_states: dict[str, JointMotionState],
+    *,
+    peak_detector: Optional[Any] = None,
+) -> None:
+    base = int(
+        (run_state.get("tuning_params") or DEFAULT_TUNING_PARAMS).get(
+            "minPeakDistance", DEFAULT_TUNING_PARAMS["minPeakDistance"]
+        )
+    )
+    effective = _effective_min_peak_distance(base, run_state)
+    if int(run_state.get("_last_applied_min_peak_distance") or -1) == effective:
+        return
+    run_state["_last_applied_min_peak_distance"] = effective
+    for state in joint_states.values():
+        det = state.detector
+        if det is not None and hasattr(det, "min_peak_distance"):
+            det.min_peak_distance = effective
+    active = peak_detector
+    if active is not None and hasattr(active, "min_peak_distance"):
+        active.min_peak_distance = effective
+
+
+def _init_ledger_guard_state(run_state: dict[str, Any]) -> None:
+    run_state["tracking_step_count"] = 0
+    run_state["suppress_retroactive_credit_until_step"] = 0
+    run_state["last_joint_switch_step"] = 0
+    run_state["rep_count_shown_floor"] = 0
+    run_state["_last_applied_min_peak_distance"] = -1
 
 
 def _percentile_nearest(sorted_values: list[float], pct: float) -> float:
@@ -415,7 +687,9 @@ def _activate_joint_switch(
     switched_at: float,
 ) -> None:
     detectors_by_angle[new_angle] = detector
-    candidate_current_shown, candidate_current_raw = _detector_counts(detector)
+    _trim_incomplete_extremum(detector)
+    candidate_current_raw = _detector_raw_count(detector)
+    candidate_current_shown, _ = _detector_counts(detector)
     pending_state = {
         "incumbent_advanced": bool(run_state.get("pending_switch_incumbent_advanced")),
         "incumbent_completed_gated_cycle_during_pending": bool(
@@ -465,7 +739,7 @@ def _activate_joint_switch(
 
     carryover_start_shown = int(run_state.get("pending_switch_candidate_carryover_start_shown") or 0)
     carryover_start_raw = int(run_state.get("pending_switch_candidate_carryover_start_raw") or 0)
-    candidate_delta_shown = max(0, candidate_current_shown - carryover_start_shown)
+    candidate_delta_shown = max(0, candidate_current_raw - carryover_start_raw)
     candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
     rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
     if decision.kind == "alternate_limb" and LOW_FPS_SAFE_MODE_ENABLED and bool(
@@ -480,14 +754,17 @@ def _activate_joint_switch(
             },
         )
         rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
-    if (
-        decision.kind == "alternate_limb"
-        and rationale.get("rule") == "forced_switch_mirrored_candidate_ready_or_delta"
-        and bool(rationale.get("candidateReadyAtStart"))
+    if decision.kind == "alternate_limb" and rationale.get("rule") in (
+        "forced_switch_mirrored_candidate_ready_or_delta",
+        "mirrored_incumbent_stopped",
+    ) and (
+        bool(rationale.get("candidateReadyAtStart"))
+        or rationale.get("rule") == "mirrored_incumbent_stopped"
     ):
         # When the mirrored candidate was already ready before pending observation
-        # started, count its full calibrated reps as alternate exercise carryover.
-        candidate_delta_shown = max(0, candidate_current_shown)
+        # started, or the incumbent stopped on a mirrored limb switch, count the
+        # candidate's full calibrated reps as alternate exercise carryover.
+        candidate_delta_shown = max(0, candidate_current_raw)
         candidate_delta_raw = max(0, candidate_current_raw)
     if decision.kind == "alternate_limb":
         target_display_shown = cumulative_shown + candidate_delta_shown
@@ -496,10 +773,14 @@ def _activate_joint_switch(
         target_display_shown = cumulative_shown
         target_display_raw = cumulative_raw
 
+    # Handoff must never reduce the displayed count, with or without carryover.
+    target_display_shown = max(target_display_shown, cumulative_shown)
+    target_display_raw = max(target_display_raw, cumulative_raw)
+
     before_activation_shown = cumulative_shown
-    run_state["rep_count_offset"] = target_display_shown - candidate_current_shown
+    run_state["rep_count_offset"] = target_display_shown - candidate_current_raw
     run_state["rep_count_raw_offset"] = target_display_raw - candidate_current_raw
-    after_activation_shown = candidate_current_shown + int(run_state["rep_count_offset"])
+    after_activation_shown = candidate_current_raw + int(run_state["rep_count_offset"])
     assert after_activation_shown == target_display_shown
     assert after_activation_shown >= before_activation_shown
     if decision.kind in ("same_exercise", "ambiguous"):
@@ -528,8 +809,10 @@ def _activate_joint_switch(
     run_state["selected_config"] = COMMON_ANGLES[new_angle]
     run_state["peak_detector"] = detector
     run_state["selection_last_switch_at"] = switched_at
+    run_state["selection_reps_at_last_recal_switch"] = int(cumulative_shown)
     _clear_pending_switch(run_state)
     _clear_handoff_observation(run_state)
+    _mark_joint_activation_guard(run_state)
 
 
 def _collect_joint_records(
@@ -712,6 +995,7 @@ class RepCounterSession:
             "selection_last_attempt": None,
             "selection_last_reevaluate_at": None,
             "selection_last_switch_at": None,
+            "selection_reps_at_last_recal_switch": None,
             "selection_detectors_by_angle": {},
             "joint_motion_states": _build_joint_motion_states(dict(tp)),
             "selection_dominance_key": None,
@@ -744,6 +1028,7 @@ class RepCounterSession:
             "low_fps_effective_fps": None,
             "_prev_calibration_complete": None,
         }
+        _init_ledger_guard_state(self._run_state)
         _clear_pending_switch(self._run_state)
         _clear_handoff_observation(self._run_state)
         if self._pose_pipeline is not None:
@@ -786,6 +1071,7 @@ class RepCounterSession:
         self._run_state["low_fps_p90_ms"] = None
         self._run_state["low_fps_gaps_over_200ms"] = 0
         self._run_state["low_fps_effective_fps"] = None
+        _init_ledger_guard_state(self._run_state)
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)
 
@@ -828,6 +1114,7 @@ class RepCounterSession:
         self._run_state["low_fps_p90_ms"] = None
         self._run_state["low_fps_gaps_over_200ms"] = 0
         self._run_state["low_fps_effective_fps"] = None
+        _init_ledger_guard_state(self._run_state)
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)
 
@@ -1250,6 +1537,7 @@ class RepCounterSession:
                 lm,
             )
             perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
+            _apply_fps_scaled_peak_distance(rs, joint_states)
 
             rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
             rep_dom = summarize_rep_dominance(rep_counts_sel)
@@ -1258,40 +1546,6 @@ class RepCounterSession:
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
             joint_records = _collect_joint_records(sdba, variances)
 
-            ready = (
-                len(frame_buffer) >= ANGLE_SELECTION_MIN_FRAMES
-                and elapsed >= ANGLE_SELECTION_MIN_SEC
-            )
-            last_att = rs.get("selection_last_attempt")
-            can_try = ready and (
-                last_att is None
-                or (now - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
-            )
-            dom_ok = dominance_conditions_met(
-                variances,
-                rep_dom,
-                dominance_fraction=ANGLE_SELECTION_DOMINANCE_FRACTION,
-                min_leading_reps=ANGLE_SELECTION_MIN_LEADING_REPS,
-            )
-            leader_key = rep_dom.get("leaderKey")
-            if dom_ok and leader_key:
-                if rs.get("selection_dominance_key") == leader_key:
-                    rs["selection_dominance_streak"] = int(
-                        rs.get("selection_dominance_streak") or 0
-                    ) + 1
-                else:
-                    rs["selection_dominance_key"] = leader_key
-                    rs["selection_dominance_streak"] = 1
-            else:
-                rs["selection_dominance_key"] = None
-                rs["selection_dominance_streak"] = 0
-
-            streak = int(rs.get("selection_dominance_streak") or 0)
-            lock_from_dominance = (
-                ready and dom_ok and streak >= ANGLE_SELECTION_DOMINANCE_STREAK_FRAMES
-            )
-            # If we already observe enough reps during selection, allow earlier variance lock
-            # instead of waiting the full fallback timeout.
             cal_reps_target = int(
                 tuning_params.get(
                     "calibrationReps",
@@ -1299,6 +1553,80 @@ class RepCounterSession:
                 )
             )
             total_selection_reps = int(rep_dom.get("totalReps") or 0)
+            rep_evidence_ready = total_selection_reps >= cal_reps_target
+            frame_ready = len(frame_buffer) >= ANGLE_SELECTION_MIN_FRAMES
+            ready = frame_ready and (
+                elapsed >= ANGLE_SELECTION_MIN_SEC or rep_evidence_ready
+            )
+            last_att = rs.get("selection_last_attempt")
+            can_try = ready and (
+                last_att is None
+                or (now - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
+            )
+            sel_thresholds = _selection_dominance_thresholds(elapsed)
+            dom_ok_joint = dominance_conditions_met(
+                variances,
+                rep_dom,
+                dominance_fraction=float(sel_thresholds["joint_fraction"]),
+                min_leading_reps=int(sel_thresholds["min_leading_reps"]),
+            )
+            leader_key: Optional[str] = (
+                rep_dom.get("leaderKey") if isinstance(rep_dom.get("leaderKey"), str) else None
+            )
+            family_dom = _family_rep_dominance(rep_counts_sel)
+            family_leader = (
+                family_dom.get("leaderFamily")
+                if isinstance(family_dom.get("leaderFamily"), str)
+                else None
+            )
+            dom_ok_family = bool(
+                family_leader
+                and float(family_dom.get("leaderShare") or 0.0) > float(sel_thresholds["family_fraction"])
+                and int(family_dom.get("leaderReps") or 0) >= int(sel_thresholds["min_leading_reps"])
+            )
+            selected_from_family = False
+            dominance_token: Optional[str] = None
+            if dom_ok_joint and leader_key is not None:
+                dominance_token = leader_key
+            elif dom_ok_family and family_leader is not None:
+                family_joint = _select_family_joint_candidate(
+                    leader_family=family_leader,
+                    rep_counts=rep_counts_sel,
+                    variances=variances,
+                    elapsed_s=elapsed,
+                )
+                if family_joint is not None:
+                    leader_key = family_joint
+                    dominance_token = f"FAMILY::{family_leader}"
+                    selected_from_family = True
+
+            if dominance_token and leader_key:
+                if rs.get("selection_dominance_key") == dominance_token:
+                    rs["selection_dominance_streak"] = int(
+                        rs.get("selection_dominance_streak") or 0
+                    ) + 1
+                else:
+                    rs["selection_dominance_key"] = dominance_token
+                    rs["selection_dominance_streak"] = 1
+            else:
+                rs["selection_dominance_key"] = None
+                rs["selection_dominance_streak"] = 0
+
+            streak = int(rs.get("selection_dominance_streak") or 0)
+            dominance_streak_required = int(sel_thresholds["streak_required"])
+            if rep_evidence_ready:
+                dominance_streak_required = max(
+                    int(sel_thresholds["min_leading_reps"]),
+                    dominance_streak_required // 2,
+                )
+            lock_from_dominance = (
+                frame_ready
+                and (elapsed >= ANGLE_SELECTION_MIN_SEC or rep_evidence_ready)
+                and (dom_ok_joint or selected_from_family)
+                and streak >= dominance_streak_required
+            )
+            # If we already observe enough reps during selection, allow earlier variance lock
+            # instead of waiting the full fallback timeout.
             variance_fallback_ready = ready and (
                 elapsed >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC
                 or total_selection_reps >= cal_reps_target
@@ -1313,6 +1641,7 @@ class RepCounterSession:
                     None,
                     tuning_params,
                     selection_detector=sdba.get(leader_key),
+                    initial_angle_value=selecting_angle_values.get(leader_key),
                 )
                 locked_this_frame = True
                 self._sync_detector_instrumentation_flags()
@@ -1336,14 +1665,35 @@ class RepCounterSession:
                         None,
                         tuning_params,
                         selection_detector=sdba.get(selected_key),
+                        initial_angle_value=selecting_angle_values.get(selected_key),
                     )
                     locked_this_frame = True
                     self._sync_detector_instrumentation_flags()
                 else:
-                    rs["selected_angle"] = None
-                    rs["selected_config"] = None
-                    rs["peak_detector"] = None
-                    rs["selection_last_attempt"] = now
+                    relaxed_family_joint: Optional[str] = None
+                    if dom_ok_family and family_leader is not None:
+                        relaxed_family_joint = _select_family_joint_candidate(
+                            leader_family=family_leader,
+                            rep_counts=rep_counts_sel,
+                            variances=variances,
+                            elapsed_s=elapsed,
+                        )
+                    if relaxed_family_joint is not None:
+                        _apply_locked_tracking(
+                            rs,
+                            relaxed_family_joint,
+                            None,
+                            tuning_params,
+                            selection_detector=sdba.get(relaxed_family_joint),
+                            initial_angle_value=selecting_angle_values.get(relaxed_family_joint),
+                        )
+                        locked_this_frame = True
+                        self._sync_detector_instrumentation_flags()
+                    else:
+                        rs["selected_angle"] = None
+                        rs["selected_config"] = None
+                        rs["peak_detector"] = None
+                        rs["selection_last_attempt"] = now
             perf_ms["selection_logic_ms"] = (time.perf_counter() - t_sel) * 1000.0
 
             retry_at = rs.get("selection_last_attempt")
@@ -1355,7 +1705,7 @@ class RepCounterSession:
                 locked_this_frame=locked_this_frame,
                 selected_angle=rs.get("selected_angle"),
                 run_state_selected=rs.get("selected_angle"),
-                dom_ok=dom_ok,
+                dom_ok=bool(dom_ok_joint or selected_from_family),
                 leader_key=leader_key,
                 streak=streak,
                 rep_dom=rep_dom,
@@ -1394,7 +1744,12 @@ class RepCounterSession:
                 leader_key=leader_key if isinstance(leader_key, str) else None,
                 selection_debug={
                     "rep_dom": rep_dom,
-                    "dom_ok": dom_ok,
+                    "dom_ok": bool(dom_ok_joint or selected_from_family),
+                    "dom_ok_joint": bool(dom_ok_joint),
+                    "dom_ok_family": bool(dom_ok_family),
+                    "family_rep_dom": family_dom,
+                    "selected_from_family": bool(selected_from_family),
+                    "dominance_thresholds": sel_thresholds,
                     "joint_records": joint_records,
                     "perf_ms": perf_ms,
                 },
@@ -1410,6 +1765,7 @@ class RepCounterSession:
             return out
 
         # Tracking phase: update all joint motion states every frame.
+        rs["tracking_step_count"] = int(rs.get("tracking_step_count") or 0) + 1
         angle_values: dict[str, Optional[float]] = {}
         detector_outputs: dict[str, dict[str, Any]] = {}
         variances: dict[str, dict[str, Any]] = {}
@@ -1433,6 +1789,11 @@ class RepCounterSession:
             for ak, cfg in COMMON_ANGLES.items()
         }
         _update_angle_histories_for_frame(angle_histories, tracking_angle_values, lm)
+        _apply_fps_scaled_peak_distance(
+            rs,
+            joint_states,
+            peak_detector=rs.get("peak_detector"),
+        )
         t_det = time.perf_counter()
         for ak, cfg in COMMON_ANGLES.items():
             val = tracking_angle_values.get(ak)
@@ -1440,24 +1801,25 @@ class RepCounterSession:
             upd = update_joint_motion_state(joint_states[ak], val, conf, int(ts))
             detector_outputs[ak] = upd.get("detectorOutput") or {}
             angle_values[ak] = val
-            if isinstance(selected_angle, str) and ak == selected_angle:
-                if upd.get("advanced"):
-                    rs["pending_switch_incumbent_advanced"] = True
-                if upd.get("gatedCycle"):
-                    rs["pending_switch_incumbent_completed_gated_cycle_during_pending"] = True
-            pending_angle_for_updates = rs.get("pending_switch_angle")
-            if isinstance(pending_angle_for_updates, str) and ak == pending_angle_for_updates:
-                rs["pending_switch_observed"] = True
-                if upd.get("advanced"):
-                    rs["pending_switch_candidate_advanced_during_pending"] = True
-                if upd.get("gatedCycle"):
-                    rs["pending_switch_candidate_completed_gated_cycle_during_pending"] = True
-                pending_rolling = (upd.get("detectorOutput") or {}).get("rollingRange")
-                if isinstance(pending_rolling, (int, float)):
-                    rs["pending_switch_candidate_pending_rom_estimate_deg"] = max(
-                        float(rs.get("pending_switch_candidate_pending_rom_estimate_deg") or 0.0),
-                        float(pending_rolling),
-                    )
+            if DYNAMIC_RECALIBRATION_ENABLED:
+                if isinstance(selected_angle, str) and ak == selected_angle:
+                    if upd.get("advanced"):
+                        rs["pending_switch_incumbent_advanced"] = True
+                    if upd.get("gatedCycle"):
+                        rs["pending_switch_incumbent_completed_gated_cycle_during_pending"] = True
+                pending_angle_for_updates = rs.get("pending_switch_angle")
+                if isinstance(pending_angle_for_updates, str) and ak == pending_angle_for_updates:
+                    rs["pending_switch_observed"] = True
+                    if upd.get("advanced"):
+                        rs["pending_switch_candidate_advanced_during_pending"] = True
+                    if upd.get("gatedCycle"):
+                        rs["pending_switch_candidate_completed_gated_cycle_during_pending"] = True
+                    pending_rolling = (upd.get("detectorOutput") or {}).get("rollingRange")
+                    if isinstance(pending_rolling, (int, float)):
+                        rs["pending_switch_candidate_pending_rom_estimate_deg"] = max(
+                            float(rs.get("pending_switch_candidate_pending_rom_estimate_deg") or 0.0),
+                            float(pending_rolling),
+                        )
         perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
         if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
             cfg = COMMON_ANGLES[selected_angle]
@@ -1472,12 +1834,23 @@ class RepCounterSession:
                 "leaderReps": rep_value,
                 "leaderShare": 1.0 if rep_value > 0 else 0.0,
             }
-        current_shown, current_raw = _detector_counts(active_detector)
-        cumulative_shown = int(rs.get("rep_count_offset") or 0) + current_shown
-        cumulative_raw = int(rs.get("rep_count_raw_offset") or 0) + current_raw
+        current_raw = _detector_raw_count(active_detector)
+        cumulative_shown, cumulative_raw = _ledger_cumulative_reps(
+            rs,
+            active_detector,
+            include_retroactive=True,
+        )
         selected_output_for_eval = (
             detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
         )
+        selected_pose_score = 0.0
+        if isinstance(selected_angle, str) and selected_angle in joint_states:
+            _, selected_pose_debug = compute_joint_recalibration_score(
+                joint_states[selected_angle],
+                None,
+                int(ts),
+            )
+            selected_pose_score = float(selected_pose_debug.get("poseScore") or 0.0)
         if isinstance(selected_output_for_eval, dict):
             if bool(selected_output_for_eval.get("rangeGateOpen", True)):
                 rs["selected_range_gate_closed_streak"] = 0
@@ -1487,74 +1860,76 @@ class RepCounterSession:
                 ) + 1
 
         switched_to: Optional[str] = None
-        pending_angle = (
-            rs.get("pending_switch_angle")
-            if isinstance(rs.get("pending_switch_angle"), str)
-            else None
-        )
-        pending_detector = rs.get("pending_switch_detector")
-        start_shown = rs.get("pending_switch_incumbent_shown_start")
-        start_raw = rs.get("pending_switch_incumbent_raw_start")
-        if isinstance(start_shown, int) and isinstance(start_raw, int):
-            if current_shown > start_shown or current_raw > start_raw:
+        if DYNAMIC_RECALIBRATION_ENABLED:
+            pending_angle = (
+                rs.get("pending_switch_angle")
+                if isinstance(rs.get("pending_switch_angle"), str)
+                else None
+            )
+            pending_detector = rs.get("pending_switch_detector")
+            start_raw = rs.get("pending_switch_incumbent_raw_start")
+            if isinstance(start_raw, int) and current_raw > start_raw:
                 rs["pending_switch_incumbent_advanced"] = True
-        if (
-            pending_angle is not None
-            and pending_angle != selected_angle
-            and pending_angle in COMMON_ANGLES
-            and pending_detector is not None
-        ):
-            if isinstance(selected_angle, str):
-                _update_pending_incumbent_motion(
-                    rs,
-                    tracking_angle_values.get(selected_angle),
-                )
-                selected_conf = get_min_confidence_for_landmarks(
-                    lm, COMMON_ANGLES[selected_angle]["landmarks"]
-                )
-                if isinstance(selected_conf, (int, float)) and selected_conf >= FRAME_MIN_CONFIDENCE:
-                    rs["pending_switch_incumbent_observable_during_pending"] = True
-            if pending_angle in detector_outputs:
-                pending_calibrated = _is_detector_calibrated(
-                    pending_detector, detector_outputs.get(pending_angle)
-                )
+            if (
+                pending_angle is not None
+                and pending_angle != selected_angle
+                and pending_angle in COMMON_ANGLES
+                and pending_detector is not None
+            ):
+                if isinstance(selected_angle, str):
+                    _update_pending_incumbent_motion(
+                        rs,
+                        tracking_angle_values.get(selected_angle),
+                    )
+                    selected_conf = get_min_confidence_for_landmarks(
+                        lm, COMMON_ANGLES[selected_angle]["landmarks"]
+                    )
+                    if isinstance(selected_conf, (int, float)) and selected_conf >= FRAME_MIN_CONFIDENCE:
+                        rs["pending_switch_incumbent_observable_during_pending"] = True
+                if pending_angle in detector_outputs:
+                    pending_calibrated = _is_detector_calibrated(
+                        pending_detector, detector_outputs.get(pending_angle)
+                    )
+                else:
+                    pending_calibrated = _is_detector_calibrated(pending_detector)
+                pending_started_at_ms = int(rs.get("pending_switch_started_at_ms") or int(ts))
+                rs["pending_switch_started_at_ms"] = pending_started_at_ms
+                pending_elapsed_ms = int(ts) - pending_started_at_ms
+                if pending_calibrated and pending_elapsed_ms >= PENDING_SWITCH_MIN_OBSERVATION_MS:
+                    _activate_joint_switch(
+                        rs,
+                        sdba,
+                        new_angle=pending_angle,
+                        detector=pending_detector,
+                        cumulative_shown=cumulative_shown,
+                        cumulative_raw=cumulative_raw,
+                        switched_at=now,
+                    )
+                    switched_to = pending_angle
+                    selected_angle = pending_angle
+                    cfg = COMMON_ANGLES[pending_angle]
+                    raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                    self._sync_detector_instrumentation_flags()
+                elif pending_elapsed_ms > PENDING_SWITCH_MAX_OBSERVATION_MS:
+                    _activate_joint_switch(
+                        rs,
+                        sdba,
+                        new_angle=pending_angle,
+                        detector=pending_detector,
+                        cumulative_shown=cumulative_shown,
+                        cumulative_raw=cumulative_raw,
+                        switched_at=now,
+                    )
+                    switched_to = pending_angle
+                    selected_angle = pending_angle
+                    cfg = COMMON_ANGLES[pending_angle]
+                    raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                    self._sync_detector_instrumentation_flags()
             else:
-                pending_calibrated = _is_detector_calibrated(pending_detector)
-            pending_started_at_ms = int(rs.get("pending_switch_started_at_ms") or int(ts))
-            rs["pending_switch_started_at_ms"] = pending_started_at_ms
-            pending_elapsed_ms = int(ts) - pending_started_at_ms
-            if pending_calibrated and pending_elapsed_ms >= PENDING_SWITCH_MIN_OBSERVATION_MS:
-                _activate_joint_switch(
-                    rs,
-                    sdba,
-                    new_angle=pending_angle,
-                    detector=pending_detector,
-                    cumulative_shown=cumulative_shown,
-                    cumulative_raw=cumulative_raw,
-                    switched_at=now,
-                )
-                switched_to = pending_angle
-                selected_angle = pending_angle
-                cfg = COMMON_ANGLES[pending_angle]
-                raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
-                self._sync_detector_instrumentation_flags()
-            elif pending_elapsed_ms > PENDING_SWITCH_MAX_OBSERVATION_MS:
-                _activate_joint_switch(
-                    rs,
-                    sdba,
-                    new_angle=pending_angle,
-                    detector=pending_detector,
-                    cumulative_shown=cumulative_shown,
-                    cumulative_raw=cumulative_raw,
-                    switched_at=now,
-                )
-                switched_to = pending_angle
-                selected_angle = pending_angle
-                cfg = COMMON_ANGLES[pending_angle]
-                raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
-                self._sync_detector_instrumentation_flags()
-        else:
+                _clear_pending_switch(rs)
+        elif rs.get("pending_switch_angle") is not None or rs.get("handoff_observation_candidate_angle") is not None:
             _clear_pending_switch(rs)
+            _clear_handoff_observation(rs)
         last_re_eval = rs.get("selection_last_reevaluate_at")
         re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
@@ -1576,7 +1951,8 @@ class RepCounterSession:
                 )
 
             candidate, candidate_sel_debug = select_recalibration_candidate(
-                score_by_joint, selected_angle if isinstance(selected_angle, str) else None
+                score_by_joint, selected_angle if isinstance(selected_angle, str) else None,
+                variance_by_joint=variances,
             )
 
             selected_score = 0.0
@@ -1603,10 +1979,38 @@ class RepCounterSession:
             candidate_pose_score = float(candidate_debug.get("poseScore") or 0.0)
             candidate_observable = bool(candidate_debug.get("observable"))
             candidate_completed_cycles = int(candidate_debug.get("completedCycles") or 0)
+            candidate_recent_range = float(candidate_debug.get("recentRange") or 0.0)
+            selected_median_rom_deg = (
+                median_cycle_rom_deg(joint_states[selected_angle])
+                if isinstance(selected_angle, str) and selected_angle in joint_states
+                else 0.0
+            )
+            candidate_median_rom_deg = (
+                median_cycle_rom_deg(joint_states[candidate])
+                if isinstance(candidate, str) and candidate in joint_states
+                else 0.0
+            )
+            median_recent_range_all = median_recent_range_from_score_debug(score_by_joint)
+            same_joint_family = (
+                is_same_joint_family(selected_angle, candidate)
+                if isinstance(selected_angle, str) and isinstance(candidate, str)
+                else False
+            )
             last_switch = rs.get("selection_last_switch_at")
-            cooldown_ok = (
+            time_cooldown_ok = (
                 last_switch is None or (now - float(last_switch)) >= ANGLE_SELECTION_SWITCH_MIN_SEC
             )
+            reps_at_last_switch = rs.get("selection_reps_at_last_recal_switch")
+            reps_since_last_switch = (
+                cumulative_shown - int(reps_at_last_switch)
+                if isinstance(reps_at_last_switch, int)
+                else JOINT_SWITCH_MIN_REPS_SINCE_LAST
+            )
+            rep_cooldown_ok = (
+                not isinstance(reps_at_last_switch, int)
+                or reps_since_last_switch >= JOINT_SWITCH_MIN_REPS_SINCE_LAST
+            )
+            cooldown_ok = time_cooldown_ok and rep_cooldown_ok
             should_switch, force_switch, switch_debug = should_switch_to_candidate(
                 cooldown_ok=cooldown_ok,
                 stale_reevals=stale_reevals,
@@ -1622,7 +2026,19 @@ class RepCounterSession:
                 candidate_pose_score=candidate_pose_score,
                 candidate_observable=candidate_observable,
                 candidate_completed_cycles=candidate_completed_cycles,
+                candidate_recent_range=candidate_recent_range,
+                candidate_median_rom_deg=candidate_median_rom_deg,
+                selected_median_rom_deg=selected_median_rom_deg,
+                median_recent_range_all=median_recent_range_all,
+                same_joint_family=same_joint_family,
             )
+            switch_debug = {
+                **switch_debug,
+                "timeCooldownOk": bool(time_cooldown_ok),
+                "repCooldownOk": bool(rep_cooldown_ok),
+                "repsSinceLastSwitch": int(reps_since_last_switch),
+                "minRepsSinceLastSwitch": int(JOINT_SWITCH_MIN_REPS_SINCE_LAST),
+            }
             if (
                 isinstance(selected_angle, str)
                 and isinstance(candidate, str)
@@ -1648,7 +2064,7 @@ class RepCounterSession:
                         rs["handoff_observation_candidate_angle"] = candidate
                         rs["handoff_observation_selected_angle"] = selected_angle
                         rs["handoff_observation_started_at_ms"] = int(ts)
-                        rs["handoff_observation_candidate_carryover_start_shown"] = cand_shown
+                        rs["handoff_observation_candidate_carryover_start_shown"] = cand_raw
                         rs["handoff_observation_candidate_carryover_start_raw"] = cand_raw
                         rs["handoff_observation_candidate_carryover_start_ts"] = int(ts)
             self._instr_emit(
@@ -1674,7 +2090,7 @@ class RepCounterSession:
                     rs["pending_switch_started_at_ms"] = int(ts)
                     rs["pending_switch_angle"] = candidate
                     rs["pending_switch_detector"] = candidate_state.detector
-                    rs["pending_switch_incumbent_shown_start"] = current_shown
+                    rs["pending_switch_incumbent_shown_start"] = current_raw
                     rs["pending_switch_incumbent_raw_start"] = current_raw
                     rs["pending_switch_incumbent_advanced"] = False
                     rs["pending_switch_observed"] = False
@@ -1726,7 +2142,7 @@ class RepCounterSession:
                             int(obs_ts) if isinstance(obs_ts, int) else int(ts)
                         )
                     else:
-                        rs["pending_switch_candidate_carryover_start_shown"] = cand_shown
+                        rs["pending_switch_candidate_carryover_start_shown"] = cand_raw
                         rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
                         rs["pending_switch_candidate_carryover_start_ts"] = int(ts)
                     now_ms = int(ts)
@@ -1835,13 +2251,14 @@ class RepCounterSession:
         # detected when the user stops moving at the end of a set.
         if (
             peak_detector is not None
-            and peak_detector.peaks
-            and peak_detector.valleys
-            and len(peak_detector.peaks) != len(peak_detector.valleys)
+            and _retroactive_credit_eligible(peak_detector, rs)
         ):
             rep_count += 1
 
-        shown_rep_count = rep_count + int(rs.get("rep_count_offset") or 0)
+        shown_rep_count = _apply_monotonic_shown_floor(
+            rs,
+            rep_count + int(rs.get("rep_count_offset") or 0),
+        )
         shown_rep_count = max(0, shown_rep_count)
         shown_rep_count_raw = primary_rep_count + int(rs.get("rep_count_raw_offset") or 0)
         shown_rep_count_raw = max(0, shown_rep_count_raw)
