@@ -7,7 +7,7 @@ from statistics import mean, median
 from typing import Any, Literal, Optional
 
 from flexible_rep_counter.core.math_engine import PeakDetector
-from flexible_rep_counter.core.variance_angle_selector import FRAME_MIN_CONFIDENCE
+from flexible_rep_counter.core.variance_angle_selector import FRAME_MIN_CONFIDENCE, is_fallback_angle
 
 _RECENT_RANGE_WINDOW = 45
 _POSE_WINDOW = 30
@@ -44,6 +44,7 @@ CROSS_FAMILY_SCORE_MARGIN = 0.25
 SAME_FAMILY_SCORE_RATIO = 1.35
 CROSS_FAMILY_SCORE_RATIO = 1.45
 CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE = 6.0
+PRIMARY_RECOVERY_SCORE = 0.60
 
 
 @dataclass
@@ -172,10 +173,11 @@ def update_joint_motion_state(
     val: Optional[float],
     conf: Optional[float],
     timestamp_ms: int,
+    min_confidence: float = FRAME_MIN_CONFIDENCE,
 ) -> dict[str, Any]:
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.0
     state.confidence_history.append((timestamp_ms, confidence))
-    if val is None or conf is None or conf < FRAME_MIN_CONFIDENCE:
+    if val is None or conf is None or conf < float(min_confidence):
         state.history.append(None)
         return {"advanced": False, "detectorOutput": state.detector.update(None), "gatedCycle": False}
 
@@ -411,6 +413,8 @@ def select_recalibration_candidate(
     selected_range_gate_closed_streak: int = 0,
     stale_switch_max_selected_recent_range_deg: float = 14.0,
     stale_switch_min_closed_streak: int = 10,
+    fallback_armed: bool = False,
+    primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
 ) -> tuple[str | None, dict[str, Any]]:
     variance_by_joint = variance_by_joint or {}
     field_median_range = median_recent_range_from_score_debug(scores)
@@ -448,8 +452,13 @@ def select_recalibration_candidate(
     best_key: Optional[str] = None
     best_score = -1.0
     best_debug: dict[str, Any] = {}
+    best_primary_key: Optional[str] = None
+    best_primary_score = -1.0
+    best_primary_debug: dict[str, Any] = {}
     for angle_key, (score, debug) in scores.items():
         if angle_key == selected_angle:
+            continue
+        if is_fallback_angle(angle_key) and not fallback_armed:
             continue
         if (
             isinstance(selected_angle, str)
@@ -471,9 +480,36 @@ def select_recalibration_candidate(
             best_key = angle_key
             best_score = float(score)
             best_debug = debug
+        if (not is_fallback_angle(angle_key)) and score > best_primary_score:
+            best_primary_key = angle_key
+            best_primary_score = float(score)
+            best_primary_debug = debug
+
+    primary_recovered = bool(
+        best_primary_key
+        and best_primary_score >= float(primary_recovery_score)
+        and float(best_primary_debug.get("poseScore") or 0.0) >= CANDIDATE_MIN_POSE_SCORE
+        and float(best_primary_debug.get("activityScore") or 0.0) >= CANDIDATE_MIN_ACTIVITY
+        and int(best_primary_debug.get("completedCycles") or 0) >= CANDIDATE_MIN_COMPLETED_CYCLES
+    )
+    if (
+        fallback_armed
+        and isinstance(best_key, str)
+        and is_fallback_angle(best_key)
+        and primary_recovered
+        and isinstance(best_primary_key, str)
+    ):
+        best_key = best_primary_key
+        best_score = best_primary_score
+        best_debug = best_primary_debug
+
     return best_key, {
         "candidateScore": best_score,
         "candidateDebug": best_debug,
+        "bestPrimaryCandidate": best_primary_key,
+        "bestPrimaryScore": best_primary_score,
+        "primaryRecovered": primary_recovered,
+        "fallbackArmed": bool(fallback_armed),
         "fieldMedianRange": field_median_range,
         "fieldMedianVariance": field_median_variance,
         "allowCrossFamily": bool(allow_cross_family),
@@ -580,12 +616,18 @@ def should_switch_to_candidate(
 def is_same_joint_family(a: Optional[str], b: Optional[str]) -> bool:
     if not isinstance(a, str) or not isinstance(b, str):
         return False
+    if is_fallback_angle(a) or is_fallback_angle(b):
+        return a == b
     base_a = a[5:] if a.startswith("LEFT_") else a[6:] if a.startswith("RIGHT_") else a
     base_b = b[5:] if b.startswith("LEFT_") else b[6:] if b.startswith("RIGHT_") else b
     return base_a == base_b
 
 
 def is_mirrored_pair(a: Optional[str], b: Optional[str]) -> bool:
+    if isinstance(a, str) and is_fallback_angle(a):
+        return False
+    if isinstance(b, str) and is_fallback_angle(b):
+        return False
     if not is_same_joint_family(a, b):
         return False
     if not isinstance(a, str) or not isinstance(b, str):
@@ -612,6 +654,14 @@ def cycle_sync_score_last_4s(
 
 
 def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
+    incumbent_angle = pending_state.get("incumbent_angle")
+    candidate_angle = pending_state.get("candidate_angle")
+    if isinstance(incumbent_angle, str) and isinstance(candidate_angle, str):
+        if is_fallback_angle(incumbent_angle) or is_fallback_angle(candidate_angle):
+            return HandoffDecision(
+                kind="same_exercise",
+                rationale={"rule": "fallback_joint_transition"},
+            )
     incumbent_motion_span = float(pending_state.get("incumbent_motion_span_deg") or 0.0)
     candidate_pending_rom = float(pending_state.get("candidate_pending_rom_estimate_deg") or 0.0)
     incumbent_active_motion_threshold = max(

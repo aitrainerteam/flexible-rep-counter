@@ -177,6 +177,29 @@ ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", de
 DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS = _toml_int(
     "dynamic_recalibration", "post_lock_min_raw_reps", default=5
 )
+FALLBACK_Y_ARM_WINDOW_SEC = _toml_float("fallback_y_point", "arm_window_sec", default=4.0)
+FALLBACK_Y_LOW_SCORE_THRESHOLD = _toml_float(
+    "fallback_y_point", "low_score_threshold", default=0.40
+)
+FALLBACK_Y_ARMING_MIN_SCORE = _toml_float(
+    "fallback_y_point", "arming_min_score", default=0.62
+)
+FALLBACK_Y_PRIMARY_RECOVERY_SCORE = _toml_float(
+    "fallback_y_point", "primary_recovery_score", default=0.60
+)
+FALLBACK_Y_MIN_ACTIVITY_SCORE = _toml_float(
+    "fallback_y_point", "min_activity_score", default=0.50
+)
+FALLBACK_Y_MIN_POSE_SCORE = _toml_float(
+    "fallback_y_point", "min_pose_score", default=0.45
+)
+FALLBACK_Y_MIN_ROM_SCORE = _toml_float("fallback_y_point", "min_rom_score", default=0.50)
+FALLBACK_Y_MIN_EXTREMA_SCORE = _toml_float(
+    "fallback_y_point", "min_extrema_score", default=0.40
+)
+FALLBACK_Y_MIN_COMPLETED_CYCLES = _toml_int(
+    "fallback_y_point", "min_completed_cycles", default=2
+)
 
 LOW_FPS_SAFE_MODE_ENABLED = bool(_toml_val("low_fps_safe_mode", "enabled") is not False)
 LOW_FPS_INTERVAL_WINDOW_FRAMES = _toml_int(

@@ -101,14 +101,140 @@ def calculate_body_scale(landmarks: list) -> float:
     return abs(height) or 1.0
 
 
-def calculate_from_type(
-    calc_type: str,
-    target_landmarks: list[int],
+def _landmark_if_confident(
+    landmarks: list[dict],
+    index: int,
+    *,
+    min_conf: float,
+) -> Optional[dict]:
+    if index < 0 or index >= len(landmarks):
+        return None
+    point = landmarks[index]
+    conf = float(point.get("confidence", 0.0)) if isinstance(point, dict) else 0.0
+    if conf < min_conf:
+        return None
+    return point
+
+
+def _mean_y_for_indices(
+    landmarks: list[dict],
+    indices: list[int],
+    *,
+    min_conf: float,
+) -> Optional[float]:
+    if not indices:
+        return None
+    ys: list[float] = []
+    for idx in indices:
+        point = _landmark_if_confident(landmarks, int(idx), min_conf=min_conf)
+        if point is None:
+            return None
+        _, y = _get_xy(point)
+        ys.append(y)
+    return sum(ys) / len(ys) if ys else None
+
+
+def _mean_x_for_indices(
+    landmarks: list[dict],
+    indices: list[int],
+    *,
+    min_conf: float,
+) -> Optional[float]:
+    if not indices:
+        return None
+    xs: list[float] = []
+    for idx in indices:
+        point = _landmark_if_confident(landmarks, int(idx), min_conf=min_conf)
+        if point is None:
+            return None
+        x, _ = _get_xy(point)
+        xs.append(x)
+    return sum(xs) / len(xs) if xs else None
+
+
+def _relational_scale_px(
+    landmarks: list[dict],
+    *,
+    scale_kind: str,
+    min_conf: float,
+) -> Optional[float]:
+    kind = scale_kind.strip().lower()
+    if kind == "shoulder_width":
+        left_x = _mean_x_for_indices(landmarks, [5], min_conf=min_conf)
+        right_x = _mean_x_for_indices(landmarks, [6], min_conf=min_conf)
+        if left_x is None or right_x is None:
+            return None
+        return abs(left_x - right_x)
+    if kind == "hip_width":
+        left_x = _mean_x_for_indices(landmarks, [11], min_conf=min_conf)
+        right_x = _mean_x_for_indices(landmarks, [12], min_conf=min_conf)
+        if left_x is None or right_x is None:
+            return None
+        return abs(left_x - right_x)
+    if kind == "torso_height":
+        shoulder_y = _mean_y_for_indices(landmarks, [5, 6], min_conf=min_conf)
+        hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
+        if shoulder_y is None or hip_y is None:
+            return None
+        return abs(hip_y - shoulder_y)
+    if kind == "leg_length":
+        hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
+        ankle_y = _mean_y_for_indices(landmarks, [15, 16], min_conf=min_conf)
+        if hip_y is None or ankle_y is None:
+            return None
+        return abs(ankle_y - hip_y)
+    # Fallback keeps backward compatibility for unknown values.
+    return calculate_body_scale(landmarks)
+
+
+def calculate_relational_y_displacement(
+    cfg: dict[str, Any],
     landmarks: list[dict],
 ) -> Optional[float]:
-    if not landmarks or not target_landmarks:
+    moving = [int(i) for i in (cfg.get("moving") or [])]
+    reference = [int(i) for i in (cfg.get("reference") or [])]
+    if not moving or not reference:
         return None
-    points = [landmarks[i] if i < len(landmarks) else None for i in target_landmarks]
+    min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
+    moving_y = _mean_y_for_indices(landmarks, moving, min_conf=min_conf)
+    reference_y = _mean_y_for_indices(landmarks, reference, min_conf=min_conf)
+    if moving_y is None or reference_y is None:
+        return None
+    scale_cfg = cfg.get("scale") or {}
+    scale_kind = (
+        str(scale_cfg.get("kind")).strip()
+        if isinstance(scale_cfg, dict) and scale_cfg.get("kind")
+        else "torso_height"
+    )
+    scale_px = _relational_scale_px(landmarks, scale_kind=scale_kind, min_conf=min_conf)
+    if scale_px is None:
+        return None
+    scale_px = max(abs(float(scale_px)), 1e-6)
+    gain = float(cfg.get("gain", 100.0) or 100.0)
+    return gain * ((moving_y - reference_y) / scale_px)
+
+
+def calculate_from_type(
+    calc_type: str,
+    target_landmarks: Any,
+    landmarks: list[dict],
+) -> Optional[float]:
+    if not landmarks or target_landmarks is None:
+        return None
+    cfg: dict[str, Any]
+    if isinstance(target_landmarks, dict):
+        cfg = target_landmarks
+        indices = list(cfg.get("landmarks") or [])
+    else:
+        indices = list(target_landmarks or [])
+        cfg = {"landmarks": indices}
+
+    if calc_type == "relational_y_displacement":
+        return calculate_relational_y_displacement(cfg, landmarks)
+
+    if not indices:
+        return None
+    points = [landmarks[i] if i < len(landmarks) else None for i in indices]
     if any(p is None for p in points):
         return None
     if calc_type == "angle_3_point" and len(points) >= 3:

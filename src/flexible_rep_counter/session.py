@@ -48,6 +48,15 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS,
+    FALLBACK_Y_ARM_WINDOW_SEC as CFG_FALLBACK_Y_ARM_WINDOW_SEC,
+    FALLBACK_Y_ARMING_MIN_SCORE as CFG_FALLBACK_Y_ARMING_MIN_SCORE,
+    FALLBACK_Y_LOW_SCORE_THRESHOLD as CFG_FALLBACK_Y_LOW_SCORE_THRESHOLD,
+    FALLBACK_Y_MIN_ACTIVITY_SCORE as CFG_FALLBACK_Y_MIN_ACTIVITY_SCORE,
+    FALLBACK_Y_MIN_COMPLETED_CYCLES as CFG_FALLBACK_Y_MIN_COMPLETED_CYCLES,
+    FALLBACK_Y_MIN_EXTREMA_SCORE as CFG_FALLBACK_Y_MIN_EXTREMA_SCORE,
+    FALLBACK_Y_MIN_POSE_SCORE as CFG_FALLBACK_Y_MIN_POSE_SCORE,
+    FALLBACK_Y_MIN_ROM_SCORE as CFG_FALLBACK_Y_MIN_ROM_SCORE,
+    FALLBACK_Y_PRIMARY_RECOVERY_SCORE as CFG_FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
     get_default_tuning_params,
     LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
     LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
@@ -65,6 +74,7 @@ from flexible_rep_counter.core.variance_angle_selector import (
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
+    is_fallback_angle,
     passes_consistent_variance_gate,
     summarize_rep_dominance,
 )
@@ -110,6 +120,15 @@ SELECTION_MIN_STREAK_FRAMES = 8
 SELECTION_MIN_ACTIVE_WINDOWS_RELAXED = 2
 SELECTION_MIN_MEDIAN_VARIANCE_ABS = 3.0
 SELECTION_MIN_RANGE_DEG_ABS = 10.0
+FALLBACK_Y_ARM_WINDOW_SEC = max(0.0, float(CFG_FALLBACK_Y_ARM_WINDOW_SEC))
+FALLBACK_Y_LOW_SCORE_THRESHOLD = float(CFG_FALLBACK_Y_LOW_SCORE_THRESHOLD)
+FALLBACK_Y_ARMING_MIN_SCORE = float(CFG_FALLBACK_Y_ARMING_MIN_SCORE)
+FALLBACK_Y_PRIMARY_RECOVERY_SCORE = float(CFG_FALLBACK_Y_PRIMARY_RECOVERY_SCORE)
+FALLBACK_Y_MIN_ACTIVITY_SCORE = float(CFG_FALLBACK_Y_MIN_ACTIVITY_SCORE)
+FALLBACK_Y_MIN_POSE_SCORE = float(CFG_FALLBACK_Y_MIN_POSE_SCORE)
+FALLBACK_Y_MIN_ROM_SCORE = float(CFG_FALLBACK_Y_MIN_ROM_SCORE)
+FALLBACK_Y_MIN_EXTREMA_SCORE = float(CFG_FALLBACK_Y_MIN_EXTREMA_SCORE)
+FALLBACK_Y_MIN_COMPLETED_CYCLES = max(1, int(CFG_FALLBACK_Y_MIN_COMPLETED_CYCLES))
 
 
 def _diagnose_missing_angle(
@@ -157,6 +176,8 @@ def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
 
 
 def _normalized_angle_family(angle_key: str) -> str:
+    if is_fallback_angle(angle_key):
+        return angle_key
     base = angle_key
     if base.startswith("LEFT_"):
         base = base[len("LEFT_") :]
@@ -165,6 +186,105 @@ def _normalized_angle_family(angle_key: str) -> str:
     if base.endswith("_ACROSS"):
         base = base[: -len("_ACROSS")]
     return base
+
+
+def _angle_landmarks(cfg: dict[str, Any]) -> list[int]:
+    landmarks = cfg.get("landmarks")
+    if isinstance(landmarks, list) and landmarks:
+        return [int(i) for i in landmarks]
+    moving = [int(i) for i in (cfg.get("moving") or [])]
+    reference = [int(i) for i in (cfg.get("reference") or [])]
+    merged = moving + reference
+    deduped: list[int] = []
+    for idx in merged:
+        if idx not in deduped:
+            deduped.append(idx)
+    return deduped
+
+
+def _angle_confidence_threshold(cfg: dict[str, Any]) -> float:
+    if str(cfg.get("type") or "").strip().lower() == "relational_y_displacement":
+        return float(cfg.get("min_conf", 0.4) or 0.4)
+    return FRAME_MIN_CONFIDENCE
+
+
+def _reset_fallback_streak(run_state: dict[str, Any]) -> None:
+    run_state["fallback_bad_streak_started_at"] = None
+    run_state["fallback_bad_streak_paused_total_s"] = 0.0
+    run_state["fallback_bad_streak_pause_anchor"] = None
+
+
+def _update_fallback_bad_streak(
+    run_state: dict[str, Any],
+    *,
+    now_s: float,
+    conditions_met: bool,
+    paused: bool,
+) -> float:
+    if not conditions_met:
+        _reset_fallback_streak(run_state)
+        return 0.0
+    started = run_state.get("fallback_bad_streak_started_at")
+    if not isinstance(started, (int, float)):
+        started = now_s
+        run_state["fallback_bad_streak_started_at"] = started
+    paused_total = float(run_state.get("fallback_bad_streak_paused_total_s") or 0.0)
+    pause_anchor = run_state.get("fallback_bad_streak_pause_anchor")
+    if paused:
+        if not isinstance(pause_anchor, (int, float)):
+            run_state["fallback_bad_streak_pause_anchor"] = now_s
+            pause_anchor = now_s
+    elif isinstance(pause_anchor, (int, float)):
+        paused_total += max(0.0, now_s - float(pause_anchor))
+        run_state["fallback_bad_streak_paused_total_s"] = paused_total
+        run_state["fallback_bad_streak_pause_anchor"] = None
+        pause_anchor = None
+    live_pause = max(0.0, now_s - float(pause_anchor)) if isinstance(pause_anchor, (int, float)) else 0.0
+    effective_elapsed = max(0.0, now_s - float(started) - paused_total - live_pause)
+    return effective_elapsed
+
+
+def _is_fallback_candidate_ready(score: float, debug: dict[str, Any]) -> bool:
+    return bool(
+        score >= FALLBACK_Y_ARMING_MIN_SCORE
+        and float(debug.get("activityScore") or 0.0) >= FALLBACK_Y_MIN_ACTIVITY_SCORE
+        and float(debug.get("poseScore") or 0.0) >= FALLBACK_Y_MIN_POSE_SCORE
+        and float(debug.get("romScore") or 0.0) >= FALLBACK_Y_MIN_ROM_SCORE
+        and float(debug.get("extremaScore") or 0.0) >= FALLBACK_Y_MIN_EXTREMA_SCORE
+        and int(debug.get("completedCycles") or 0) >= FALLBACK_Y_MIN_COMPLETED_CYCLES
+    )
+
+
+def _best_fallback_candidate(
+    score_by_joint: dict[str, tuple[float, dict[str, Any]]],
+) -> tuple[Optional[str], float, dict[str, Any]]:
+    best_key: Optional[str] = None
+    best_score = -1.0
+    best_debug: dict[str, Any] = {}
+    for angle_key, (score, debug) in score_by_joint.items():
+        if not is_fallback_angle(angle_key):
+            continue
+        if _is_fallback_candidate_ready(float(score), debug) and float(score) > best_score:
+            best_key = angle_key
+            best_score = float(score)
+            best_debug = debug
+    return best_key, best_score, best_debug
+
+
+def _has_primary_recovery_candidate(
+    score_by_joint: dict[str, tuple[float, dict[str, Any]]],
+) -> bool:
+    for angle_key, (score, debug) in score_by_joint.items():
+        if is_fallback_angle(angle_key):
+            continue
+        if (
+            float(score) >= FALLBACK_Y_PRIMARY_RECOVERY_SCORE
+            and float(debug.get("activityScore") or 0.0) >= FALLBACK_Y_MIN_ACTIVITY_SCORE
+            and float(debug.get("poseScore") or 0.0) >= FALLBACK_Y_MIN_POSE_SCORE
+            and int(debug.get("completedCycles") or 0) >= FALLBACK_Y_MIN_COMPLETED_CYCLES
+        ):
+            return True
+    return False
 
 
 def _selection_relax_progress(elapsed_s: float) -> float:
@@ -368,8 +488,10 @@ def _append_angle_history(
     if hist is None:
         return
     cfg = COMMON_ANGLES[angle_key]
-    min_conf = get_min_confidence_for_landmarks(landmarks, cfg["landmarks"])
-    if not _is_valid_angle_value(value) or min_conf is None or min_conf < FRAME_MIN_CONFIDENCE:
+    angle_landmarks = _angle_landmarks(cfg)
+    min_conf = get_min_confidence_for_landmarks(landmarks, angle_landmarks)
+    min_conf_required = _angle_confidence_threshold(cfg)
+    if not _is_valid_angle_value(value) or min_conf is None or min_conf < min_conf_required:
         hist.append(None)
         return
     assert value is not None
@@ -695,6 +817,8 @@ def _activate_joint_switch(
     candidate_current_raw = _detector_raw_count(detector)
     candidate_current_shown, _ = _detector_counts(detector)
     pending_state = {
+        "incumbent_angle": run_state.get("selected_angle"),
+        "candidate_angle": new_angle,
         "incumbent_advanced": bool(run_state.get("pending_switch_incumbent_advanced")),
         "incumbent_completed_gated_cycle_during_pending": bool(
             run_state.get("pending_switch_incumbent_completed_gated_cycle_during_pending")
@@ -1001,6 +1125,10 @@ class RepCounterSession:
             "selection_last_reevaluate_at": None,
             "selection_last_switch_at": None,
             "selection_reps_at_last_recal_switch": None,
+            "fallback_armed": False,
+            "fallback_bad_streak_started_at": None,
+            "fallback_bad_streak_paused_total_s": 0.0,
+            "fallback_bad_streak_pause_anchor": None,
             "selection_detectors_by_angle": {},
             "joint_motion_states": _build_joint_motion_states(dict(tp)),
             "selection_dominance_key": None,
@@ -1048,6 +1176,10 @@ class RepCounterSession:
         self._run_state["selection_last_attempt"] = None
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
+        self._run_state["fallback_armed"] = False
+        self._run_state["fallback_bad_streak_started_at"] = None
+        self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
+        self._run_state["fallback_bad_streak_pause_anchor"] = None
         self._run_state["joint_motion_states"] = _build_joint_motion_states(
             self._run_state["tuning_params"]
         )
@@ -1092,6 +1224,10 @@ class RepCounterSession:
         self._run_state["selection_last_attempt"] = None
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
+        self._run_state["fallback_armed"] = False
+        self._run_state["fallback_bad_streak_started_at"] = None
+        self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
+        self._run_state["fallback_bad_streak_pause_anchor"] = None
         self._run_state["joint_motion_states"] = _build_joint_motion_states(
             self._run_state["tuning_params"]
         )
@@ -1159,8 +1295,9 @@ class RepCounterSession:
         frame_buffer: deque,
         *,
         include_debug: bool = False,
+        fallback_armed: bool = False,
     ) -> dict[str, dict[str, Any]]:
-        sig = self._buffer_signature(frame_buffer)
+        sig = (self._buffer_signature(frame_buffer), bool(fallback_armed))
         cache = rs.get("variance_cache") or {}
         if (
             cache.get("signature") == sig
@@ -1175,6 +1312,7 @@ class RepCounterSession:
         variances = compute_angle_variances_from_buffer(
             self._buffer_as_list(rs, frame_buffer),
             include_debug=include_debug,
+            fallback_armed=fallback_armed,
             angle_histories={
                 ak: list(hist)
                 for ak, hist in (rs.get("selection_angle_histories") or {}).items()
@@ -1527,16 +1665,17 @@ class RepCounterSession:
                 rs["selection_angle_histories"] = angle_histories
             t_det = time.perf_counter()
             for ak, cfg in COMMON_ANGLES.items():
-                raw_av = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                raw_av = calculate_from_type(cfg["type"], cfg, raw_landmarks)
                 selecting_raw_angle_values[ak] = raw_av
-                val = calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+                val = calculate_from_type(cfg["type"], cfg, lm)
                 selecting_angle_values[ak] = val
-                conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
+                conf = get_min_confidence_for_landmarks(lm, _angle_landmarks(cfg))
                 upd = update_joint_motion_state(
                     joint_states[ak],
                     val,
                     conf,
                     int(ts),
+                    min_confidence=_angle_confidence_threshold(cfg),
                 )
                 selecting_detector_outputs[ak] = upd.get("detectorOutput") or {}
             _update_angle_histories_for_frame(
@@ -1548,11 +1687,35 @@ class RepCounterSession:
             _apply_fps_scaled_peak_distance(rs, joint_states)
 
             rep_counts_sel = {ak: d.get_rep_count() for ak, d in sdba.items()}
-            rep_dom = summarize_rep_dominance(rep_counts_sel)
+            fallback_armed = bool(rs.get("fallback_armed"))
+            rep_counts_for_selection = {
+                ak: int(v)
+                for ak, v in rep_counts_sel.items()
+                if fallback_armed or not is_fallback_angle(ak)
+            }
+            rep_dom = summarize_rep_dominance(rep_counts_for_selection)
             t_var = time.perf_counter()
-            variances = self._get_variances(rs, frame_buffer, include_debug=False)
+            variances = self._get_variances(
+                rs,
+                frame_buffer,
+                include_debug=False,
+                fallback_armed=fallback_armed,
+            )
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
             joint_records = _collect_joint_records(sdba, variances)
+            score_by_joint_all: dict[str, tuple[float, dict[str, Any]]] = {}
+            variances_all = self._get_variances(
+                rs,
+                frame_buffer,
+                include_debug=False,
+                fallback_armed=True,
+            )
+            for angle_key, state in joint_states.items():
+                score_by_joint_all[angle_key] = compute_joint_recalibration_score(
+                    state,
+                    variances_all.get(angle_key),
+                    int(ts),
+                )
 
             cal_reps_target = int(
                 tuning_params.get(
@@ -1567,6 +1730,49 @@ class RepCounterSession:
                 elapsed >= ANGLE_SELECTION_MIN_SEC or rep_evidence_ready
             )
             last_att = rs.get("selection_last_attempt")
+            unclear_motion_now = bool(
+                last_att is not None
+                and (now - float(last_att)) < ANGLE_SELECTION_RETRY_INTERVAL_SEC
+            )
+            stale_now = bool(elapsed >= ANGLE_SELECTION_MIN_SEC and rs.get("selected_angle") is None)
+            best_primary_selection_score = max(
+                (
+                    float(score)
+                    for angle_key, (score, _) in score_by_joint_all.items()
+                    if not is_fallback_angle(angle_key)
+                ),
+                default=0.0,
+            )
+            low_score_now = bool(best_primary_selection_score < FALLBACK_Y_LOW_SCORE_THRESHOLD)
+            not_recalibrating_now = bool(
+                rs.get("pending_switch_angle") is None
+                and rs.get("handoff_observation_candidate_angle") is None
+            )
+            fallback_elapsed = _update_fallback_bad_streak(
+                rs,
+                now_s=now,
+                conditions_met=(
+                    stale_now
+                    and low_score_now
+                    and unclear_motion_now
+                    and not_recalibrating_now
+                ),
+                paused=False,
+            )
+            if bool(rs.get("fallback_armed")):
+                if _has_primary_recovery_candidate(score_by_joint_all):
+                    rs["fallback_armed"] = False
+                    _reset_fallback_streak(rs)
+            else:
+                fb_key, _, _ = _best_fallback_candidate(score_by_joint_all)
+                if (
+                    fb_key is not None
+                    and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
+                    and FALLBACK_Y_ARM_WINDOW_SEC > 0.0
+                ):
+                    rs["fallback_armed"] = True
+
+            fallback_armed = bool(rs.get("fallback_armed"))
             can_try = ready and (
                 last_att is None
                 or (now - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
@@ -1577,11 +1783,12 @@ class RepCounterSession:
                 rep_dom,
                 dominance_fraction=float(sel_thresholds["joint_fraction"]),
                 min_leading_reps=int(sel_thresholds["min_leading_reps"]),
+                fallback_armed=fallback_armed,
             )
             leader_key: Optional[str] = (
                 rep_dom.get("leaderKey") if isinstance(rep_dom.get("leaderKey"), str) else None
             )
-            family_dom = _family_rep_dominance(rep_counts_sel)
+            family_dom = _family_rep_dominance(rep_counts_for_selection)
             family_leader = (
                 family_dom.get("leaderFamily")
                 if isinstance(family_dom.get("leaderFamily"), str)
@@ -1659,6 +1866,7 @@ class RepCounterSession:
                     buf_list,
                     variances=variances,
                     include_debug=False,
+                    fallback_armed=fallback_armed,
                 )
                 tuning_params = result.get("tuningParams") or DEFAULT_TUNING_PARAMS
                 rs["tuning_params"] = tuning_params
@@ -1793,7 +2001,7 @@ class RepCounterSession:
             }
             rs["selection_angle_histories"] = angle_histories
         tracking_angle_values = {
-            ak: calculate_from_type(cfg["type"], cfg["landmarks"], lm)
+            ak: calculate_from_type(cfg["type"], cfg, lm)
             for ak, cfg in COMMON_ANGLES.items()
         }
         _update_angle_histories_for_frame(angle_histories, tracking_angle_values, lm)
@@ -1805,8 +2013,14 @@ class RepCounterSession:
         t_det = time.perf_counter()
         for ak, cfg in COMMON_ANGLES.items():
             val = tracking_angle_values.get(ak)
-            conf = get_min_confidence_for_landmarks(lm, cfg["landmarks"])
-            upd = update_joint_motion_state(joint_states[ak], val, conf, int(ts))
+            conf = get_min_confidence_for_landmarks(lm, _angle_landmarks(cfg))
+            upd = update_joint_motion_state(
+                joint_states[ak],
+                val,
+                conf,
+                int(ts),
+                min_confidence=_angle_confidence_threshold(cfg),
+            )
             detector_outputs[ak] = upd.get("detectorOutput") or {}
             angle_values[ak] = val
             if DYNAMIC_RECALIBRATION_ENABLED:
@@ -1831,7 +2045,7 @@ class RepCounterSession:
         perf_ms["detector_update_ms"] = (time.perf_counter() - t_det) * 1000.0
         if isinstance(selected_angle, str) and selected_angle in COMMON_ANGLES:
             cfg = COMMON_ANGLES[selected_angle]
-            raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+            raw_angle_val = calculate_from_type(cfg["type"], cfg, raw_landmarks)
             active_detector = rs.get("peak_detector") or sdba.get(selected_angle)
             if active_detector is None:
                 active_detector = sdba[selected_angle]
@@ -1896,9 +2110,10 @@ class RepCounterSession:
                         tracking_angle_values.get(selected_angle),
                     )
                     selected_conf = get_min_confidence_for_landmarks(
-                        lm, COMMON_ANGLES[selected_angle]["landmarks"]
+                        lm, _angle_landmarks(COMMON_ANGLES[selected_angle])
                     )
-                    if isinstance(selected_conf, (int, float)) and selected_conf >= FRAME_MIN_CONFIDENCE:
+                    selected_conf_min = _angle_confidence_threshold(COMMON_ANGLES[selected_angle])
+                    if isinstance(selected_conf, (int, float)) and selected_conf >= selected_conf_min:
                         rs["pending_switch_incumbent_observable_during_pending"] = True
                 if pending_angle in detector_outputs:
                     pending_calibrated = _is_detector_calibrated(
@@ -1922,7 +2137,7 @@ class RepCounterSession:
                     switched_to = pending_angle
                     selected_angle = pending_angle
                     cfg = COMMON_ANGLES[pending_angle]
-                    raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                    raw_angle_val = calculate_from_type(cfg["type"], cfg, raw_landmarks)
                     self._sync_detector_instrumentation_flags()
                 elif pending_elapsed_ms > PENDING_SWITCH_MAX_OBSERVATION_MS:
                     _activate_joint_switch(
@@ -1937,7 +2152,7 @@ class RepCounterSession:
                     switched_to = pending_angle
                     selected_angle = pending_angle
                     cfg = COMMON_ANGLES[pending_angle]
-                    raw_angle_val = calculate_from_type(cfg["type"], cfg["landmarks"], raw_landmarks)
+                    raw_angle_val = calculate_from_type(cfg["type"], cfg, raw_landmarks)
                     self._sync_detector_instrumentation_flags()
             else:
                 _clear_pending_switch(rs)
@@ -1978,7 +2193,12 @@ class RepCounterSession:
             re_eval_due = bool(run_full_re_eval)
         if re_eval_due:
             t_var = time.perf_counter()
-            variances = self._get_variances(rs, frame_buffer, include_debug=False)
+            variances = self._get_variances(
+                rs,
+                frame_buffer,
+                include_debug=False,
+                fallback_armed=True,
+            )
             perf_ms["variance_ms"] = (time.perf_counter() - t_var) * 1000.0
             now_ms = int(ts)
             score_by_joint: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -1989,6 +2209,59 @@ class RepCounterSession:
                     now_ms,
                 )
 
+            fallback_armed = bool(rs.get("fallback_armed"))
+            primary_recovered = _has_primary_recovery_candidate(score_by_joint)
+            if fallback_armed and primary_recovered:
+                rs["fallback_armed"] = False
+                _reset_fallback_streak(rs)
+                fallback_armed = False
+
+            selected_score_for_fallback = 0.0
+            selected_debug_for_fallback: dict[str, Any] = {}
+            if isinstance(selected_angle, str):
+                selected_score_for_fallback, selected_debug_for_fallback = score_by_joint.get(
+                    selected_angle, (0.0, {})
+                )
+            selected_range_gate_closed_streak = int(rs.get("selected_range_gate_closed_streak") or 0)
+            stale_now = bool(stale_reevals >= 1)
+            low_score_now = bool(
+                float(selected_score_for_fallback) < FALLBACK_Y_LOW_SCORE_THRESHOLD
+                and float(selected_debug_for_fallback.get("recentRange") or 0.0)
+                < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+            )
+            unclear_motion_now = bool(selected_range_gate_closed_streak >= STALE_SWITCH_MIN_CLOSED_STREAK)
+            not_recalibrating_now = bool(
+                rs.get("pending_switch_angle") is None
+                and rs.get("handoff_observation_candidate_angle") is None
+            )
+            pre_calibrate_active = False
+            if isinstance(selected_output_for_eval, dict):
+                pre_calibrate_active = not bool(
+                    selected_output_for_eval.get("calibrationComplete", False)
+                )
+            elif active_detector is not None:
+                pre_calibrate_active = not _is_detector_calibrated(active_detector)
+            fallback_elapsed = _update_fallback_bad_streak(
+                rs,
+                now_s=now,
+                conditions_met=(
+                    stale_now
+                    and low_score_now
+                    and unclear_motion_now
+                    and not_recalibrating_now
+                ),
+                paused=pre_calibrate_active,
+            )
+            if not fallback_armed:
+                fb_key, _, _ = _best_fallback_candidate(score_by_joint)
+                if (
+                    fb_key is not None
+                    and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
+                    and FALLBACK_Y_ARM_WINDOW_SEC > 0.0
+                ):
+                    rs["fallback_armed"] = True
+                    fallback_armed = True
+
             candidate, candidate_sel_debug = select_recalibration_candidate(
                 score_by_joint, selected_angle if isinstance(selected_angle, str) else None,
                 variance_by_joint=variances,
@@ -1997,6 +2270,8 @@ class RepCounterSession:
                 selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
                 stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
                 stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                fallback_armed=fallback_armed,
+                primary_recovery_score=FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
             )
 
             selected_score = 0.0
@@ -2074,6 +2349,14 @@ class RepCounterSession:
                 "repCooldownOk": bool(rep_cooldown_ok),
                 "repsSinceLastSwitch": int(reps_since_last_switch),
                 "minRepsSinceLastSwitch": int(JOINT_SWITCH_MIN_REPS_SINCE_LAST),
+                "fallbackArmed": bool(fallback_armed),
+                "fallbackElapsedSec": float(fallback_elapsed),
+                "fallbackPrimaryRecovered": bool(primary_recovered),
+                "fallbackStaleNow": bool(stale_now),
+                "fallbackLowScoreNow": bool(low_score_now),
+                "fallbackUnclearMotionNow": bool(unclear_motion_now),
+                "fallbackNotRecalibratingNow": bool(not_recalibrating_now),
+                "fallbackPreCalibratePaused": bool(pre_calibrate_active),
             }
             if (
                 isinstance(selected_angle, str)
@@ -2300,7 +2583,7 @@ class RepCounterSession:
         shown_rep_count_raw = max(0, shown_rep_count_raw)
         sel_ang = rs.get("selected_angle")
         if isinstance(sel_ang, str):
-            tlm = list(COMMON_ANGLES[sel_ang]["landmarks"])
+            tlm = list(_angle_landmarks(COMMON_ANGLES[sel_ang]))
         else:
             tlm = None
 

@@ -25,18 +25,68 @@ from flexible_rep_counter.core.math_engine import (
 # knee–hip–opposite hip (no shoulders/torso).
 
 COMMON_ANGLES: dict[str, dict[str, Any]] = {
-    "LEFT_KNEE": {"type": "angle_3_point", "landmarks": [11, 13, 15]},
-    "RIGHT_KNEE": {"type": "angle_3_point", "landmarks": [12, 14, 16]},
-    "LEFT_ELBOW": {"type": "angle_3_point", "landmarks": [5, 7, 9]},
-    "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10]},
-    "LEFT_SHOULDER": {"type": "angle_3_point", "landmarks": [11, 5, 7]},
-    "RIGHT_SHOULDER": {"type": "angle_3_point", "landmarks": [12, 6, 8]},
-    "LEFT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [7, 5, 6]},
-    "RIGHT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [8, 6, 5]},
-    "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13]},
-    "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14]},
-    "LEFT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [13, 11, 12]},
-    "RIGHT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [14, 12, 11]},
+    "LEFT_KNEE": {"type": "angle_3_point", "landmarks": [11, 13, 15], "eligibility": "primary"},
+    "RIGHT_KNEE": {"type": "angle_3_point", "landmarks": [12, 14, 16], "eligibility": "primary"},
+    "LEFT_ELBOW": {"type": "angle_3_point", "landmarks": [5, 7, 9], "eligibility": "primary"},
+    "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10], "eligibility": "primary"},
+    "LEFT_SHOULDER": {"type": "angle_3_point", "landmarks": [11, 5, 7], "eligibility": "primary"},
+    "RIGHT_SHOULDER": {"type": "angle_3_point", "landmarks": [12, 6, 8], "eligibility": "primary"},
+    "LEFT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [7, 5, 6], "eligibility": "primary"},
+    "RIGHT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [8, 6, 5], "eligibility": "primary"},
+    "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13], "eligibility": "primary"},
+    "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14], "eligibility": "primary"},
+    "LEFT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [13, 11, 12], "eligibility": "primary"},
+    "RIGHT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [14, 12, 11], "eligibility": "primary"},
+    "SHOULDER_SHRUG_Y": {
+        "type": "relational_y_displacement",
+        "moving": [5, 6],
+        "reference": [11, 12],
+        "landmarks": [5, 6, 11, 12],
+        "scale": {"kind": "shoulder_width"},
+        "gain": 100.0,
+        "min_conf": 0.4,
+        "eligibility": "fallback",
+    },
+    "LEFT_WRIST_Y_REL": {
+        "type": "relational_y_displacement",
+        "moving": [9],
+        "reference": [5],
+        "landmarks": [9, 5, 6, 11, 12],
+        "scale": {"kind": "torso_height"},
+        "gain": 100.0,
+        "min_conf": 0.4,
+        "eligibility": "fallback",
+    },
+    "RIGHT_WRIST_Y_REL": {
+        "type": "relational_y_displacement",
+        "moving": [10],
+        "reference": [6],
+        "landmarks": [10, 6, 5, 11, 12],
+        "scale": {"kind": "torso_height"},
+        "gain": 100.0,
+        "min_conf": 0.4,
+        "eligibility": "fallback",
+    },
+    "HIP_DEPTH_Y": {
+        "type": "relational_y_displacement",
+        "moving": [11, 12],
+        "reference": [15, 16],
+        "landmarks": [11, 12, 15, 16],
+        "scale": {"kind": "hip_width"},
+        "gain": 100.0,
+        "min_conf": 0.4,
+        "eligibility": "fallback",
+    },
+    "ANKLE_LIFT_Y": {
+        "type": "relational_y_displacement",
+        "moving": [15, 16],
+        "reference": [11, 12],
+        "landmarks": [15, 16, 11, 12],
+        "scale": {"kind": "hip_width"},
+        "gain": 100.0,
+        "min_conf": 0.4,
+        "eligibility": "fallback",
+    },
 }
 
 LOW_CONFIDENCE_THRESHOLD = 0.5
@@ -50,6 +100,36 @@ ACROSS_DOMINANCE_MIN_RATIO = 1.32
 # When the #2 candidate is hip/shoulder *across* and #1 is a limb joint, median-window
 # variances are not directly comparable; use at most this ratio (vs global second_best).
 SECOND_BEST_RELAXED_WHEN_RUNNERUP_ACROSS = 1.06
+UNCLEAR_TIEBREAK_POOL_RATIO = 0.96
+UNCLEAR_TIEBREAK_MIN_CONFIDENCE = 0.62
+UNCLEAR_TIEBREAK_MIN_VARIANCE_FACTOR = 1.10
+UNCLEAR_TIEBREAK_MIN_ACTIVE_WINDOWS = 3
+UNCLEAR_TIEBREAK_MIN_RANGE_FLOOR_DEG = 18.0
+
+
+def is_fallback_angle(angle_key: str) -> bool:
+    cfg = COMMON_ANGLES.get(angle_key) or {}
+    return str(cfg.get("eligibility") or "primary").strip().lower() == "fallback"
+
+
+def _angle_landmarks(cfg: dict[str, Any]) -> list[int]:
+    landmarks = cfg.get("landmarks")
+    if isinstance(landmarks, list) and landmarks:
+        return [int(i) for i in landmarks]
+    moving = [int(i) for i in (cfg.get("moving") or [])]
+    reference = [int(i) for i in (cfg.get("reference") or [])]
+    merged = moving + reference
+    deduped: list[int] = []
+    for idx in merged:
+        if idx not in deduped:
+            deduped.append(idx)
+    return deduped
+
+
+def _angle_min_conf_threshold(cfg: dict[str, Any]) -> float:
+    if str(cfg.get("type") or "").strip().lower() == "relational_y_displacement":
+        return float(cfg.get("min_conf", 0.4) or 0.4)
+    return FRAME_MIN_CONFIDENCE
 
 
 def _angle_side(angle_key: str) -> str:
@@ -111,11 +191,14 @@ def compute_angle_variances_from_buffer(
     *,
     include_debug: bool = True,
     angle_histories: Optional[dict[str, list[Optional[float]]]] = None,
+    fallback_armed: bool = False,
 ) -> dict[str, dict[str, Any]]:
     if not frame_buffer:
         return {}
     variances: dict[str, dict[str, Any]] = {}
     for angle_key, config in COMMON_ANGLES.items():
+        if is_fallback_angle(angle_key) and not fallback_armed:
+            continue
         history: list[float] = []
         precomputed = angle_histories.get(angle_key) if angle_histories else None
         if precomputed is not None:
@@ -129,10 +212,12 @@ def compute_angle_variances_from_buffer(
             for landmarks in frame_buffer:
                 if not landmarks:
                     continue
-                min_conf = get_min_confidence_for_landmarks(landmarks, config["landmarks"])
-                if min_conf is None or min_conf < FRAME_MIN_CONFIDENCE:
+                angle_landmarks = _angle_landmarks(config)
+                min_conf_required = _angle_min_conf_threshold(config)
+                min_conf = get_min_confidence_for_landmarks(landmarks, angle_landmarks)
+                if min_conf is None or min_conf < min_conf_required:
                     continue
-                value = calculate_from_type(config["type"], config["landmarks"], landmarks)
+                value = calculate_from_type(config["type"], config, landmarks)
                 if value is not None and not (isinstance(value, float) and value != value):
                     history.append(value)
         if len(history) >= 10:
@@ -188,6 +273,7 @@ def dominance_conditions_met(
     *,
     dominance_fraction: float,
     min_leading_reps: int,
+    fallback_armed: bool = False,
 ) -> bool:
     """
     True when one joint leads rep count by more than `dominance_fraction` of total reps, has at least
@@ -202,16 +288,16 @@ def dominance_conditions_met(
         return False
     if int(rep_dom.get("leaderReps") or 0) < min_leading_reps:
         return False
-    if not passes_consistent_variance_gate(variances, leader_key):
+    if not passes_consistent_variance_gate(variances, leader_key, fallback_armed=fallback_armed):
         return False
-    top = _get_top_candidate(variances)
+    top = _get_top_candidate(variances, fallback_armed=fallback_armed)
     if top is not None and not angle_keys_compatible(str(top.get("key")), str(leader_key)):
         return False
     return True
 
 
 def passes_consistent_variance_gate(
-    variances: dict[str, dict[str, Any]], angle_key: str
+    variances: dict[str, dict[str, Any]], angle_key: str, *, fallback_armed: bool = False
 ) -> bool:
     """
     True if this angle shows the same multi-window activity + ROM pattern used to
@@ -220,6 +306,8 @@ def passes_consistent_variance_gate(
     """
     data = variances.get(angle_key)
     if not data:
+        return False
+    if is_fallback_angle(angle_key) and not fallback_armed:
         return False
     ok, _ = _variance_eligibility(angle_key, data)
     return ok
@@ -259,10 +347,81 @@ def _prefer_same_side_alt_over_across(
     return across_score < alt_score * ACROSS_DOMINANCE_MIN_RATIO
 
 
-def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _joint_stability_rank(angle_key: str) -> int:
+    base = _angle_base(angle_key)
+    if base == "KNEE":
+        return 4
+    if base == "HIP":
+        return 3
+    if base == "SHOULDER":
+        return 2
+    if base == "ELBOW":
+        return 1
+    return 0
+
+
+def _is_strong_unclear_tiebreak_candidate(
+    angle_key: str,
+    score: float,
+    data: dict[str, Any],
+) -> bool:
+    thresholds = _angle_selection_thresholds(angle_key)
+    min_score = float(thresholds["min_variance"]) * UNCLEAR_TIEBREAK_MIN_VARIANCE_FACTOR
+    min_range = max(float(thresholds["min_range_deg"]), UNCLEAR_TIEBREAK_MIN_RANGE_FLOOR_DEG)
+    active_windows = int(data.get("activeWindowCount") or 0)
+    range_deg = float(data.get("smoothedRangeDeg") or 0.0)
+    return bool(
+        score >= min_score
+        and active_windows >= UNCLEAR_TIEBREAK_MIN_ACTIVE_WINDOWS
+        and range_deg >= min_range
+    )
+
+
+def _resolve_unclear_tie_break_candidate(
+    ranked: list[tuple[float, str, dict[str, Any]]],
+) -> Optional[dict[str, Any]]:
+    if len(ranked) < 2:
+        return None
+    top_score = float(ranked[0][0])
+    if top_score <= 0.0:
+        return None
+    pool: list[tuple[float, str, dict[str, Any]]] = []
+    for score, key, data in ranked:
+        if float(score) < top_score * UNCLEAR_TIEBREAK_POOL_RATIO:
+            break
+        if _is_strong_unclear_tiebreak_candidate(key, float(score), data):
+            pool.append((float(score), key, data))
+    if len(pool) < 2:
+        return None
+    winner_score, winner_key, winner_data = max(
+        pool,
+        key=lambda x: (
+            _joint_stability_rank(x[1]),
+            float(x[2].get("smoothedRangeDeg") or 0.0),
+            x[0],
+            int(x[2].get("activeWindowCount") or 0),
+            x[1],
+        ),
+    )
+    return {
+        "key": winner_key,
+        "__tiebreak_unclear": True,
+        "__tiebreak_pool_size": len(pool),
+        "__tiebreak_winner_score": winner_score,
+        **winner_data,
+    }
+
+
+def _get_top_candidate(
+    variances: dict[str, dict[str, Any]],
+    *,
+    fallback_armed: bool = False,
+) -> Optional[dict[str, Any]]:
     """Pick the clearest winner: multi-window activity, meaningful ROM, and margin over the runner-up."""
     ranked: list[tuple[float, str, dict[str, Any]]] = []
     for key, data in variances.items():
+        if is_fallback_angle(key) and not fallback_armed:
+            continue
         score = _candidate_score_if_eligible(key, data)
         if score is None:
             continue
@@ -290,14 +449,20 @@ def _get_top_candidate(variances: dict[str, dict[str, Any]]) -> Optional[dict[st
         if second_key.endswith("_ACROSS") and not top_key.endswith("_ACROSS"):
             ratio = min(ratio, SECOND_BEST_RELAXED_WHEN_RUNNERUP_ACROSS)
         if second_score > 0 and top_score < second_score * ratio:
+            tie_break = _resolve_unclear_tie_break_candidate(ranked)
+            if tie_break is not None:
+                return tie_break
             return None
     return {"key": top_key, **top_data}
 
 
 def _get_angle_confidence(frame_buffer: list[list[dict]], angle_config: Optional[dict]) -> float:
-    if not angle_config or not angle_config.get("landmarks"):
+    if not angle_config:
         return 0.0
-    return get_average_confidence_for_landmarks(frame_buffer, angle_config["landmarks"])
+    landmarks = _angle_landmarks(angle_config)
+    if not landmarks:
+        return 0.0
+    return get_average_confidence_for_landmarks(frame_buffer, landmarks)
 
 
 def determine_best_angle(
@@ -305,6 +470,7 @@ def determine_best_angle(
     *,
     variances: Optional[dict[str, dict[str, Any]]] = None,
     include_debug: bool = True,
+    fallback_armed: bool = False,
 ) -> dict[str, Any]:
     """
     Pick the best angle to track from a buffer of frames.
@@ -327,7 +493,7 @@ def determine_best_angle(
         return default_result
 
     variance_rows = variances or _calculate_all_variances(
-        frame_buffer, include_debug=include_debug
+        frame_buffer, include_debug=include_debug, fallback_armed=fallback_armed
     )
     if include_debug:
         debug["variances"] = {
@@ -343,7 +509,7 @@ def determine_best_angle(
             for k, v in variance_rows.items()
         }
 
-    top_candidate = _get_top_candidate(variance_rows)
+    top_candidate = _get_top_candidate(variance_rows, fallback_armed=fallback_armed)
     debug["topCandidate"] = (
         {
             "key": top_candidate["key"],
@@ -366,12 +532,17 @@ def determine_best_angle(
     avg_confidence = _get_angle_confidence(frame_buffer, top_candidate.get("config"))
     debug["avgConfidence"] = avg_confidence
 
-    if avg_confidence < LOW_CONFIDENCE_THRESHOLD:
+    min_conf_for_pick = (
+        UNCLEAR_TIEBREAK_MIN_CONFIDENCE
+        if bool(top_candidate.get("__tiebreak_unclear"))
+        else LOW_CONFIDENCE_THRESHOLD
+    )
+    if avg_confidence < min_conf_for_pick:
         return default_result
 
     return {
         "selectedAngle": top_candidate["key"],
-        "source": "variance",
+        "source": "variance_tiebreak" if bool(top_candidate.get("__tiebreak_unclear")) else "variance",
         "tuningParams": get_default_tuning_params(),
         "debug": debug,
     }

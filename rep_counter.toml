@@ -82,6 +82,22 @@ smooth_window = 5
 # a joint lock/switch. Helps avoid early noisy candidate scans.
 post_lock_min_raw_reps = 5
 
+[fallback_y_point]
+# Arm fallback-only Y candidates after these bad-3-point conditions hold for this long.
+arm_window_sec = 4.0
+# Tracked 3-point joint is considered low quality under this score.
+low_score_threshold = 0.40
+# Minimum score needed for a Y fallback candidate to be armed.
+arming_min_score = 0.62
+# Any 3-point candidate at/above this score can disarm fallback.
+primary_recovery_score = 0.60
+# Additional fallback quality gates.
+min_activity_score = 0.50
+min_pose_score = 0.45
+min_rom_score = 0.50
+min_extrema_score = 0.40
+min_completed_cycles = 2
+
 # Per joint: keys match COMMON_ANGLES. Omitted fields use [angle_selection] globals above.
 # min_variance / min_range_deg: override globals for noisy or small-ROM joints. Higher = harder for that joint to win; lower = easier.
 [angle_selection.joints.LEFT_ELBOW]
