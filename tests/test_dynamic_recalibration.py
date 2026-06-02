@@ -483,7 +483,8 @@ def test_full_reeval_when_raw_stale_even_if_range_healthy() -> None:
     assert should_run is True
 
 
-def test_post_lock_grace_skips_full_reeval() -> None:
+def test_post_lock_skips_full_reeval_even_when_incumbent_cannot_count() -> None:
+    """Before post_lock raw reps, skip full re-eval until the warmup threshold is met."""
     should_run = should_run_full_recalibration(
         has_pending_switch=False,
         has_handoff_observation=False,
@@ -492,10 +493,11 @@ def test_post_lock_grace_skips_full_reeval() -> None:
         post_lock_min_raw_reps=5,
         raw_advanced_since_last_eval=False,
         selected_recent_range=4.0,
-        selected_pose_score=0.1,
+        selected_pose_score=0.9,
         selected_range_gate_closed_streak=12,
         stale_switch_max_selected_recent_range_deg=14.0,
         stale_switch_min_closed_streak=10,
+        selected_score=0.55,
     )
     assert should_run is False
 

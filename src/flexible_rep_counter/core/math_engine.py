@@ -187,31 +187,36 @@ def _relational_scale_px(
     return calculate_body_scale(landmarks)
 
 
-def calculate_relational_y_displacement(
+def calculate_scale_px_for_cfg(
     cfg: dict[str, Any],
     landmarks: list[dict],
 ) -> Optional[float]:
-    moving = [int(i) for i in (cfg.get("moving") or [])]
-    reference = [int(i) for i in (cfg.get("reference") or [])]
-    if not moving or not reference:
-        return None
     min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
-    moving_y = _mean_y_for_indices(landmarks, moving, min_conf=min_conf)
-    reference_y = _mean_y_for_indices(landmarks, reference, min_conf=min_conf)
-    if moving_y is None or reference_y is None:
-        return None
     scale_cfg = cfg.get("scale") or {}
     scale_kind = (
         str(scale_cfg.get("kind")).strip()
         if isinstance(scale_cfg, dict) and scale_cfg.get("kind")
         else "torso_height"
     )
-    scale_px = _relational_scale_px(landmarks, scale_kind=scale_kind, min_conf=min_conf)
+    scale_px = _relational_scale_px(
+        landmarks,
+        scale_kind=scale_kind,
+        min_conf=min_conf,
+    )
     if scale_px is None:
         return None
-    scale_px = max(abs(float(scale_px)), 1e-6)
-    gain = float(cfg.get("gain", 100.0) or 100.0)
-    return gain * ((moving_y - reference_y) / scale_px)
+    return max(abs(float(scale_px)), 1e-6)
+
+
+def calculate_absolute_y_position(
+    cfg: dict[str, Any],
+    landmarks: list[dict],
+) -> Optional[float]:
+    indices = [int(i) for i in (cfg.get("sample_landmarks") or cfg.get("landmarks") or [])]
+    if not indices:
+        return None
+    min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
+    return _mean_y_for_indices(landmarks, indices, min_conf=min_conf)
 
 
 def calculate_from_type(
@@ -229,8 +234,8 @@ def calculate_from_type(
         indices = list(target_landmarks or [])
         cfg = {"landmarks": indices}
 
-    if calc_type == "relational_y_displacement":
-        return calculate_relational_y_displacement(cfg, landmarks)
+    if calc_type == "absolute_y_position":
+        return calculate_absolute_y_position(cfg, landmarks)
 
     if not indices:
         return None
@@ -818,6 +823,24 @@ class PeakDetector:
         self._calibrated_avg_peak = None
         self._calibrated_avg_valley = None
         self._last_rep_time_ms = None
+        self._instrumentation_events.clear()
+
+    def reset_calibration_preserve_reps(self) -> None:
+        self.state = PEAK_STATE_NEUTRAL
+        self.smoothed_value = None
+        self.last_peak_frame = -self.min_peak_distance
+        self.neutral_frame_count = 0
+        self.peaks.clear()
+        self.valleys.clear()
+        self.current_peak_value = None
+        self.current_valley_value = None
+        self._value_window.clear()
+        self._last_rolling_range = 0.0
+        self._last_range_gate_open = self.min_range_gate_degrees <= 0
+        self._last_debanded_pass = None
+        self._calibrated = False
+        self._calibrated_avg_peak = None
+        self._calibrated_avg_valley = None
         self._instrumentation_events.clear()
 
     def get_state(self) -> dict[str, Any]:

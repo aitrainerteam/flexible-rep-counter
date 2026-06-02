@@ -7,7 +7,17 @@ from statistics import mean, median
 from typing import Any, Literal, Optional
 
 from flexible_rep_counter.core.math_engine import PeakDetector
-from flexible_rep_counter.core.variance_angle_selector import FRAME_MIN_CONFIDENCE, is_fallback_angle
+from flexible_rep_counter.core.settings import (
+    FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC,
+    FALLBACK_Y_BASELINE_MIN_SAMPLES,
+    FALLBACK_Y_BASELINE_SHORT_WINDOW_FRAMES,
+    FALLBACK_Y_BASELINE_WINDOW_FRAMES,
+)
+from flexible_rep_counter.core.variance_angle_selector import (
+    FRAME_MIN_CONFIDENCE,
+    angle_signal_unit,
+    is_fallback_angle,
+)
 
 _RECENT_RANGE_WINDOW = 45
 _POSE_WINDOW = 30
@@ -17,6 +27,10 @@ MIN_EVIDENCE_ROM_DEG = 12.0
 MIN_EVIDENCE_RANGE_DEG = 12.0
 GOOD_RANGE_DEG = 35.0
 MIN_RANGE_DEG = 12.0
+MIN_EVIDENCE_ROM_PX = 8.0
+MIN_EVIDENCE_RANGE_PX = 8.0
+GOOD_RANGE_PX = 24.0
+MIN_RANGE_PX = 8.0
 
 UNOBSERVABLE_POSE_SCORE = 0.30
 INCUMBENT_ACTIVE_MOTION_MIN_SPAN_DEG = 18.0
@@ -63,6 +77,19 @@ class JointMotionState:
     recent_valleys: deque[float] = field(default_factory=lambda: deque(maxlen=8))
     recent_intervals_ms: deque[int] = field(default_factory=lambda: deque(maxlen=8))
     cycle_log: deque[tuple[int, float]] = field(default_factory=lambda: deque(maxlen=16))
+    absolute_y_long_window: deque[float] = field(
+        default_factory=lambda: deque(maxlen=max(8, int(FALLBACK_Y_BASELINE_WINDOW_FRAMES)))
+    )
+    absolute_y_short_window: deque[float] = field(
+        default_factory=lambda: deque(maxlen=max(4, int(FALLBACK_Y_BASELINE_SHORT_WINDOW_FRAMES)))
+    )
+    absolute_y_baseline_px: float | None = None
+    absolute_y_last_baseline_update_ms: int | None = None
+    last_raw_y_px: float | None = None
+    last_baseline_px: float | None = None
+    last_oscillation_px: float | None = None
+    last_scale_px: float | None = None
+    scale_at_lock_px: float | None = None
 
     last_score: float = 0.0
     last_score_debug: dict[str, float] = field(default_factory=dict)
@@ -122,7 +149,7 @@ def robust_cv(values: list[float]) -> float:
     return robust_std(values) / max(abs(med), 1e-6)
 
 
-def _recent_range_deg(state: JointMotionState) -> float:
+def _recent_range(state: JointMotionState) -> float:
     recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
     if len(recent_values) < 8:
         return 0.0
@@ -131,11 +158,14 @@ def _recent_range_deg(state: JointMotionState) -> float:
 
 def median_recent_range_from_score_debug(
     scores: dict[str, tuple[float, dict[str, Any]]],
+    *,
+    signal_unit: Optional[str] = None,
 ) -> float:
     ranges = [
         float(debug.get("recentRange") or 0.0)
-        for _, (_, debug) in scores.items()
+        for angle_key, (_, debug) in scores.items()
         if float(debug.get("recentRange") or 0.0) > 0.0
+        and (signal_unit is None or angle_signal_unit(angle_key) == signal_unit)
     ]
     return float(median(ranges)) if ranges else 0.0
 
@@ -143,6 +173,60 @@ def median_recent_range_from_score_debug(
 def median_cycle_rom_deg(state: JointMotionState) -> float:
     roms = [float(v) for v in list(state.recent_roms) if isinstance(v, (int, float))]
     return float(median(roms)) if roms else 0.0
+
+
+def signal_unit(angle_key: str) -> str:
+    return angle_signal_unit(angle_key)
+
+
+def _activity_thresholds(unit: str) -> tuple[float, float]:
+    if unit == "px":
+        return MIN_RANGE_PX, GOOD_RANGE_PX
+    return MIN_RANGE_DEG, GOOD_RANGE_DEG
+
+
+def _evidence_thresholds(unit: str) -> tuple[float, float]:
+    if unit == "px":
+        return MIN_EVIDENCE_ROM_PX, MIN_EVIDENCE_RANGE_PX
+    return MIN_EVIDENCE_ROM_DEG, MIN_EVIDENCE_RANGE_DEG
+
+
+def _apply_absolute_y_baseline(
+    state: JointMotionState,
+    *,
+    raw_value: float,
+    timestamp_ms: int,
+) -> float:
+    state.absolute_y_long_window.append(raw_value)
+    state.absolute_y_short_window.append(raw_value)
+    state.last_raw_y_px = float(raw_value)
+    long_values = list(state.absolute_y_long_window)
+    if state.absolute_y_baseline_px is None:
+        if len(long_values) >= max(3, int(FALLBACK_Y_BASELINE_MIN_SAMPLES)):
+            state.absolute_y_baseline_px = float(median(long_values))
+            state.absolute_y_last_baseline_update_ms = int(timestamp_ms)
+        state.last_baseline_px = state.absolute_y_baseline_px
+        state.last_oscillation_px = 0.0
+        return 0.0
+
+    target_baseline = float(median(long_values)) if long_values else float(state.absolute_y_baseline_px)
+    last_update = (
+        int(state.absolute_y_last_baseline_update_ms)
+        if isinstance(state.absolute_y_last_baseline_update_ms, int)
+        else int(timestamp_ms)
+    )
+    dt_s = max(0.0, float(timestamp_ms - last_update) / 1000.0)
+    max_slew = max(0.0, float(FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC)) * dt_s
+    delta = target_baseline - float(state.absolute_y_baseline_px)
+    if max_slew <= 0.0:
+        adjusted_baseline = float(state.absolute_y_baseline_px)
+    else:
+        adjusted_baseline = float(state.absolute_y_baseline_px) + max(-max_slew, min(max_slew, delta))
+    state.absolute_y_baseline_px = adjusted_baseline
+    state.absolute_y_last_baseline_update_ms = int(timestamp_ms)
+    state.last_baseline_px = adjusted_baseline
+    state.last_oscillation_px = float(raw_value - adjusted_baseline)
+    return float(raw_value - adjusted_baseline)
 
 
 def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, Any]) -> float:
@@ -160,10 +244,11 @@ def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, An
     return 0.0
 
 
-def cycle_is_evidence(state: JointMotionState, rom: float, recent_range_deg: float) -> bool:
+def cycle_is_evidence(state: JointMotionState, rom: float, recent_range: float) -> bool:
+    min_rom, min_range = _evidence_thresholds(signal_unit(state.angle_key))
     return (
-        rom >= MIN_EVIDENCE_ROM_DEG
-        and recent_range_deg >= MIN_EVIDENCE_RANGE_DEG
+        rom >= min_rom
+        and recent_range >= min_range
         and state.last_observed_timestamp_ms is not None
     )
 
@@ -174,6 +259,7 @@ def update_joint_motion_state(
     conf: Optional[float],
     timestamp_ms: int,
     min_confidence: float = FRAME_MIN_CONFIDENCE,
+    scale_px: Optional[float] = None,
 ) -> dict[str, Any]:
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.0
     state.confidence_history.append((timestamp_ms, confidence))
@@ -181,8 +267,18 @@ def update_joint_motion_state(
         state.history.append(None)
         return {"advanced": False, "detectorOutput": state.detector.update(None), "gatedCycle": False}
 
-    value = float(val)
+    raw_value = float(val)
+    value = raw_value
+    if signal_unit(state.angle_key) == "px":
+        value = _apply_absolute_y_baseline(
+            state,
+            raw_value=raw_value,
+            timestamp_ms=timestamp_ms,
+        )
     state.history.append(value)
+    state.last_scale_px = float(scale_px) if isinstance(scale_px, (int, float)) else None
+    if state.scale_at_lock_px is None and state.last_scale_px is not None:
+        state.scale_at_lock_px = float(state.last_scale_px)
     state.last_observed_timestamp_ms = timestamp_ms
 
     prev_raw = int(state.detector.get_rep_count() or 0)
@@ -203,8 +299,8 @@ def update_joint_motion_state(
             state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
         state.last_rep_timestamp_ms = timestamp_ms
         rom = _latest_cycle_rom_deg(state, detector_output)
-        range_deg = _recent_range_deg(state)
-        if cycle_is_evidence(state, rom, range_deg):
+        recent_range = _recent_range(state)
+        if cycle_is_evidence(state, rom, recent_range):
             state.recent_roms.append(float(rom))
             state.cycle_log.append((timestamp_ms, float(rom)))
             gated_cycle = True
@@ -215,12 +311,15 @@ def update_joint_motion_state(
 
 def normalize_variance_prior(variance_data: Optional[dict[str, Any]]) -> float:
     data = variance_data or {}
+    unit = str(data.get("signalUnit") or "deg")
     variance = float(data.get("medianWindowVariance") or 0.0)
     active_windows = float(data.get("activeWindowCount") or 0.0)
-    smoothed_range = float(data.get("smoothedRangeDeg") or 0.0)
+    range_raw = data.get("smoothedRangePx") if unit == "px" else data.get("smoothedRangeDeg")
+    smoothed_range = float(range_raw or 0.0)
+    min_range, good_range = _activity_thresholds(unit)
     variance_score = clamp(variance / 120.0, 0.0, 1.0)
     active_score = clamp(active_windows / 4.0, 0.0, 1.0)
-    range_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, smoothed_range)
+    range_score = smoothstep(min_range, good_range, smoothed_range)
     return 0.45 * variance_score + 0.20 * active_score + 0.35 * range_score
 
 
@@ -229,6 +328,7 @@ def compute_joint_recalibration_score(
     variance_data: Optional[dict[str, Any]],
     now_ms: int,
 ) -> tuple[float, dict[str, Any]]:
+    unit = signal_unit(state.angle_key)
     recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
     recent_range = (
         _percentile(recent_values, 95.0) - _percentile(recent_values, 5.0)
@@ -237,7 +337,8 @@ def compute_joint_recalibration_score(
     )
 
     variance_prior = normalize_variance_prior(variance_data)
-    activity_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, recent_range)
+    min_range, good_range = _activity_thresholds(unit)
+    activity_score = smoothstep(min_range, good_range, recent_range)
 
     roms = list(state.recent_roms)
     peaks = list(state.recent_peaks)
@@ -288,6 +389,7 @@ def compute_joint_recalibration_score(
     score = evidence * cycle_quality + (1.0 - evidence) * variance_prior
     debug = {
         "score": score,
+        "signalUnit": unit,
         "evidence": evidence,
         "completedCycles": completed_cycles,
         "activityScore": activity_score,
@@ -301,6 +403,8 @@ def compute_joint_recalibration_score(
         "poseScore": pose_score,
         "visibleFraction": visible_fraction,
         "recentRange": recent_range,
+        "recentRangePx": recent_range if unit == "px" else None,
+        "recentRangeDeg": recent_range if unit == "deg" else None,
         "observable": observable,
     }
     state.last_score = float(score)
@@ -384,20 +488,27 @@ def should_run_full_recalibration(
     selected_range_gate_closed_streak: int,
     stale_switch_max_selected_recent_range_deg: float,
     stale_switch_min_closed_streak: int,
+    selected_score: float = 1.0,
 ) -> bool:
     if has_pending_switch or has_handoff_observation:
         return True
-    if current_raw < tracking_raw_at_joint_lock + max(0, int(post_lock_min_raw_reps)):
-        return False
     incumbent_health = compute_incumbent_health(
         stale_reevals=0,
         selected_recent_range=selected_recent_range,
         stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
         selected_range_gate_closed_streak=selected_range_gate_closed_streak,
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
-        selected_score=1.0,
+        selected_score=float(selected_score),
         selected_pose_score=selected_pose_score,
     )
+    # Keep post-lock warmup for healthy incumbents, but do not block re-evals when
+    # the currently tracked joint is already stale/bad (low ROM, closed range gate,
+    # weak score, or weak pose). This allows generic fallback recovery across joints.
+    within_post_lock_warmup = (
+        current_raw < tracking_raw_at_joint_lock + max(0, int(post_lock_min_raw_reps))
+    )
+    if within_post_lock_warmup and bool(incumbent_health.get("incumbentRangeHealthy")):
+        return False
     if raw_advanced_since_last_eval and bool(incumbent_health.get("incumbentRangeHealthy")):
         return False
     return True
@@ -417,7 +528,13 @@ def select_recalibration_candidate(
     primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
 ) -> tuple[str | None, dict[str, Any]]:
     variance_by_joint = variance_by_joint or {}
-    field_median_range = median_recent_range_from_score_debug(scores)
+    selected_unit = (
+        signal_unit(selected_angle) if isinstance(selected_angle, str) else None
+    )
+    field_median_range = median_recent_range_from_score_debug(
+        scores,
+        signal_unit=selected_unit,
+    )
     variance_values = [
         float((variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0)
         for angle_key in scores
@@ -468,8 +585,12 @@ def select_recalibration_candidate(
             continue
         if float(debug.get("poseScore") or 0.0) < UNOBSERVABLE_POSE_SCORE:
             continue
+        candidate_unit = signal_unit(angle_key)
+        range_floor = min_range
+        if candidate_unit != selected_unit:
+            range_floor = 0.0
         recent_range = float(debug.get("recentRange") or 0.0)
-        if min_range > 0.0 and recent_range < min_range:
+        if range_floor > 0.0 and recent_range < range_floor:
             continue
         joint_variance = float(
             (variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0
@@ -510,6 +631,7 @@ def select_recalibration_candidate(
         "bestPrimaryScore": best_primary_score,
         "primaryRecovered": primary_recovered,
         "fallbackArmed": bool(fallback_armed),
+        "fieldMedianRangeUnit": selected_unit,
         "fieldMedianRange": field_median_range,
         "fieldMedianVariance": field_median_variance,
         "allowCrossFamily": bool(allow_cross_family),
@@ -538,6 +660,8 @@ def should_switch_to_candidate(
     selected_median_rom_deg: float = 0.0,
     median_recent_range_all: float = 0.0,
     same_joint_family: bool = False,
+    selected_signal_unit: str = "deg",
+    candidate_signal_unit: str = "deg",
 ) -> tuple[bool, bool, dict[str, Any]]:
     incumbent_health = compute_incumbent_health(
         stale_reevals=stale_reevals,
@@ -555,18 +679,22 @@ def should_switch_to_candidate(
     score_margin = SAME_FAMILY_SCORE_MARGIN if same_joint_family else CROSS_FAMILY_SCORE_MARGIN
     score_ratio = SAME_FAMILY_SCORE_RATIO if same_joint_family else CROSS_FAMILY_SCORE_RATIO
 
+    compare_motion_ranges = selected_signal_unit == candidate_signal_unit
     candidate_range_vs_incumbent = (
-        candidate_recent_range <= 0.0
+        not compare_motion_ranges
+        or candidate_recent_range <= 0.0
         or selected_recent_range <= 0.0
         or candidate_recent_range >= selected_recent_range * range_ratio
     )
     candidate_range_vs_field = (
-        median_recent_range_all <= 0.0
+        not compare_motion_ranges
+        or median_recent_range_all <= 0.0
         or candidate_recent_range <= 0.0
         or candidate_recent_range >= median_recent_range_all * CANDIDATE_MIN_MEDIAN_RANGE_RATIO
     )
     candidate_rom_dominates = (
-        candidate_median_rom_deg <= 0.0
+        not compare_motion_ranges
+        or candidate_median_rom_deg <= 0.0
         or selected_median_rom_deg <= 0.0
         or candidate_median_rom_deg >= selected_median_rom_deg * rom_ratio
     )
@@ -607,6 +735,9 @@ def should_switch_to_candidate(
         "candidateRomDominates": bool(candidate_rom_dominates),
         "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),
+        "compareMotionRanges": bool(compare_motion_ranges),
+        "selectedSignalUnit": selected_signal_unit,
+        "candidateSignalUnit": candidate_signal_unit,
         "sameJointFamily": bool(same_joint_family),
         "shouldSwitch": bool(should_switch),
         "forceSwitch": bool(force_switch),

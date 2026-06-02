@@ -18,6 +18,8 @@ from flexible_rep_counter.session import (
     LOW_FPS_INTERVAL_WINDOW_FRAMES,
     _activate_joint_switch,
     _clear_pending_switch,
+    _dynamic_recalibration_active,
+    _suspend_recalibration_for_low_fps,
     _update_low_fps_health,
 )
 
@@ -177,3 +179,44 @@ def test_alternate_limb_carryover_remains_when_safe_mode_inactive() -> None:
     assert run_state["pending_switch_handoff_kind"] == "alternate_limb"
     assert int(run_state["pending_switch_handoff_target_shown"]) == 19
     assert int(run_state["rep_count_offset"]) == 10
+
+
+def test_dynamic_recalibration_is_inactive_during_low_fps_safe_mode() -> None:
+    rs = _new_health_state()
+    rs["low_fps_mode_active"] = True
+    assert _dynamic_recalibration_active(rs) is False
+    rs["low_fps_mode_active"] = False
+    assert _dynamic_recalibration_active(rs) is True
+
+
+def test_pending_recalibration_state_is_cleared_when_safe_mode_enters() -> None:
+    rs = _new_health_state()
+    rs["pending_switch_angle"] = "LEFT_ELBOW"
+    rs["handoff_observation_candidate_angle"] = "LEFT_ELBOW"
+    rs["fallback_armed"] = True
+    rs["low_fps_mode_active"] = True
+    rs["low_fps_mode_changed_pulse"] = True
+    _suspend_recalibration_for_low_fps(rs)
+    assert rs.get("pending_switch_angle") is None
+    assert rs.get("handoff_observation_candidate_angle") is None
+    assert rs.get("fallback_armed") is False
+
+
+def test_low_fps_enter_clears_in_progress_pending_switch(monkeypatch: Any) -> None:
+    rs = _new_health_state()
+    rs["pending_switch_angle"] = "LEFT_ELBOW"
+    rs["handoff_observation_candidate_angle"] = "RIGHT_ELBOW"
+    now = [1000.0]
+
+    def _fake_monotonic() -> float:
+        return now[0]
+
+    monkeypatch.setattr("flexible_rep_counter.session.time.monotonic", _fake_monotonic)
+    _update_low_fps_health(rs)
+    for _ in range(LOW_FPS_ENTER_STREAK + 20):
+        now[0] += 0.160
+        _update_low_fps_health(rs)
+        _suspend_recalibration_for_low_fps(rs)
+    assert rs["low_fps_mode_active"] is True
+    assert rs.get("pending_switch_angle") is None
+    assert rs.get("handoff_observation_candidate_angle") is None

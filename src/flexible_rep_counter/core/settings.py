@@ -200,6 +200,35 @@ FALLBACK_Y_MIN_EXTREMA_SCORE = _toml_float(
 FALLBACK_Y_MIN_COMPLETED_CYCLES = _toml_int(
     "fallback_y_point", "min_completed_cycles", default=2
 )
+FALLBACK_Y_BASELINE_MIN_SAMPLES = _toml_int(
+    "fallback_y_point", "baseline_min_samples", default=20
+)
+FALLBACK_Y_BASELINE_WINDOW_FRAMES = _toml_int(
+    "fallback_y_point", "baseline_window_frames", default=90
+)
+FALLBACK_Y_BASELINE_SHORT_WINDOW_FRAMES = _toml_int(
+    "fallback_y_point", "baseline_short_window_frames", default=24
+)
+FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC = _toml_float(
+    "fallback_y_point", "baseline_max_slew_px_per_sec", default=6.0
+)
+FALLBACK_Y_BASELINE_JUMP_FRAC = _toml_float(
+    "fallback_y_point", "baseline_jump_frac", default=0.25
+)
+
+DEPTH_RECALIBRATION_ENABLED = bool(_toml_val("depth_recalibration", "enabled") is not False)
+DEPTH_RECALIBRATION_SCALE_CHANGE_PCT = _toml_float(
+    "depth_recalibration", "scale_change_pct", default=0.18
+)
+DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC = _toml_float(
+    "depth_recalibration", "baseline_jump_frac", default=0.25
+)
+DEPTH_RECALIBRATION_COOLDOWN_SEC = _toml_float(
+    "depth_recalibration", "cooldown_sec", default=2.0
+)
+DEPTH_RECALIBRATION_OBSERVATION_REPS = _toml_int(
+    "depth_recalibration", "observation_reps", default=2
+)
 
 LOW_FPS_SAFE_MODE_ENABLED = bool(_toml_val("low_fps_safe_mode", "enabled") is not False)
 LOW_FPS_INTERVAL_WINDOW_FRAMES = _toml_int(
@@ -218,6 +247,38 @@ LOW_FPS_EXIT_STREAK_FRAMES = _toml_int(
 )
 
 
+def get_rep_joint_tuning_overrides(angle_key: str) -> dict[str, Any]:
+    """Per-joint peak-detector overrides from ``[rep.joints.<KEY>]`` (fallback Y joints, etc.)."""
+    joint = _toml_val("rep", "joints", angle_key)
+    if not isinstance(joint, dict):
+        return {}
+
+    def _f(key: str) -> Optional[float]:
+        raw = joint.get(key)
+        if raw is not None and isinstance(raw, (int, float)):
+            return float(raw)
+        return None
+
+    out: dict[str, Any] = {}
+    mapping = {
+        "hysteresis": "hysteresis",
+        "min_peak_distance": "minPeakDistance",
+        "min_range_gate": "minRangeGate",
+        "range_window_frames": "rangeWindowFrames",
+        "range_min_samples": "rangeMinSamples",
+        "min_interval_ms": "minRepIntervalMs",
+        "calibration_reps": "calibrationReps",
+    }
+    for toml_key, tp_key in mapping.items():
+        val = _f(toml_key)
+        if val is not None:
+            if tp_key in ("minPeakDistance", "rangeWindowFrames", "rangeMinSamples", "calibrationReps"):
+                out[tp_key] = int(val)
+            else:
+                out[tp_key] = val
+    return out
+
+
 def get_angle_selection_joint_thresholds(angle_key: str) -> dict[str, float]:
     """Per-joint gates from ``[angle_selection.joints.<KEY>]``, else ``[angle_selection]`` globals."""
     joint = _toml_val("angle_selection", "joints", angle_key)
@@ -233,6 +294,8 @@ def get_angle_selection_joint_thresholds(angle_key: str) -> dict[str, float]:
     return {
         "min_variance": _local("min_variance", ANGLE_SELECTION_MIN_VARIANCE),
         "min_range_deg": _local("min_range_deg", ANGLE_SELECTION_MIN_RANGE_DEG),
+        "min_variance_px2": _local("min_variance_px2", ANGLE_SELECTION_MIN_VARIANCE),
+        "min_range_px": _local("min_range_px", ANGLE_SELECTION_MIN_RANGE_DEG),
         "second_best_ratio": _local("second_best_ratio", ANGLE_SELECTION_SECOND_BEST_RATIO),
     }
 

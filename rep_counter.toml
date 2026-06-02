@@ -82,9 +82,16 @@ smooth_window = 5
 # a joint lock/switch. Helps avoid early noisy candidate scans.
 post_lock_min_raw_reps = 5
 
+# Vertical absolute-Y joints use smaller ROM in px than angle joints.
+[rep.joints.SHOULDER_SHRUG_Y]
+hysteresis = 4.0
+min_range_gate = 5.0
+min_peak_distance = 3
+range_min_samples = 8
+
 [fallback_y_point]
 # Arm fallback-only Y candidates after these bad-3-point conditions hold for this long.
-arm_window_sec = 4.0
+arm_window_sec = 3.0
 # Tracked 3-point joint is considered low quality under this score.
 low_score_threshold = 0.40
 # Minimum score needed for a Y fallback candidate to be armed.
@@ -97,6 +104,18 @@ min_pose_score = 0.45
 min_rom_score = 0.50
 min_extrema_score = 0.40
 min_completed_cycles = 2
+baseline_min_samples = 20
+baseline_window_frames = 90
+baseline_short_window_frames = 24
+baseline_max_slew_px_per_sec = 6.0
+baseline_jump_frac = 0.25
+
+[depth_recalibration]
+enabled = true
+scale_change_pct = 0.18
+baseline_jump_frac = 0.25
+cooldown_sec = 2.0
+observation_reps = 2
 
 # Per joint: keys match COMMON_ANGLES. Omitted fields use [angle_selection] globals above.
 # min_variance / min_range_deg: override globals for noisy or small-ROM joints. Higher = harder for that joint to win; lower = easier.
@@ -123,6 +142,11 @@ min_range_deg = 15
 [angle_selection.joints.RIGHT_HIP]
 min_variance = 6
 min_range_deg = 15
+
+[angle_selection.joints.SHOULDER_SHRUG_Y]
+min_variance_px2 = 4.0
+min_range_px = 6.0
+second_best_ratio = 1.10
 
 [low_fps_safe_mode]
 enabled = true

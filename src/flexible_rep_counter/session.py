@@ -14,7 +14,10 @@ from flexible_rep_counter.instrumentation import (
 
 from flexible_rep_counter.core.math_engine import (
     PeakDetector,
+    _mean_x_for_indices,
+    _mean_y_for_indices,
     calculate_from_type,
+    calculate_scale_px_for_cfg,
     create_peak_detector,
     get_min_confidence_for_landmarks,
 )
@@ -30,6 +33,7 @@ from flexible_rep_counter.core.recalibration_confidence import (
     median_cycle_rom_deg,
     median_recent_range_from_score_debug,
     select_recalibration_candidate,
+    signal_unit,
     should_switch_to_candidate,
     update_joint_motion_state,
 )
@@ -48,6 +52,11 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS,
+    DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC as CFG_DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC,
+    DEPTH_RECALIBRATION_COOLDOWN_SEC as CFG_DEPTH_RECALIBRATION_COOLDOWN_SEC,
+    DEPTH_RECALIBRATION_ENABLED as CFG_DEPTH_RECALIBRATION_ENABLED,
+    DEPTH_RECALIBRATION_OBSERVATION_REPS as CFG_DEPTH_RECALIBRATION_OBSERVATION_REPS,
+    DEPTH_RECALIBRATION_SCALE_CHANGE_PCT as CFG_DEPTH_RECALIBRATION_SCALE_CHANGE_PCT,
     FALLBACK_Y_ARM_WINDOW_SEC as CFG_FALLBACK_Y_ARM_WINDOW_SEC,
     FALLBACK_Y_ARMING_MIN_SCORE as CFG_FALLBACK_Y_ARMING_MIN_SCORE,
     FALLBACK_Y_LOW_SCORE_THRESHOLD as CFG_FALLBACK_Y_LOW_SCORE_THRESHOLD,
@@ -58,6 +67,7 @@ from flexible_rep_counter.core.settings import (
     FALLBACK_Y_MIN_ROM_SCORE as CFG_FALLBACK_Y_MIN_ROM_SCORE,
     FALLBACK_Y_PRIMARY_RECOVERY_SCORE as CFG_FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
     get_default_tuning_params,
+    get_rep_joint_tuning_overrides,
     LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
     LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
     LOW_FPS_ENTER_STREAK_FRAMES as CFG_LOW_FPS_ENTER_STREAK_FRAMES,
@@ -86,6 +96,7 @@ DEFAULT_TUNING_PARAMS = get_default_tuning_params()
 _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Temporary kill-switch: disable runtime variance-based joint recalibration/switching,
 # pending handoff observation, and classify_handoff carryover.
+# Also paused automatically while low-FPS safe mode is active (see _dynamic_recalibration_active).
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
 STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
@@ -100,6 +111,11 @@ HANDOFF_OBSERVATION_MIN_ACTIVITY_SCORE = 0.45
 HANDOFF_OBSERVATION_MIN_POSE_SCORE = 0.45
 HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE = 0.45
 POST_LOCK_MIN_RAW_REPS = max(0, int(DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS))
+DEPTH_RECALIBRATION_ENABLED = bool(CFG_DEPTH_RECALIBRATION_ENABLED)
+DEPTH_RECALIBRATION_SCALE_CHANGE_PCT = max(0.0, float(CFG_DEPTH_RECALIBRATION_SCALE_CHANGE_PCT))
+DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC = max(0.0, float(CFG_DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC))
+DEPTH_RECALIBRATION_COOLDOWN_SEC = max(0.0, float(CFG_DEPTH_RECALIBRATION_COOLDOWN_SEC))
+DEPTH_RECALIBRATION_OBSERVATION_REPS = max(0, int(CFG_DEPTH_RECALIBRATION_OBSERVATION_REPS))
 LOW_FPS_SAFE_MODE_ENABLED = CFG_LOW_FPS_SAFE_MODE_ENABLED
 LOW_FPS_INTERVAL_WINDOW_FRAMES = max(1, int(CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES))
 LOW_FPS_MIN_SAMPLES = max(2, int(CFG_LOW_FPS_MIN_SAMPLES))
@@ -129,8 +145,6 @@ FALLBACK_Y_MIN_POSE_SCORE = float(CFG_FALLBACK_Y_MIN_POSE_SCORE)
 FALLBACK_Y_MIN_ROM_SCORE = float(CFG_FALLBACK_Y_MIN_ROM_SCORE)
 FALLBACK_Y_MIN_EXTREMA_SCORE = float(CFG_FALLBACK_Y_MIN_EXTREMA_SCORE)
 FALLBACK_Y_MIN_COMPLETED_CYCLES = max(1, int(CFG_FALLBACK_Y_MIN_COMPLETED_CYCLES))
-
-
 def _diagnose_missing_angle(
     cfg: dict[str, Any], landmarks: list[dict]
 ) -> tuple[str, dict[str, Any]]:
@@ -153,9 +167,15 @@ def _diagnose_missing_angle(
     return "geometry_unavailable", detail
 
 
-def _peak_detector_from_tuning(tuning_params: dict[str, Any]) -> PeakDetector:
+def _peak_detector_from_tuning(
+    tuning_params: dict[str, Any],
+    *,
+    angle_key: Optional[str] = None,
+) -> PeakDetector:
     d = DEFAULT_TUNING_PARAMS
-    tp = tuning_params or {}
+    tp = {**DEFAULT_TUNING_PARAMS, **(tuning_params or {})}
+    if angle_key:
+        tp.update(get_rep_joint_tuning_overrides(angle_key))
     return create_peak_detector(
         smoothing_factor=float(tp.get("smoothingFactor", d["smoothingFactor"])),
         hysteresis=float(tp.get("hysteresis", d["hysteresis"])),
@@ -203,7 +223,7 @@ def _angle_landmarks(cfg: dict[str, Any]) -> list[int]:
 
 
 def _angle_confidence_threshold(cfg: dict[str, Any]) -> float:
-    if str(cfg.get("type") or "").strip().lower() == "relational_y_displacement":
+    if str(cfg.get("type") or "").strip().lower() == "absolute_y_position":
         return float(cfg.get("min_conf", 0.4) or 0.4)
     return FRAME_MIN_CONFIDENCE
 
@@ -244,19 +264,104 @@ def _update_fallback_bad_streak(
     return effective_elapsed
 
 
-def _is_fallback_candidate_ready(score: float, debug: dict[str, Any]) -> bool:
+def _fallback_incumbent_low_score_now(
+    incumbent_score: float,
+    incumbent_recent_range_deg: float,
+) -> bool:
+    """
+    True when the locked joint looks stale for Y-fallback arming.
+
+    Low recent ROM alone is enough; do not require incumbent_score < threshold when
+    variance_prior keeps score high despite flat motion on the incumbent.
+    """
+    low_rom = float(incumbent_recent_range_deg) < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+    if low_rom:
+        return True
+    return float(incumbent_score) < FALLBACK_Y_LOW_SCORE_THRESHOLD
+
+
+def _fallback_instr_payload(
+    *,
+    fallback_armed: bool,
+    fallback_elapsed: float,
+    stale_now: bool,
+    low_score_now: bool,
+    unclear_motion_now: bool,
+    not_recalibrating_now: bool,
+    pre_calibrate_paused: Optional[bool] = None,
+    primary_recovered: Optional[bool] = None,
+    incumbent_score: Optional[float] = None,
+    incumbent_recent_range_deg: Optional[float] = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "fallbackArmed": bool(fallback_armed),
+        "fallbackElapsedSec": float(fallback_elapsed),
+        "fallbackStaleNow": bool(stale_now),
+        "fallbackLowScoreNow": bool(low_score_now),
+        "fallbackUnclearMotionNow": bool(unclear_motion_now),
+        "fallbackNotRecalibratingNow": bool(not_recalibrating_now),
+    }
+    if pre_calibrate_paused is not None:
+        payload["fallbackPreCalibratePaused"] = bool(pre_calibrate_paused)
+    if primary_recovered is not None:
+        payload["fallbackPrimaryRecovered"] = bool(primary_recovered)
+    if incumbent_score is not None:
+        payload["fallbackIncumbentScore"] = float(incumbent_score)
+    if incumbent_recent_range_deg is not None:
+        payload["fallbackIncumbentRecentRangeDeg"] = float(incumbent_recent_range_deg)
+    return payload
+
+
+def _shoulder_motion_instr_payload(landmarks: Optional[list[dict]]) -> dict[str, Any]:
+    """Shoulder/hip Y and SHOULDER_SHRUG_Y signal for VM NDJSON (px + normalized units)."""
+    if not landmarks or len(landmarks) < 13:
+        return {}
+    cfg = COMMON_ANGLES["SHOULDER_SHRUG_Y"]
+    min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
+    shoulder_y = _mean_y_for_indices(landmarks, [5, 6], min_conf=min_conf)
+    hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
+    left_x = _mean_x_for_indices(landmarks, [5], min_conf=min_conf)
+    right_x = _mean_x_for_indices(landmarks, [6], min_conf=min_conf)
+    shrug_signal = calculate_from_type(cfg["type"], cfg, landmarks)
+    payload: dict[str, Any] = {}
+    if shoulder_y is not None:
+        payload["shoulder_y_px"] = float(shoulder_y)
+    if hip_y is not None:
+        payload["hip_y_px"] = float(hip_y)
+    if left_x is not None and right_x is not None:
+        payload["shoulder_width_px"] = float(abs(right_x - left_x))
+    if shoulder_y is not None and hip_y is not None:
+        payload["shoulder_hip_dy_px"] = float(shoulder_y - hip_y)
+    if shrug_signal is not None:
+        payload["shrug_y_signal"] = float(shrug_signal)
+    return payload
+
+
+def _is_fallback_candidate_ready(
+    score: float,
+    debug: dict[str, Any],
+    *,
+    min_completed_cycles: Optional[int] = None,
+) -> bool:
+    cycles_required = (
+        int(min_completed_cycles)
+        if min_completed_cycles is not None
+        else int(FALLBACK_Y_MIN_COMPLETED_CYCLES)
+    )
     return bool(
         score >= FALLBACK_Y_ARMING_MIN_SCORE
         and float(debug.get("activityScore") or 0.0) >= FALLBACK_Y_MIN_ACTIVITY_SCORE
         and float(debug.get("poseScore") or 0.0) >= FALLBACK_Y_MIN_POSE_SCORE
         and float(debug.get("romScore") or 0.0) >= FALLBACK_Y_MIN_ROM_SCORE
         and float(debug.get("extremaScore") or 0.0) >= FALLBACK_Y_MIN_EXTREMA_SCORE
-        and int(debug.get("completedCycles") or 0) >= FALLBACK_Y_MIN_COMPLETED_CYCLES
+        and int(debug.get("completedCycles") or 0) >= cycles_required
     )
 
 
 def _best_fallback_candidate(
     score_by_joint: dict[str, tuple[float, dict[str, Any]]],
+    *,
+    min_completed_cycles: Optional[int] = None,
 ) -> tuple[Optional[str], float, dict[str, Any]]:
     best_key: Optional[str] = None
     best_score = -1.0
@@ -264,7 +369,14 @@ def _best_fallback_candidate(
     for angle_key, (score, debug) in score_by_joint.items():
         if not is_fallback_angle(angle_key):
             continue
-        if _is_fallback_candidate_ready(float(score), debug) and float(score) > best_score:
+        if (
+            _is_fallback_candidate_ready(
+                float(score),
+                debug,
+                min_completed_cycles=min_completed_cycles,
+            )
+            and float(score) > best_score
+        ):
             best_key = angle_key
             best_score = float(score)
             best_debug = debug
@@ -285,6 +397,83 @@ def _has_primary_recovery_candidate(
         ):
             return True
     return False
+
+
+def _depth_recalibration_state(run_state: dict[str, Any], current_raw: int) -> str:
+    if bool(run_state.get("depth_recal_observing")):
+        until_raw = int(run_state.get("depth_recal_observe_until_raw") or 0)
+        if current_raw < until_raw:
+            return "observing"
+        run_state["depth_recal_observing"] = False
+        run_state["depth_recal_observe_until_raw"] = None
+        run_state["depth_recal_state"] = "complete"
+    return str(run_state.get("depth_recal_state") or "idle")
+
+
+def _maybe_trigger_depth_recalibration(
+    *,
+    run_state: dict[str, Any],
+    state: JointMotionState,
+    detector: Optional[PeakDetector],
+    now_s: float,
+    current_raw: int,
+) -> bool:
+    if not DEPTH_RECALIBRATION_ENABLED:
+        return False
+    if detector is None or signal_unit(state.angle_key) != "px":
+        return False
+    if _depth_recalibration_state(run_state, current_raw) == "observing":
+        return False
+    last_trigger = run_state.get("depth_recal_last_trigger_s")
+    if (
+        isinstance(last_trigger, (int, float))
+        and (now_s - float(last_trigger)) < DEPTH_RECALIBRATION_COOLDOWN_SEC
+    ):
+        return False
+
+    scale_now = state.last_scale_px
+    scale_ref = state.scale_at_lock_px
+    scale_event = False
+    if isinstance(scale_now, (int, float)) and isinstance(scale_ref, (int, float)) and scale_ref > 1e-6:
+        scale_ratio = float(scale_now) / float(scale_ref)
+        scale_event = abs(scale_ratio - 1.0) >= DEPTH_RECALIBRATION_SCALE_CHANGE_PCT
+    else:
+        scale_ratio = None
+
+    short_vals = list(state.absolute_y_short_window)
+    long_vals = list(state.absolute_y_long_window)
+    baseline_jump = False
+    if (
+        len(short_vals) >= 4
+        and len(long_vals) >= 8
+        and isinstance(scale_now, (int, float))
+        and float(scale_now) > 1e-6
+    ):
+        short_med = float(sorted(short_vals)[len(short_vals) // 2])
+        long_med = float(sorted(long_vals)[len(long_vals) // 2])
+        baseline_jump = abs(short_med - long_med) >= (
+            DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC * float(scale_now)
+        )
+    if not (scale_event or baseline_jump):
+        return False
+
+    detector.reset_calibration_preserve_reps()
+    if isinstance(scale_now, (int, float)):
+        state.scale_at_lock_px = float(scale_now)
+    if short_vals:
+        short_sorted = sorted(short_vals)
+        state.absolute_y_baseline_px = float(short_sorted[len(short_sorted) // 2])
+    run_state["depth_recal_last_trigger_s"] = float(now_s)
+    run_state["depth_recal_state"] = "triggered"
+    if DEPTH_RECALIBRATION_OBSERVATION_REPS > 0:
+        run_state["depth_recal_observing"] = True
+        run_state["depth_recal_observe_until_raw"] = int(current_raw) + int(DEPTH_RECALIBRATION_OBSERVATION_REPS)
+    else:
+        run_state["depth_recal_observing"] = False
+        run_state["depth_recal_observe_until_raw"] = None
+        run_state["depth_recal_state"] = "complete"
+    run_state["depth_recal_last_scale_ratio"] = float(scale_ratio) if isinstance(scale_ratio, (int, float)) else None
+    return True
 
 
 def _selection_relax_progress(elapsed_s: float) -> float:
@@ -435,7 +624,7 @@ def _build_joint_motion_states(
     for angle_key in COMMON_ANGLES:
         states[angle_key] = JointMotionState(
             angle_key=angle_key,
-            detector=_peak_detector_from_tuning(tuning_params),
+            detector=_peak_detector_from_tuning(tuning_params, angle_key=angle_key),
             history=deque(maxlen=history_maxlen),
             confidence_history=deque(maxlen=history_maxlen),
         )
@@ -459,7 +648,7 @@ def _apply_locked_tracking(
     # Never carry rep debt from selection detectors into tracking lock.
     # Selection may run for many frames while outputs remain hidden (reps=0),
     # so reusing the detector would surface a sudden jump on first lock.
-    det: Any = _peak_detector_from_tuning(tuning_params)
+    det: Any = _peak_detector_from_tuning(tuning_params, angle_key=selected_angle)
     if isinstance(initial_angle_value, (int, float)):
         angle_seed = float(initial_angle_value)
         if angle_seed == angle_seed:
@@ -751,6 +940,35 @@ def _clear_handoff_observation(run_state: dict[str, Any]) -> None:
     run_state["handoff_observation_candidate_carryover_start_shown"] = 0
     run_state["handoff_observation_candidate_carryover_start_raw"] = 0
     run_state["handoff_observation_candidate_carryover_start_ts"] = 0
+
+
+def _dynamic_recalibration_active(run_state: dict[str, Any]) -> bool:
+    if not DYNAMIC_RECALIBRATION_ENABLED:
+        return False
+    if LOW_FPS_SAFE_MODE_ENABLED and bool(run_state.get("low_fps_mode_active")):
+        return False
+    if bool(run_state.get("depth_recal_observing")):
+        return False
+    return True
+
+
+def _suspend_recalibration_for_low_fps(run_state: dict[str, Any]) -> None:
+    if not bool(run_state.get("low_fps_mode_changed_pulse")):
+        return
+    if not bool(run_state.get("low_fps_mode_active")):
+        return
+    if (
+        run_state.get("pending_switch_angle") is not None
+        or run_state.get("handoff_observation_candidate_angle") is not None
+    ):
+        _clear_pending_switch(run_state)
+        _clear_handoff_observation(run_state)
+    if run_state.get("fallback_armed"):
+        run_state["fallback_armed"] = False
+        _reset_fallback_streak(run_state)
+    run_state["depth_recal_observing"] = False
+    run_state["depth_recal_observe_until_raw"] = None
+    run_state["depth_recal_state"] = "idle"
 
 
 def _recent_history_range(series: Optional[deque], window: int) -> Optional[float]:
@@ -1129,6 +1347,11 @@ class RepCounterSession:
             "fallback_bad_streak_started_at": None,
             "fallback_bad_streak_paused_total_s": 0.0,
             "fallback_bad_streak_pause_anchor": None,
+            "depth_recal_state": "idle",
+            "depth_recal_last_trigger_s": None,
+            "depth_recal_last_scale_ratio": None,
+            "depth_recal_observing": False,
+            "depth_recal_observe_until_raw": None,
             "selection_detectors_by_angle": {},
             "joint_motion_states": _build_joint_motion_states(dict(tp)),
             "selection_dominance_key": None,
@@ -1180,6 +1403,11 @@ class RepCounterSession:
         self._run_state["fallback_bad_streak_started_at"] = None
         self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
         self._run_state["fallback_bad_streak_pause_anchor"] = None
+        self._run_state["depth_recal_state"] = "idle"
+        self._run_state["depth_recal_last_trigger_s"] = None
+        self._run_state["depth_recal_last_scale_ratio"] = None
+        self._run_state["depth_recal_observing"] = False
+        self._run_state["depth_recal_observe_until_raw"] = None
         self._run_state["joint_motion_states"] = _build_joint_motion_states(
             self._run_state["tuning_params"]
         )
@@ -1228,6 +1456,11 @@ class RepCounterSession:
         self._run_state["fallback_bad_streak_started_at"] = None
         self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
         self._run_state["fallback_bad_streak_pause_anchor"] = None
+        self._run_state["depth_recal_state"] = "idle"
+        self._run_state["depth_recal_last_trigger_s"] = None
+        self._run_state["depth_recal_last_scale_ratio"] = None
+        self._run_state["depth_recal_observing"] = False
+        self._run_state["depth_recal_observe_until_raw"] = None
         self._run_state["joint_motion_states"] = _build_joint_motion_states(
             self._run_state["tuning_params"]
         )
@@ -1431,6 +1664,7 @@ class RepCounterSession:
                 "angles_filtered_compact": {
                     k: v for k, v in angle_values.items() if v is not None
                 },
+                **(self._run_state.get("fallback_instr") or {}),
             },
         )
 
@@ -1486,6 +1720,9 @@ class RepCounterSession:
                 feed_v = float(fv)
             if sv is not None:
                 smooth_v = float(sv)
+        selected_joint_state = None
+        if isinstance(sel_angle, str):
+            selected_joint_state = (self._run_state.get("joint_motion_states") or {}).get(sel_angle)
         self._instr_emit(
             trace_context,
             {
@@ -1542,6 +1779,51 @@ class RepCounterSession:
                     "pending_switch_handoff_candidate_pending_rom_estimate_deg"
                 ),
                 "handoff_switch_forced": self._run_state.get("pending_switch_handoff_switch_forced"),
+                "motion_modality": (
+                    "vertical_px"
+                    if isinstance(out.tracked_joint, str) and signal_unit(out.tracked_joint) == "px"
+                    else "angle_deg"
+                ),
+                "signal_unit": (
+                    signal_unit(out.tracked_joint)
+                    if isinstance(out.tracked_joint, str)
+                    else None
+                ),
+                "P_y_px": (
+                    selected_joint_state.last_raw_y_px
+                    if selected_joint_state is not None
+                    else None
+                ),
+                "baseline_px": (
+                    selected_joint_state.last_baseline_px
+                    if selected_joint_state is not None
+                    else None
+                ),
+                "oscillation_px": (
+                    selected_joint_state.last_oscillation_px
+                    if selected_joint_state is not None
+                    else None
+                ),
+                "scale_px": (
+                    selected_joint_state.last_scale_px
+                    if selected_joint_state is not None
+                    else None
+                ),
+                "scale_ratio": (
+                    (
+                        selected_joint_state.last_scale_px
+                        / selected_joint_state.scale_at_lock_px
+                    )
+                    if selected_joint_state is not None
+                    and isinstance(selected_joint_state.last_scale_px, (int, float))
+                    and isinstance(selected_joint_state.scale_at_lock_px, (int, float))
+                    and float(selected_joint_state.scale_at_lock_px) > 1e-6
+                    else None
+                ),
+                "depth_recal_state": self._run_state.get("depth_recal_state"),
+                "depth_recal_scale_ratio": self._run_state.get("depth_recal_last_scale_ratio"),
+                **(self._run_state.get("fallback_instr") or {}),
+                **_shoulder_motion_instr_payload(self._last_smoothed_landmarks),
             },
         )
 
@@ -1569,6 +1851,7 @@ class RepCounterSession:
         tuning_params = rs["tuning_params"]
         default_tuning = DEFAULT_TUNING_PARAMS
         _update_low_fps_health(rs)
+        _suspend_recalibration_for_low_fps(rs)
 
         if not landmarks:
             self._last_smoothed_landmarks = None
@@ -1670,12 +1953,14 @@ class RepCounterSession:
                 val = calculate_from_type(cfg["type"], cfg, lm)
                 selecting_angle_values[ak] = val
                 conf = get_min_confidence_for_landmarks(lm, _angle_landmarks(cfg))
+                scale_px = calculate_scale_px_for_cfg(cfg, lm) if signal_unit(ak) == "px" else None
                 upd = update_joint_motion_state(
                     joint_states[ak],
                     val,
                     conf,
                     int(ts),
                     min_confidence=_angle_confidence_threshold(cfg),
+                    scale_px=scale_px,
                 )
                 selecting_detector_outputs[ak] = upd.get("detectorOutput") or {}
             _update_angle_histories_for_frame(
@@ -1764,7 +2049,9 @@ class RepCounterSession:
                     rs["fallback_armed"] = False
                     _reset_fallback_streak(rs)
             else:
-                fb_key, _, _ = _best_fallback_candidate(score_by_joint_all)
+                fb_key, _, _ = _best_fallback_candidate(
+                    score_by_joint_all,
+                )
                 if (
                     fb_key is not None
                     and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
@@ -1773,6 +2060,14 @@ class RepCounterSession:
                     rs["fallback_armed"] = True
 
             fallback_armed = bool(rs.get("fallback_armed"))
+            rs["fallback_instr"] = _fallback_instr_payload(
+                fallback_armed=fallback_armed,
+                fallback_elapsed=fallback_elapsed,
+                stale_now=stale_now,
+                low_score_now=low_score_now,
+                unclear_motion_now=unclear_motion_now,
+                not_recalibrating_now=not_recalibrating_now,
+            )
             can_try = ready and (
                 last_att is None
                 or (now - float(last_att)) >= ANGLE_SELECTION_RETRY_INTERVAL_SEC
@@ -1850,13 +2145,14 @@ class RepCounterSession:
             t_sel = time.perf_counter()
 
             if lock_from_dominance and leader_key:
+                lock_angle = leader_key
                 _apply_locked_tracking(
                     rs,
-                    leader_key,
+                    lock_angle,
                     None,
                     tuning_params,
-                    selection_detector=sdba.get(leader_key),
-                    initial_angle_value=selecting_angle_values.get(leader_key),
+                    selection_detector=sdba.get(lock_angle),
+                    initial_angle_value=selecting_angle_values.get(lock_angle),
                 )
                 locked_this_frame = True
                 self._sync_detector_instrumentation_flags()
@@ -1875,13 +2171,14 @@ class RepCounterSession:
                 selected_key = sel if isinstance(sel, str) and sel in COMMON_ANGLES else None
                 variance_ok = selected_key is not None and src == "variance"
                 if variance_ok and selected_key is not None:
+                    lock_angle = selected_key
                     _apply_locked_tracking(
                         rs,
-                        selected_key,
+                        lock_angle,
                         None,
                         tuning_params,
-                        selection_detector=sdba.get(selected_key),
-                        initial_angle_value=selecting_angle_values.get(selected_key),
+                        selection_detector=sdba.get(lock_angle),
+                        initial_angle_value=selecting_angle_values.get(lock_angle),
                     )
                     locked_this_frame = True
                     self._sync_detector_instrumentation_flags()
@@ -1895,13 +2192,14 @@ class RepCounterSession:
                             elapsed_s=elapsed,
                         )
                     if relaxed_family_joint is not None:
+                        lock_angle = relaxed_family_joint
                         _apply_locked_tracking(
                             rs,
-                            relaxed_family_joint,
+                            lock_angle,
                             None,
                             tuning_params,
-                            selection_detector=sdba.get(relaxed_family_joint),
-                            initial_angle_value=selecting_angle_values.get(relaxed_family_joint),
+                            selection_detector=sdba.get(lock_angle),
+                            initial_angle_value=selecting_angle_values.get(lock_angle),
                         )
                         locked_this_frame = True
                         self._sync_detector_instrumentation_flags()
@@ -2014,16 +2312,18 @@ class RepCounterSession:
         for ak, cfg in COMMON_ANGLES.items():
             val = tracking_angle_values.get(ak)
             conf = get_min_confidence_for_landmarks(lm, _angle_landmarks(cfg))
+            scale_px = calculate_scale_px_for_cfg(cfg, lm) if signal_unit(ak) == "px" else None
             upd = update_joint_motion_state(
                 joint_states[ak],
                 val,
                 conf,
                 int(ts),
                 min_confidence=_angle_confidence_threshold(cfg),
+                scale_px=scale_px,
             )
             detector_outputs[ak] = upd.get("detectorOutput") or {}
             angle_values[ak] = val
-            if DYNAMIC_RECALIBRATION_ENABLED:
+            if _dynamic_recalibration_active(rs):
                 if isinstance(selected_angle, str) and ak == selected_angle:
                     if upd.get("advanced"):
                         rs["pending_switch_incumbent_advanced"] = True
@@ -2062,6 +2362,22 @@ class RepCounterSession:
             active_detector,
             include_retroactive=True,
         )
+        depth_recal_triggered = False
+        if (
+            isinstance(selected_angle, str)
+            and selected_angle in joint_states
+            and isinstance(active_detector, PeakDetector)
+        ):
+            depth_recal_triggered = _maybe_trigger_depth_recalibration(
+                run_state=rs,
+                state=joint_states[selected_angle],
+                detector=active_detector,
+                now_s=now,
+                current_raw=current_raw,
+            )
+        depth_recal_state = _depth_recalibration_state(rs, current_raw)
+        if depth_recal_triggered and depth_recal_state != "observing":
+            depth_recal_state = str(rs.get("depth_recal_state") or "triggered")
         selected_output_for_eval = (
             detector_outputs.get(selected_angle) if isinstance(selected_angle, str) else None
         )
@@ -2088,7 +2404,7 @@ class RepCounterSession:
                 ) + 1
 
         switched_to: Optional[str] = None
-        if DYNAMIC_RECALIBRATION_ENABLED:
+        if _dynamic_recalibration_active(rs):
             pending_angle = (
                 rs.get("pending_switch_angle")
                 if isinstance(rs.get("pending_switch_angle"), str)
@@ -2160,7 +2476,7 @@ class RepCounterSession:
             _clear_pending_switch(rs)
             _clear_handoff_observation(rs)
         last_re_eval = rs.get("selection_last_reevaluate_at")
-        timer_re_eval_due = DYNAMIC_RECALIBRATION_ENABLED and (
+        timer_re_eval_due = _dynamic_recalibration_active(rs) and (
             ANGLE_SELECTION_REEVALUATE_EVERY_SEC <= 0
             or last_re_eval is None
             or (now - float(last_re_eval)) >= ANGLE_SELECTION_REEVALUATE_EVERY_SEC
@@ -2177,6 +2493,13 @@ class RepCounterSession:
                 stale_reevals += 1
             rs["selected_raw_last_at_reeval"] = current_raw
             rs["selected_raw_stale_reeval_streak"] = stale_reevals
+            selected_score_for_reeval_gate = 0.0
+            if isinstance(selected_angle, str) and selected_angle in joint_states:
+                selected_score_for_reeval_gate, _ = compute_joint_recalibration_score(
+                    joint_states[selected_angle],
+                    None,
+                    int(ts),
+                )
             run_full_re_eval = should_run_full_recalibration(
                 has_pending_switch=isinstance(rs.get("pending_switch_angle"), str),
                 has_handoff_observation=isinstance(rs.get("handoff_observation_candidate_angle"), str),
@@ -2189,6 +2512,7 @@ class RepCounterSession:
                 selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
                 stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
                 stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                selected_score=float(selected_score_for_reeval_gate),
             )
             re_eval_due = bool(run_full_re_eval)
         if re_eval_due:
@@ -2224,10 +2548,10 @@ class RepCounterSession:
                 )
             selected_range_gate_closed_streak = int(rs.get("selected_range_gate_closed_streak") or 0)
             stale_now = bool(stale_reevals >= 1)
-            low_score_now = bool(
-                float(selected_score_for_fallback) < FALLBACK_Y_LOW_SCORE_THRESHOLD
-                and float(selected_debug_for_fallback.get("recentRange") or 0.0)
-                < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+            incumbent_recent_range = float(selected_debug_for_fallback.get("recentRange") or 0.0)
+            low_score_now = _fallback_incumbent_low_score_now(
+                float(selected_score_for_fallback),
+                incumbent_recent_range,
             )
             unclear_motion_now = bool(selected_range_gate_closed_streak >= STALE_SWITCH_MIN_CLOSED_STREAK)
             not_recalibrating_now = bool(
@@ -2241,6 +2565,12 @@ class RepCounterSession:
                 )
             elif active_detector is not None:
                 pre_calibrate_active = not _is_detector_calibrated(active_detector)
+            # Do not pause the bad streak while ROM is too low to ever open the range gate
+            # (e.g. shrugs on a locked across-shoulder angle stuck at 0 calibration reps).
+            fallback_streak_paused = bool(pre_calibrate_active and not low_score_now)
+            fallback_min_cycles: Optional[int] = None
+            if low_score_now and cumulative_shown <= 0:
+                fallback_min_cycles = 1
             fallback_elapsed = _update_fallback_bad_streak(
                 rs,
                 now_s=now,
@@ -2250,10 +2580,13 @@ class RepCounterSession:
                     and unclear_motion_now
                     and not_recalibrating_now
                 ),
-                paused=pre_calibrate_active,
+                paused=fallback_streak_paused,
             )
             if not fallback_armed:
-                fb_key, _, _ = _best_fallback_candidate(score_by_joint)
+                fb_key, _, _ = _best_fallback_candidate(
+                    score_by_joint,
+                    min_completed_cycles=fallback_min_cycles,
+                )
                 if (
                     fb_key is not None
                     and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
@@ -2261,6 +2594,18 @@ class RepCounterSession:
                 ):
                     rs["fallback_armed"] = True
                     fallback_armed = True
+            rs["fallback_instr"] = _fallback_instr_payload(
+                fallback_armed=fallback_armed,
+                fallback_elapsed=fallback_elapsed,
+                stale_now=stale_now,
+                low_score_now=low_score_now,
+                unclear_motion_now=unclear_motion_now,
+                not_recalibrating_now=not_recalibrating_now,
+                pre_calibrate_paused=pre_calibrate_active,
+                primary_recovered=primary_recovered,
+                incumbent_score=float(selected_score_for_fallback),
+                incumbent_recent_range_deg=incumbent_recent_range,
+            )
 
             candidate, candidate_sel_debug = select_recalibration_candidate(
                 score_by_joint, selected_angle if isinstance(selected_angle, str) else None,
@@ -2301,7 +2646,12 @@ class RepCounterSession:
                 if isinstance(candidate, str) and candidate in joint_states
                 else 0.0
             )
-            median_recent_range_all = median_recent_range_from_score_debug(score_by_joint)
+            selected_signal_unit = signal_unit(selected_angle) if isinstance(selected_angle, str) else "deg"
+            candidate_signal_unit = signal_unit(candidate) if isinstance(candidate, str) else selected_signal_unit
+            median_recent_range_all = median_recent_range_from_score_debug(
+                score_by_joint,
+                signal_unit=selected_signal_unit,
+            )
             same_joint_family = (
                 is_same_joint_family(selected_angle, candidate)
                 if isinstance(selected_angle, str) and isinstance(candidate, str)
@@ -2342,6 +2692,8 @@ class RepCounterSession:
                 selected_median_rom_deg=selected_median_rom_deg,
                 median_recent_range_all=median_recent_range_all,
                 same_joint_family=same_joint_family,
+                selected_signal_unit=selected_signal_unit,
+                candidate_signal_unit=candidate_signal_unit,
             )
             switch_debug = {
                 **switch_debug,
@@ -2356,7 +2708,10 @@ class RepCounterSession:
                 "fallbackLowScoreNow": bool(low_score_now),
                 "fallbackUnclearMotionNow": bool(unclear_motion_now),
                 "fallbackNotRecalibratingNow": bool(not_recalibrating_now),
-                "fallbackPreCalibratePaused": bool(pre_calibrate_active),
+                "fallbackPreCalibrateActive": bool(pre_calibrate_active),
+                "fallbackStreakPaused": bool(fallback_streak_paused),
+                "depthRecalState": depth_recal_state,
+                "depthRecalTriggered": bool(depth_recal_triggered),
             }
             if (
                 isinstance(selected_angle, str)

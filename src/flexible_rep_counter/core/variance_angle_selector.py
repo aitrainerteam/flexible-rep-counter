@@ -25,67 +25,62 @@ from flexible_rep_counter.core.math_engine import (
 # knee–hip–opposite hip (no shoulders/torso).
 
 COMMON_ANGLES: dict[str, dict[str, Any]] = {
-    "LEFT_KNEE": {"type": "angle_3_point", "landmarks": [11, 13, 15], "eligibility": "primary"},
-    "RIGHT_KNEE": {"type": "angle_3_point", "landmarks": [12, 14, 16], "eligibility": "primary"},
-    "LEFT_ELBOW": {"type": "angle_3_point", "landmarks": [5, 7, 9], "eligibility": "primary"},
-    "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10], "eligibility": "primary"},
-    "LEFT_SHOULDER": {"type": "angle_3_point", "landmarks": [11, 5, 7], "eligibility": "primary"},
-    "RIGHT_SHOULDER": {"type": "angle_3_point", "landmarks": [12, 6, 8], "eligibility": "primary"},
-    "LEFT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [7, 5, 6], "eligibility": "primary"},
-    "RIGHT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [8, 6, 5], "eligibility": "primary"},
-    "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13], "eligibility": "primary"},
-    "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14], "eligibility": "primary"},
-    "LEFT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [13, 11, 12], "eligibility": "primary"},
-    "RIGHT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [14, 12, 11], "eligibility": "primary"},
+    "LEFT_KNEE": {"type": "angle_3_point", "landmarks": [11, 13, 15], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_KNEE": {"type": "angle_3_point", "landmarks": [12, 14, 16], "eligibility": "primary", "modality": "angle_deg"},
+    "LEFT_ELBOW": {"type": "angle_3_point", "landmarks": [5, 7, 9], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_ELBOW": {"type": "angle_3_point", "landmarks": [6, 8, 10], "eligibility": "primary", "modality": "angle_deg"},
+    "LEFT_SHOULDER": {"type": "angle_3_point", "landmarks": [11, 5, 7], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_SHOULDER": {"type": "angle_3_point", "landmarks": [12, 6, 8], "eligibility": "primary", "modality": "angle_deg"},
+    "LEFT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [7, 5, 6], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_SHOULDER_ACROSS": {"type": "angle_3_point", "landmarks": [8, 6, 5], "eligibility": "primary", "modality": "angle_deg"},
+    "LEFT_HIP": {"type": "angle_3_point", "landmarks": [5, 11, 13], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14], "eligibility": "primary", "modality": "angle_deg"},
+    "LEFT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [13, 11, 12], "eligibility": "primary", "modality": "angle_deg"},
+    "RIGHT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [14, 12, 11], "eligibility": "primary", "modality": "angle_deg"},
     "SHOULDER_SHRUG_Y": {
-        "type": "relational_y_displacement",
-        "moving": [5, 6],
-        "reference": [11, 12],
+        "type": "absolute_y_position",
         "landmarks": [5, 6, 11, 12],
-        "scale": {"kind": "shoulder_width"},
-        "gain": 100.0,
+        "sample_landmarks": [5, 6],
+        "scale": {"kind": "shoulder_width", "landmarks": [5, 6]},
         "min_conf": 0.4,
         "eligibility": "fallback",
+        "modality": "vertical_px",
     },
-    "LEFT_WRIST_Y_REL": {
-        "type": "relational_y_displacement",
-        "moving": [9],
-        "reference": [5],
+    "LEFT_WRIST_Y": {
+        "type": "absolute_y_position",
         "landmarks": [9, 5, 6, 11, 12],
-        "scale": {"kind": "torso_height"},
-        "gain": 100.0,
+        "sample_landmarks": [9],
+        "scale": {"kind": "torso_height", "landmarks": [5, 6, 11, 12]},
         "min_conf": 0.4,
         "eligibility": "fallback",
+        "modality": "vertical_px",
     },
-    "RIGHT_WRIST_Y_REL": {
-        "type": "relational_y_displacement",
-        "moving": [10],
-        "reference": [6],
+    "RIGHT_WRIST_Y": {
+        "type": "absolute_y_position",
         "landmarks": [10, 6, 5, 11, 12],
-        "scale": {"kind": "torso_height"},
-        "gain": 100.0,
+        "sample_landmarks": [10],
+        "scale": {"kind": "torso_height", "landmarks": [5, 6, 11, 12]},
         "min_conf": 0.4,
         "eligibility": "fallback",
+        "modality": "vertical_px",
     },
     "HIP_DEPTH_Y": {
-        "type": "relational_y_displacement",
-        "moving": [11, 12],
-        "reference": [15, 16],
+        "type": "absolute_y_position",
         "landmarks": [11, 12, 15, 16],
-        "scale": {"kind": "hip_width"},
-        "gain": 100.0,
+        "sample_landmarks": [11, 12],
+        "scale": {"kind": "hip_width", "landmarks": [11, 12]},
         "min_conf": 0.4,
         "eligibility": "fallback",
+        "modality": "vertical_px",
     },
     "ANKLE_LIFT_Y": {
-        "type": "relational_y_displacement",
-        "moving": [15, 16],
-        "reference": [11, 12],
+        "type": "absolute_y_position",
         "landmarks": [15, 16, 11, 12],
-        "scale": {"kind": "hip_width"},
-        "gain": 100.0,
+        "sample_landmarks": [15, 16],
+        "scale": {"kind": "hip_width", "landmarks": [11, 12]},
         "min_conf": 0.4,
         "eligibility": "fallback",
+        "modality": "vertical_px",
     },
 }
 
@@ -127,9 +122,19 @@ def _angle_landmarks(cfg: dict[str, Any]) -> list[int]:
 
 
 def _angle_min_conf_threshold(cfg: dict[str, Any]) -> float:
-    if str(cfg.get("type") or "").strip().lower() == "relational_y_displacement":
+    if str(cfg.get("type") or "").strip().lower() in {"absolute_y_position"}:
         return float(cfg.get("min_conf", 0.4) or 0.4)
     return FRAME_MIN_CONFIDENCE
+
+
+def angle_modality(angle_key: str) -> str:
+    cfg = COMMON_ANGLES.get(angle_key) or {}
+    modality = str(cfg.get("modality") or "").strip().lower()
+    return modality if modality else "angle_deg"
+
+
+def angle_signal_unit(angle_key: str) -> str:
+    return "px" if angle_modality(angle_key) == "vertical_px" else "deg"
 
 
 def _angle_side(angle_key: str) -> str:
@@ -176,12 +181,16 @@ def _variance_eligibility(angle_key: str, data: dict[str, Any]) -> tuple[bool, f
     t = _angle_selection_thresholds(angle_key)
     consistent_var = float(data.get("medianWindowVariance") or 0.0)
     active_windows = int(data.get("activeWindowCount") or 0)
-    span_deg = float(data.get("smoothedRangeDeg") or 0.0)
+    signal_unit = angle_signal_unit(angle_key)
+    span_raw = data.get("smoothedRangePx") if signal_unit == "px" else data.get("smoothedRangeDeg")
+    span = float(span_raw or 0.0)
     if active_windows < MIN_ACTIVE_WINDOWS:
         return False, 0.0
-    if consistent_var < t["min_variance"]:
+    min_variance = float(t["min_variance_px2"] if signal_unit == "px" else t["min_variance"])
+    if consistent_var < min_variance:
         return False, 0.0
-    if span_deg < t["min_range_deg"]:
+    min_range = float(t["min_range_px"] if signal_unit == "px" else t["min_range_deg"])
+    if span < min_range:
         return False, 0.0
     return True, consistent_var
 
@@ -232,7 +241,10 @@ def compute_angle_variances_from_buffer(
                 "robustVariance": robust["variance"],
                 "medianWindowVariance": consistent["medianWindowVariance"],
                 "activeWindowCount": consistent["activeWindowCount"],
+                "signalUnit": angle_signal_unit(angle_key),
+                "smoothedRange": span_deg,
                 "smoothedRangeDeg": span_deg,
+                "smoothedRangePx": span_deg if angle_signal_unit(angle_key) == "px" else None,
                 "config": config,
             }
             if include_debug:
@@ -366,10 +378,18 @@ def _is_strong_unclear_tiebreak_candidate(
     data: dict[str, Any],
 ) -> bool:
     thresholds = _angle_selection_thresholds(angle_key)
-    min_score = float(thresholds["min_variance"]) * UNCLEAR_TIEBREAK_MIN_VARIANCE_FACTOR
-    min_range = max(float(thresholds["min_range_deg"]), UNCLEAR_TIEBREAK_MIN_RANGE_FLOOR_DEG)
+    unit = angle_signal_unit(angle_key)
+    min_score = float(
+        thresholds["min_variance_px2"] if unit == "px" else thresholds["min_variance"]
+    ) * UNCLEAR_TIEBREAK_MIN_VARIANCE_FACTOR
+    min_range = (
+        float(thresholds["min_range_px"])
+        if unit == "px"
+        else max(float(thresholds["min_range_deg"]), UNCLEAR_TIEBREAK_MIN_RANGE_FLOOR_DEG)
+    )
     active_windows = int(data.get("activeWindowCount") or 0)
-    range_deg = float(data.get("smoothedRangeDeg") or 0.0)
+    range_raw = data.get("smoothedRangePx") if unit == "px" else data.get("smoothedRangeDeg")
+    range_deg = float(range_raw or 0.0)
     return bool(
         score >= min_score
         and active_windows >= UNCLEAR_TIEBREAK_MIN_ACTIVE_WINDOWS
@@ -502,6 +522,9 @@ def determine_best_angle(
                 "robustVariance": v.get("robustVariance"),
                 "medianWindowVariance": v.get("medianWindowVariance"),
                 "activeWindowCount": v.get("activeWindowCount"),
+                "signalUnit": v.get("signalUnit"),
+                "smoothedRange": v.get("smoothedRange"),
+                "smoothedRangePx": v.get("smoothedRangePx"),
                 "smoothedRangeDeg": v.get("smoothedRangeDeg"),
                 "mean": v.get("mean"),
                 "thresholds": _angle_selection_thresholds(k),
