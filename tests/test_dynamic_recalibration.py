@@ -63,9 +63,39 @@ class _ScriptedDetector:
         return self.rep_count
 
 
+class _ReversalOnlyDetector:
+    def __init__(self, outputs: list[dict[str, Any]]) -> None:
+        self._outputs = list(outputs)
+        self._idx = 0
+        self.rep_count = 0
+        self.peaks: list[float] = []
+        self.valleys: list[float] = []
+
+    def update(self, value: float | None) -> dict[str, Any]:
+        i = min(self._idx, len(self._outputs) - 1)
+        self._idx += 1
+        output = {
+            "repCount": self.rep_count,
+            "peak": None,
+            "valley": None,
+            "reversalPeak": None,
+            "reversalValley": None,
+            "rollingRange": 60.0,
+            "rangeGateOpen": True,
+            "calibrationComplete": True,
+            "smoothedValue": value,
+            "state": "GOING_DOWN",
+        }
+        output.update(self._outputs[i])
+        return output
+
+    def get_rep_count(self) -> int:
+        return self.rep_count
+
+
 def _make_state(
     angle_key: str,
-    detector: _ScriptedDetector | None = None,
+    detector: Any | None = None,
     history_values: list[float] | None = None,
     confidence: float = 0.99,
 ) -> JointMotionState:
@@ -375,6 +405,35 @@ def test_cycle_gating_rejects_low_range_cycles() -> None:
     assert score < 0.62
 
 
+def test_margin_blocked_reversals_count_as_recalibration_evidence() -> None:
+    detector = _ReversalOnlyDetector(
+        [
+            {"reversalPeak": 150.0},
+            {"reversalValley": 55.0},
+            {"reversalPeak": 148.0},
+            {"reversalValley": 57.0},
+        ]
+    )
+    state = _make_state(
+        "RIGHT_ELBOW",
+        detector=cast(PeakDetector, detector),
+        history_values=[55.0, 80.0, 110.0, 140.0, 150.0, 120.0, 90.0, 60.0] * 6,
+    )
+
+    for i, value in enumerate([150.0, 55.0, 148.0, 57.0]):
+        update_joint_motion_state(state, value, 0.99, 2000 + i * 500)
+
+    score, debug = compute_joint_recalibration_score(
+        state,
+        {"medianWindowVariance": 80.0, "activeWindowCount": 4, "smoothedRangeDeg": 95.0},
+        now_ms=4000,
+    )
+    assert detector.get_rep_count() == 0
+    assert debug["completedCycles"] >= 2
+    assert debug["activityScore"] == 1.0
+    assert score >= 0.62
+
+
 def test_force_stale_requires_two_gated_cycles() -> None:
     can_switch, force_switch, _ = should_switch_to_candidate(
         cooldown_ok=True,
@@ -656,6 +715,37 @@ def test_same_family_mirrored_switch_still_allowed_with_strong_motion() -> None:
     assert debug["shouldSwitch"] is True
 
 
+def test_stale_incumbent_rom_dominance_uses_recent_range_not_cycle_median() -> None:
+    """Mirrored limb handoff: incumbent quiet but historical cycle ROM still high."""
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=4.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.68,
+        selected_pose_score=0.95,
+        candidate_score=0.93,
+        candidate_activity_score=1.0,
+        candidate_pose_score=1.0,
+        candidate_observable=True,
+        candidate_completed_cycles=6,
+        candidate_recent_range=57.0,
+        candidate_median_rom_deg=55.0,
+        selected_median_rom_deg=65.0,
+        median_recent_range_all=4.0,
+        same_joint_family=True,
+    )
+    assert debug["incumbentRangeStale"] is True
+    assert debug["selectedRomForDominance"] == 4.0
+    assert debug["candidateRomDominates"] is True
+    assert debug["candidateMotionOk"] is True
+    assert can_switch
+    assert debug["shouldSwitch"] is True
+
+
 def test_no_displayed_count_regression_on_any_handoff() -> None:
     before = 10
     for kind in ("alternate_limb", "same_exercise", "ambiguous"):
@@ -867,3 +957,42 @@ def test_fallback_y_switch_credits_epoch_reps_not_zero_carry() -> None:
     )
     assert int(run_state["rep_count_offset"]) == 4
     assert int(run_state["rep_count_offset"]) + det.get_rep_count() == 14
+
+
+def test_recal_frame_instr_payload_exposes_handoff_and_rom_fields() -> None:
+    from flexible_rep_counter.session import _recal_frame_instr_payload
+
+    right = JointMotionState(
+        angle_key="RIGHT_ELBOW",
+        detector=PeakDetector(),
+        history=deque(),
+        confidence_history=deque(),
+    )
+    left = JointMotionState(
+        angle_key="LEFT_ELBOW",
+        detector=PeakDetector(),
+        history=deque(),
+        confidence_history=deque(),
+    )
+    right.recent_roms.extend([62.0, 64.0, 66.0])
+    left.recent_roms.extend([54.0, 56.0, 58.0])
+    run_state: dict[str, Any] = {
+        "handoff_observation_candidate_angle": "LEFT_ELBOW",
+        "handoff_observation_selected_angle": "RIGHT_ELBOW",
+        "joint_motion_states": {"RIGHT_ELBOW": right, "LEFT_ELBOW": left},
+        "recal_instr": {
+            "recal_candidate_angle": "LEFT_ELBOW",
+            "selected_rom_for_dominance": 4.2,
+            "candidate_rom_dominates": False,
+        },
+    }
+
+    payload = _recal_frame_instr_payload(run_state, selected_angle="RIGHT_ELBOW")
+
+    assert payload["handoff_observation_candidate_angle"] == "LEFT_ELBOW"
+    assert payload["handoff_observation_selected_angle"] == "RIGHT_ELBOW"
+    assert payload["selected_median_rom_deg"] == 64.0
+    assert payload["candidate_median_rom_deg"] == 56.0
+    assert payload["recal_candidate_angle"] == "LEFT_ELBOW"
+    assert payload["selected_rom_for_dominance"] == 4.2
+    assert payload["candidate_rom_dominates"] is False

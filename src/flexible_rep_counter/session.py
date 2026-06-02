@@ -321,6 +321,43 @@ def _fallback_incumbent_low_score_now(
     return float(incumbent_score) < FALLBACK_Y_LOW_SCORE_THRESHOLD
 
 
+def _recal_frame_instr_payload(
+    run_state: dict[str, Any],
+    *,
+    selected_angle: Optional[str],
+) -> dict[str, Any]:
+    """Per-frame recalibration/handoff debug for VM frame_snapshot NDJSON."""
+    joint_states: dict[str, JointMotionState] = run_state.get("joint_motion_states") or {}
+    stored: dict[str, Any] = dict(run_state.get("recal_instr") or {})
+    payload: dict[str, Any] = {
+        "handoff_observation_candidate_angle": run_state.get("handoff_observation_candidate_angle"),
+        "handoff_observation_selected_angle": run_state.get("handoff_observation_selected_angle"),
+    }
+    if isinstance(selected_angle, str) and selected_angle in joint_states:
+        selected_rom = median_cycle_rom_deg(joint_states[selected_angle])
+        payload["selected_median_rom_deg"] = (
+            float(selected_rom) if selected_rom > 0.0 else None
+        )
+    elif stored.get("selected_median_rom_deg") is not None:
+        payload["selected_median_rom_deg"] = stored.get("selected_median_rom_deg")
+
+    candidate_angle = run_state.get("handoff_observation_candidate_angle")
+    if not isinstance(candidate_angle, str):
+        candidate_angle = stored.get("recal_candidate_angle")
+    if isinstance(candidate_angle, str) and candidate_angle in joint_states:
+        candidate_rom = median_cycle_rom_deg(joint_states[candidate_angle])
+        payload["candidate_median_rom_deg"] = (
+            float(candidate_rom) if candidate_rom > 0.0 else None
+        )
+    elif stored.get("candidate_median_rom_deg") is not None:
+        payload["candidate_median_rom_deg"] = stored.get("candidate_median_rom_deg")
+
+    for key in ("recal_candidate_angle", "selected_rom_for_dominance", "candidate_rom_dominates"):
+        if key in stored:
+            payload[key] = stored[key]
+    return payload
+
+
 def _fallback_instr_payload(
     *,
     fallback_armed: bool,
@@ -2024,6 +2061,10 @@ class RepCounterSession:
                 "depth_recal_state": self._run_state.get("depth_recal_state"),
                 "depth_recal_scale_ratio": self._run_state.get("depth_recal_last_scale_ratio"),
                 **(self._run_state.get("fallback_instr") or {}),
+                **_recal_frame_instr_payload(
+                    self._run_state,
+                    selected_angle=sel_angle,
+                ),
                 **_vertical_px_instr_payload(
                     self._last_smoothed_landmarks,
                     tracked_joint=out.tracked_joint,
@@ -2928,6 +2969,17 @@ class RepCounterSession:
                 "fallbackStreakPaused": bool(fallback_streak_paused),
                 "depthRecalState": depth_recal_state,
                 "depthRecalTriggered": bool(depth_recal_triggered),
+            }
+            rs["recal_instr"] = {
+                "recal_candidate_angle": candidate,
+                "selected_median_rom_deg": (
+                    float(selected_median_rom_deg) if selected_median_rom_deg > 0.0 else None
+                ),
+                "candidate_median_rom_deg": (
+                    float(candidate_median_rom_deg) if candidate_median_rom_deg > 0.0 else None
+                ),
+                "selected_rom_for_dominance": switch_debug.get("selectedRomForDominance"),
+                "candidate_rom_dominates": switch_debug.get("candidateRomDominates"),
             }
             if (
                 isinstance(selected_angle, str)

@@ -230,10 +230,18 @@ def _apply_absolute_y_baseline(
 
 
 def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, Any]) -> float:
-    peak = detector_output.get("peak")
-    valley = detector_output.get("valley")
+    peak = detector_output.get("reversalPeak")
+    valley = detector_output.get("reversalValley")
+    if not isinstance(peak, (int, float)):
+        peak = detector_output.get("peak")
+    if not isinstance(valley, (int, float)):
+        valley = detector_output.get("valley")
     if isinstance(peak, (int, float)) and isinstance(valley, (int, float)):
         return abs(float(peak) - float(valley))
+    recent_peaks = list(state.recent_peaks)
+    recent_valleys = list(state.recent_valleys)
+    if recent_peaks and recent_valleys:
+        return abs(float(recent_peaks[-1]) - float(recent_valleys[-1]))
     peaks = list(getattr(state.detector, "peaks", []) or [])
     valleys = list(getattr(state.detector, "valleys", []) or [])
     if peaks and valleys:
@@ -289,21 +297,31 @@ def update_joint_motion_state(
 
     peak = detector_output.get("peak")
     valley = detector_output.get("valley")
-    if isinstance(peak, (int, float)):
-        state.recent_peaks.append(float(peak))
-    if isinstance(valley, (int, float)):
-        state.recent_valleys.append(float(valley))
+    reversal_peak = detector_output.get("reversalPeak")
+    reversal_valley = detector_output.get("reversalValley")
+    score_peak = peak if isinstance(peak, (int, float)) else reversal_peak
+    score_valley = valley if isinstance(valley, (int, float)) else reversal_valley
+    if isinstance(score_peak, (int, float)):
+        state.recent_peaks.append(float(score_peak))
+    if isinstance(score_valley, (int, float)):
+        state.recent_valleys.append(float(score_valley))
 
-    if advanced:
-        if state.last_rep_timestamp_ms is not None:
+    reversal_observed = isinstance(score_peak, (int, float)) or isinstance(score_valley, (int, float))
+    if advanced or reversal_observed:
+        if advanced and state.last_rep_timestamp_ms is not None:
             state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
-        state.last_rep_timestamp_ms = timestamp_ms
+        if advanced:
+            state.last_rep_timestamp_ms = timestamp_ms
         rom = _latest_cycle_rom_deg(state, detector_output)
         recent_range = _recent_range(state)
         if cycle_is_evidence(state, rom, recent_range):
+            if not advanced and state.last_rep_timestamp_ms is not None:
+                state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
             state.recent_roms.append(float(rom))
             state.cycle_log.append((timestamp_ms, float(rom)))
             gated_cycle = True
+            if not advanced:
+                state.last_rep_timestamp_ms = timestamp_ms
 
     state.last_raw_rep_count = new_raw
     return {"advanced": advanced, "detectorOutput": detector_output, "gatedCycle": gated_cycle}
@@ -692,11 +710,21 @@ def should_switch_to_candidate(
         or candidate_recent_range <= 0.0
         or candidate_recent_range >= median_recent_range_all * CANDIDATE_MIN_MEDIAN_RANGE_RATIO
     )
+    incumbent_range_stale = bool(
+        incumbent_health.get("lowRange") or incumbent_health.get("gateClosed")
+    )
+    # When the tracked joint's recent ROM has collapsed, compare against its live
+    # sliding-window range—not peak cycle ROM from before the limb went quiet.
+    selected_rom_for_dominance = (
+        selected_recent_range
+        if incumbent_range_stale and selected_recent_range > 0.0
+        else selected_median_rom_deg
+    )
     candidate_rom_dominates = (
         not compare_motion_ranges
         or candidate_median_rom_deg <= 0.0
-        or selected_median_rom_deg <= 0.0
-        or candidate_median_rom_deg >= selected_median_rom_deg * rom_ratio
+        or selected_rom_for_dominance <= 0.0
+        or candidate_median_rom_deg >= selected_rom_for_dominance * rom_ratio
     )
     candidate_motion_ok = (
         candidate_range_vs_incumbent and candidate_range_vs_field and candidate_rom_dominates
@@ -733,6 +761,8 @@ def should_switch_to_candidate(
         "candidateRangeVsIncumbent": bool(candidate_range_vs_incumbent),
         "candidateRangeVsField": bool(candidate_range_vs_field),
         "candidateRomDominates": bool(candidate_rom_dominates),
+        "incumbentRangeStale": bool(incumbent_range_stale),
+        "selectedRomForDominance": float(selected_rom_for_dominance),
         "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),
         "compareMotionRanges": bool(compare_motion_ranges),

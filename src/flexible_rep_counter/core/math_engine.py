@@ -458,8 +458,13 @@ class PeakDetector:
     def _range_gate_allows_rep_recording(self) -> bool:
         return self._last_range_gate_open
 
-    def _record_peak_on_reversal(self) -> tuple[Optional[float], bool]:
-        """Append a peak at end of GOING_UP; may increment rep_count. Returns (detected_peak, rep_completed)."""
+    def _record_peak_on_reversal(self) -> tuple[Optional[float], bool, Optional[float], Optional[str]]:
+        """Append a peak at end of GOING_UP; may increment rep_count.
+
+        Returns (counted_peak, rep_completed, reversal_peak, block_reason). The
+        reversal value is exposed even when old calibration margins reject the
+        rep, so recalibration can still see strong new motion.
+        """
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
             self._instr_emit(
                 {
@@ -471,7 +476,7 @@ class PeakDetector:
                     "min_peak_distance": self.min_peak_distance,
                 }
             )
-            return None, False
+            return None, False, None, "min_peak_distance_block"
         if not self._calibrated:
             within_margin = True
         else:
@@ -509,7 +514,8 @@ class PeakDetector:
                     "rolling_range": self._last_rolling_range,
                 }
             )
-            return None, False
+            reversal_peak = self.current_peak_value if reason == "margin_fail" and gate_ok else None
+            return None, False, reversal_peak, reason
         detected_peak = self.current_peak_value
         self.peaks.append(self.current_peak_value)
         self.last_peak_frame = self.frame_count
@@ -568,10 +574,13 @@ class PeakDetector:
                 }
             )
         self._maybe_lock_calibration()
-        return detected_peak, rep_completed
+        return detected_peak, rep_completed, detected_peak, None
 
-    def _record_valley_on_reversal(self) -> tuple[Optional[float], bool]:
-        """Append a valley at end of GOING_DOWN; may increment rep_count. Returns (detected_valley, rep_completed)."""
+    def _record_valley_on_reversal(self) -> tuple[Optional[float], bool, Optional[float], Optional[str]]:
+        """Append a valley at end of GOING_DOWN; may increment rep_count.
+
+        Returns (counted_valley, rep_completed, reversal_valley, block_reason).
+        """
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
             self._instr_emit(
                 {
@@ -583,7 +592,7 @@ class PeakDetector:
                     "min_peak_distance": self.min_peak_distance,
                 }
             )
-            return None, False
+            return None, False, None, "min_peak_distance_block"
         if not self._calibrated:
             within_margin = True
         else:
@@ -621,7 +630,8 @@ class PeakDetector:
                     "rolling_range": self._last_rolling_range,
                 }
             )
-            return None, False
+            reversal_valley = self.current_valley_value if reason == "margin_fail" and gate_ok else None
+            return None, False, reversal_valley, reason
         detected_valley = self.current_valley_value
         self.valleys.append(self.current_valley_value)
         self.last_peak_frame = self.frame_count
@@ -678,7 +688,7 @@ class PeakDetector:
                 }
             )
         self._maybe_lock_calibration()
-        return detected_valley, rep_completed
+        return detected_valley, rep_completed, detected_valley, None
 
     def update(self, raw_value: Optional[float]) -> dict[str, Any]:
         if raw_value is None:
@@ -716,6 +726,9 @@ class PeakDetector:
         rep_completed = False
         detected_peak = None
         detected_valley = None
+        reversal_peak = None
+        reversal_valley = None
+        reversal_block_reason = None
 
         if self.state == PEAK_STATE_NEUTRAL:
             if self.current_peak_value is None or self.current_valley_value is None:
@@ -739,9 +752,13 @@ class PeakDetector:
             if self.smoothed_value > self.current_peak_value:
                 self.current_peak_value = self.smoothed_value
             elif self.smoothed_value < self.current_peak_value - self.hysteresis:
-                dp, rc = self._record_peak_on_reversal()
+                dp, rc, rp, block_reason = self._record_peak_on_reversal()
                 if dp is not None:
                     detected_peak = dp
+                if rp is not None:
+                    reversal_peak = rp
+                if block_reason is not None:
+                    reversal_block_reason = block_reason
                 if rc:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_DOWN
@@ -751,9 +768,13 @@ class PeakDetector:
             if self.smoothed_value < self.current_valley_value:
                 self.current_valley_value = self.smoothed_value
             elif self.smoothed_value > self.current_valley_value + self.hysteresis:
-                dv, rc = self._record_valley_on_reversal()
+                dv, rc, rv, block_reason = self._record_valley_on_reversal()
                 if dv is not None:
                     detected_valley = dv
+                if rv is not None:
+                    reversal_valley = rv
+                if block_reason is not None:
+                    reversal_block_reason = block_reason
                 if rc:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_UP
@@ -774,6 +795,9 @@ class PeakDetector:
             "repCompleted": rep_completed,
             "peak": detected_peak,
             "valley": detected_valley,
+            "reversalPeak": reversal_peak,
+            "reversalValley": reversal_valley,
+            "reversalBlockReason": reversal_block_reason,
             "rawValue": float(raw_value),
             "feedValue": float(feed),
             "smoothedValue": self.smoothed_value,
