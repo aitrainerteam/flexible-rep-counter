@@ -1,5 +1,9 @@
 # Rep counter tuning. Set FLEXIBLE_REP_COUNTER_CONFIG to use another file.
 
+# Live validation after enabling flags (pull session NDJSON, then):
+#   grep -E 'switch_debug|effective_min_range_gate|depth_recal_trigger_reason' events.ndjson
+# Enable order: primary_recovery_* → scale_change_pct / trigger_on_range_collapse → scale_relative_range_gate → min_closed_streak
+
 [app]
 log_level = "INFO"
 
@@ -81,6 +85,16 @@ smooth_window = 5
 # Skip full runtime re-evaluation until this many raw reps have been counted after
 # a joint lock/switch. Helps avoid early noisy candidate scans.
 post_lock_min_raw_reps = 5
+# Live tuning (Issue 2 — primary takes leadership from vertical_px fallback):
+# primary_recovery_bypass_rep_cooldown = true
+# primary_recovery_force_after_stale_reevals = 2
+# primary_recovery_skip_score_margin = true
+
+[dynamic_recalibration.vertical_px]
+# Stale/handoff thresholds when tracking vertical_px (defaults match global behavior).
+# min_closed_streak = 3
+# force_after_stale_reevals = 8
+# max_recent_range_px = 14.0
 
 # Peak-detector overrides by signal modality (not by joint name). Omitted keys inherit [rep].
 [rep.vertical_px]
@@ -88,6 +102,9 @@ hysteresis = 4.0
 min_range_gate = 5.0
 min_peak_distance = 3
 range_min_samples = 8
+# Live tuning (Issue 1 — counting at distance):
+# scale_relative_range_gate = true
+# min_scale_ratio = 0.75
 
 [fallback_y_point]
 # Arm fallback-only Y candidates after these bad-3-point conditions hold for this long.
@@ -120,11 +137,16 @@ scale_change_pct = 0.18
 baseline_jump_frac = 0.25
 cooldown_sec = 2.0
 observation_reps = 2
+# Live tuning (Issue 1 — react to distance / dead Y signal):
+# scale_change_pct = 0.14
+# trigger_on_range_collapse = true
+# defer_when_primary_recovered = true
 
 # Selection gates by signal modality. Angle joints use [angle_selection] globals above.
 [angle_selection.vertical_px]
 min_variance = 4.0
 min_range = 6.0
+# Live tuning (Issue 1 — easier Y selection when far): min_range = 4.5
 second_best_ratio = 1.10
 
 [low_fps_safe_mode]

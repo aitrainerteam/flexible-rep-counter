@@ -616,6 +616,35 @@ def test_brazil_debug_session_ndjson_regression_expectations() -> None:
     assert s2["vertical_px_increments"] >= 15
 
 
+def test_apply_scale_relative_range_gate_updates_vertical_px_detectors() -> None:
+    from flexible_rep_counter.session import _apply_scale_relative_range_gate
+    import flexible_rep_counter.session as session_mod
+
+    session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = True
+    try:
+        det = PeakDetector(min_range_gate_degrees=5.0)
+        state = JointMotionState(
+            angle_key="SHOULDER_Y",
+            detector=det,
+            history=deque(),
+            confidence_history=deque(),
+        )
+        state.last_scale_px = 212.0
+        state.scale_at_lock_px = 256.0
+        run_state: dict[str, Any] = {"tuning_params": {"minRangeGate": 15.0}}
+        effective = _apply_scale_relative_range_gate(
+            run_state,
+            {"SHOULDER_Y": state},
+            selected_angle="SHOULDER_Y",
+            peak_detector=det,
+        )
+        assert effective is not None
+        assert abs(float(det.min_range_gate_degrees) - 4.1484375) < 0.01
+        assert run_state.get("effective_min_range_gate") == effective
+    finally:
+        session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = False
+
+
 def test_peak_detector_reset_calibration_preserves_reps() -> None:
     detector = PeakDetector(
         smoothing_factor=0.3,

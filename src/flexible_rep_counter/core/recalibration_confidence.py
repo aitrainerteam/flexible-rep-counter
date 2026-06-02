@@ -680,6 +680,11 @@ def should_switch_to_candidate(
     same_joint_family: bool = False,
     selected_signal_unit: str = "deg",
     candidate_signal_unit: str = "deg",
+    primary_recovery_cross_modality: bool = False,
+    primary_recovery_force_after_stale_reevals: int = 8,
+    primary_recovery_skip_score_margin: bool = False,
+    primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
+    incumbent_is_fallback: bool = False,
 ) -> tuple[bool, bool, dict[str, Any]]:
     incumbent_health = compute_incumbent_health(
         stale_reevals=stale_reevals,
@@ -738,14 +743,41 @@ def should_switch_to_candidate(
         and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
         and candidate_motion_ok
     )
+    if (
+        primary_recovery_cross_modality
+        and incumbent_is_fallback
+        and incumbent_bad
+        and candidate_score >= float(primary_recovery_score)
+        and candidate_score >= FORCE_SWITCH_MIN_SCORE
+        and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
+        and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
+        and candidate_observable
+        and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+        and candidate_motion_ok
+    ):
+        candidate_good = True
     candidate_clearly_better = (
         candidate_score >= selected_score + score_margin
         or candidate_score >= selected_score * score_ratio
     )
+    if (
+        primary_recovery_skip_score_margin
+        and primary_recovery_cross_modality
+        and incumbent_is_fallback
+        and incumbent_bad
+        and candidate_good
+        and candidate_score >= float(primary_recovery_score)
+    ):
+        candidate_clearly_better = True
     should_switch = cooldown_ok and incumbent_bad and candidate_good and candidate_clearly_better
 
+    force_after = (
+        int(primary_recovery_force_after_stale_reevals)
+        if primary_recovery_cross_modality
+        else int(stale_switch_force_after_reevals)
+    )
     force_switch = (
-        stale_reevals >= stale_switch_force_after_reevals
+        stale_reevals >= force_after
         and candidate_score >= FORCE_SWITCH_MIN_SCORE
         and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
         and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
@@ -771,6 +803,8 @@ def should_switch_to_candidate(
         "sameJointFamily": bool(same_joint_family),
         "shouldSwitch": bool(should_switch),
         "forceSwitch": bool(force_switch),
+        "primaryRecoveryCrossModality": bool(primary_recovery_cross_modality),
+        "forceAfterStaleReevals": int(force_after),
     }
 
 

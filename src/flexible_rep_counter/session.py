@@ -52,11 +52,18 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_SWITCH_MIN_SEC,
     ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS,
+    DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN,
+    DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS,
+    DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN,
     DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC as CFG_DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC,
     DEPTH_RECALIBRATION_COOLDOWN_SEC as CFG_DEPTH_RECALIBRATION_COOLDOWN_SEC,
+    DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED as CFG_DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED,
     DEPTH_RECALIBRATION_ENABLED as CFG_DEPTH_RECALIBRATION_ENABLED,
     DEPTH_RECALIBRATION_OBSERVATION_REPS as CFG_DEPTH_RECALIBRATION_OBSERVATION_REPS,
     DEPTH_RECALIBRATION_SCALE_CHANGE_PCT as CFG_DEPTH_RECALIBRATION_SCALE_CHANGE_PCT,
+    DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE as CFG_DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE,
+    REP_VERTICAL_PX_MIN_SCALE_RATIO as CFG_REP_VERTICAL_PX_MIN_SCALE_RATIO,
+    REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE as CFG_REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE,
     FALLBACK_Y_ARM_WINDOW_SEC as CFG_FALLBACK_Y_ARM_WINDOW_SEC,
     FALLBACK_Y_ARMING_MIN_SCORE as CFG_FALLBACK_Y_ARMING_MIN_SCORE,
     FALLBACK_Y_LOW_SCORE_THRESHOLD as CFG_FALLBACK_Y_LOW_SCORE_THRESHOLD,
@@ -71,6 +78,7 @@ from flexible_rep_counter.core.settings import (
     FALLBACK_Y_MIN_ROM_SCORE as CFG_FALLBACK_Y_MIN_ROM_SCORE,
     FALLBACK_Y_PRIMARY_RECOVERY_SCORE as CFG_FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
     get_default_tuning_params,
+    get_dynamic_recalibration_vertical_px_thresholds,
     get_rep_modality_tuning_overrides,
     LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
     LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
@@ -121,6 +129,19 @@ DEPTH_RECALIBRATION_SCALE_CHANGE_PCT = max(0.0, float(CFG_DEPTH_RECALIBRATION_SC
 DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC = max(0.0, float(CFG_DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC))
 DEPTH_RECALIBRATION_COOLDOWN_SEC = max(0.0, float(CFG_DEPTH_RECALIBRATION_COOLDOWN_SEC))
 DEPTH_RECALIBRATION_OBSERVATION_REPS = max(0, int(CFG_DEPTH_RECALIBRATION_OBSERVATION_REPS))
+DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE = bool(CFG_DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE)
+DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED = bool(CFG_DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED)
+REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = bool(CFG_REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE)
+REP_VERTICAL_PX_MIN_SCALE_RATIO = max(0.0, min(1.0, float(CFG_REP_VERTICAL_PX_MIN_SCALE_RATIO)))
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN = bool(
+    CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN
+)
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS = max(
+    1, int(CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS)
+)
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN = bool(
+    CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN
+)
 LOW_FPS_SAFE_MODE_ENABLED = CFG_LOW_FPS_SAFE_MODE_ENABLED
 LOW_FPS_INTERVAL_WINDOW_FRAMES = max(1, int(CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES))
 LOW_FPS_MIN_SAMPLES = max(2, int(CFG_LOW_FPS_MIN_SAMPLES))
@@ -308,6 +329,8 @@ def _update_fallback_bad_streak(
 def _fallback_incumbent_low_score_now(
     incumbent_score: float,
     incumbent_recent_range_deg: float,
+    *,
+    max_recent_range_threshold: float = STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
 ) -> bool:
     """
     True when the locked joint looks stale for Y-fallback arming.
@@ -315,7 +338,7 @@ def _fallback_incumbent_low_score_now(
     Low recent ROM alone is enough; do not require incumbent_score < threshold when
     variance_prior keeps score high despite flat motion on the incumbent.
     """
-    low_rom = float(incumbent_recent_range_deg) < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+    low_rom = float(incumbent_recent_range_deg) < float(max_recent_range_threshold)
     if low_rom:
         return True
     return float(incumbent_score) < FALLBACK_Y_LOW_SCORE_THRESHOLD
@@ -622,6 +645,113 @@ def _has_primary_recovery_candidate(
     return False
 
 
+def _has_cross_modality_primary_recovery(
+    score_by_joint: dict[str, tuple[float, dict[str, Any]]],
+    *,
+    incumbent_signal_unit: str,
+) -> bool:
+    for angle_key, (score, debug) in score_by_joint.items():
+        if is_fallback_angle(angle_key):
+            continue
+        if signal_unit(angle_key) == incumbent_signal_unit:
+            continue
+        if (
+            float(score) >= FALLBACK_Y_PRIMARY_RECOVERY_SCORE
+            and float(debug.get("activityScore") or 0.0) >= FALLBACK_Y_MIN_ACTIVITY_SCORE
+            and float(debug.get("poseScore") or 0.0) >= FALLBACK_Y_MIN_POSE_SCORE
+            and int(debug.get("completedCycles") or 0) >= FALLBACK_Y_MIN_COMPLETED_CYCLES
+        ):
+            return True
+    return False
+
+
+def _stale_switch_thresholds_for_signal_unit(signal_unit_name: str) -> dict[str, float | int]:
+    if signal_unit_name == "px":
+        px = get_dynamic_recalibration_vertical_px_thresholds()
+        return {
+            "max_recent_range": float(px["max_recent_range_px"]),
+            "min_closed_streak": int(px["min_closed_streak"]),
+            "force_after_stale_reevals": int(px["force_after_stale_reevals"]),
+        }
+    return {
+        "max_recent_range": float(STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG),
+        "min_closed_streak": int(STALE_SWITCH_MIN_CLOSED_STREAK),
+        "force_after_stale_reevals": int(STALE_SWITCH_FORCE_AFTER_STALE_REEVALS),
+    }
+
+
+def _vertical_px_base_min_range_gate(run_state: dict[str, Any]) -> float:
+    tuning = run_state.get("tuning_params") or DEFAULT_TUNING_PARAMS
+    base = float(tuning.get("minRangeGate", DEFAULT_TUNING_PARAMS["minRangeGate"]))
+    overrides = get_rep_modality_tuning_overrides(signal_unit="px")
+    if overrides.get("minRangeGate") is not None:
+        base = float(overrides["minRangeGate"])
+    return base
+
+
+def _effective_scale_relative_min_range_gate(
+    base_gate: float,
+    *,
+    scale_now: Optional[float],
+    scale_at_lock: Optional[float],
+) -> float:
+    if not REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE:
+        return base_gate
+    if not isinstance(scale_now, (int, float)) or not isinstance(scale_at_lock, (int, float)):
+        return base_gate
+    if float(scale_at_lock) <= 1e-6:
+        return base_gate
+    ratio = max(
+        REP_VERTICAL_PX_MIN_SCALE_RATIO,
+        min(1.0, float(scale_now) / float(scale_at_lock)),
+    )
+    return float(base_gate) * ratio
+
+
+def _apply_scale_relative_range_gate(
+    run_state: dict[str, Any],
+    joint_states: dict[str, JointMotionState],
+    *,
+    selected_angle: Optional[str],
+    peak_detector: Optional[Any] = None,
+) -> Optional[float]:
+    if not REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE:
+        run_state.pop("effective_min_range_gate", None)
+        return None
+    base_gate = _vertical_px_base_min_range_gate(run_state)
+    effective: Optional[float] = None
+    for angle_key, state in joint_states.items():
+        if signal_unit(angle_key) != "px":
+            continue
+        det = state.detector
+        if det is None or not hasattr(det, "min_range_gate_degrees"):
+            continue
+        gate = _effective_scale_relative_min_range_gate(
+            base_gate,
+            scale_now=state.last_scale_px,
+            scale_at_lock=state.scale_at_lock_px,
+        )
+        det.min_range_gate_degrees = gate
+        if isinstance(selected_angle, str) and angle_key == selected_angle:
+            effective = gate
+    active = peak_detector
+    if active is not None and hasattr(active, "min_range_gate_degrees"):
+        if isinstance(selected_angle, str) and selected_angle in joint_states:
+            sel_state = joint_states[selected_angle]
+            gate = _effective_scale_relative_min_range_gate(
+                base_gate,
+                scale_now=sel_state.last_scale_px,
+                scale_at_lock=sel_state.scale_at_lock_px,
+            )
+            active.min_range_gate_degrees = gate
+            effective = gate
+    if effective is not None:
+        run_state["effective_min_range_gate"] = float(effective)
+    else:
+        run_state.pop("effective_min_range_gate", None)
+    return effective
+
+
 def _depth_recalibration_state(run_state: dict[str, Any], current_raw: int) -> str:
     if bool(run_state.get("depth_recal_observing")):
         until_raw = int(run_state.get("depth_recal_observe_until_raw") or 0)
@@ -633,6 +763,28 @@ def _depth_recalibration_state(run_state: dict[str, Any], current_raw: int) -> s
     return str(run_state.get("depth_recal_state") or "idle")
 
 
+def _should_defer_depth_recal_for_primary_recovery(
+    *,
+    selected_angle: Optional[str],
+    joint_states: dict[str, JointMotionState],
+    ts_ms: int,
+) -> bool:
+    if not DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED:
+        return False
+    if not isinstance(selected_angle, str) or not is_fallback_angle(selected_angle):
+        return False
+    if signal_unit(selected_angle) != "px":
+        return False
+    score_by_joint = {
+        angle_key: compute_joint_recalibration_score(joint_state, None, ts_ms)
+        for angle_key, joint_state in joint_states.items()
+    }
+    return _has_cross_modality_primary_recovery(
+        score_by_joint,
+        incumbent_signal_unit="px",
+    )
+
+
 def _maybe_trigger_depth_recalibration(
     *,
     run_state: dict[str, Any],
@@ -640,7 +792,11 @@ def _maybe_trigger_depth_recalibration(
     detector: Optional[PeakDetector],
     now_s: float,
     current_raw: int,
+    selected_angle: Optional[str] = None,
+    joint_states: Optional[dict[str, JointMotionState]] = None,
+    ts_ms: int = 0,
 ) -> bool:
+    run_state.pop("depth_recal_trigger_reason", None)
     if not DEPTH_RECALIBRATION_ENABLED:
         return False
     if detector is None or signal_unit(state.angle_key) != "px":
@@ -657,11 +813,10 @@ def _maybe_trigger_depth_recalibration(
     scale_now = state.last_scale_px
     scale_ref = state.scale_at_lock_px
     scale_event = False
+    scale_ratio: Optional[float] = None
     if isinstance(scale_now, (int, float)) and isinstance(scale_ref, (int, float)) and scale_ref > 1e-6:
         scale_ratio = float(scale_now) / float(scale_ref)
         scale_event = abs(scale_ratio - 1.0) >= DEPTH_RECALIBRATION_SCALE_CHANGE_PCT
-    else:
-        scale_ratio = None
 
     short_vals = list(state.absolute_y_short_window)
     long_vals = list(state.absolute_y_long_window)
@@ -677,7 +832,35 @@ def _maybe_trigger_depth_recalibration(
         baseline_jump = abs(short_med - long_med) >= (
             DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC * float(scale_now)
         )
-    if not (scale_event or baseline_jump):
+
+    range_collapse = False
+    if DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE and isinstance(scale_ratio, (int, float)):
+        base_gate = _vertical_px_base_min_range_gate(run_state)
+        rolling_range = float(getattr(detector, "_last_rolling_range", 0.0) or 0.0)
+        range_collapse = (
+            rolling_range < base_gate
+            and float(scale_ratio) < 1.0
+        )
+
+    trigger_reason: Optional[str] = None
+    if scale_event:
+        trigger_reason = "scale_change"
+    elif baseline_jump:
+        trigger_reason = "baseline_jump"
+    elif range_collapse:
+        trigger_reason = "range_collapse"
+
+    if trigger_reason is None:
+        return False
+
+    if (
+        joint_states is not None
+        and _should_defer_depth_recal_for_primary_recovery(
+            selected_angle=selected_angle,
+            joint_states=joint_states,
+            ts_ms=ts_ms,
+        )
+    ):
         return False
 
     detector.reset_calibration_preserve_reps()
@@ -688,6 +871,7 @@ def _maybe_trigger_depth_recalibration(
         state.absolute_y_baseline_px = float(short_sorted[len(short_sorted) // 2])
     run_state["depth_recal_last_trigger_s"] = float(now_s)
     run_state["depth_recal_state"] = "triggered"
+    run_state["depth_recal_trigger_reason"] = trigger_reason
     if DEPTH_RECALIBRATION_OBSERVATION_REPS > 0:
         run_state["depth_recal_observing"] = True
         run_state["depth_recal_observe_until_raw"] = int(current_raw) + int(DEPTH_RECALIBRATION_OBSERVATION_REPS)
@@ -2060,6 +2244,8 @@ class RepCounterSession:
                 ),
                 "depth_recal_state": self._run_state.get("depth_recal_state"),
                 "depth_recal_scale_ratio": self._run_state.get("depth_recal_last_scale_ratio"),
+                "depth_recal_trigger_reason": self._run_state.get("depth_recal_trigger_reason"),
+                "effective_min_range_gate": self._run_state.get("effective_min_range_gate"),
                 **(self._run_state.get("fallback_instr") or {}),
                 **_recal_frame_instr_payload(
                     self._run_state,
@@ -2567,6 +2753,12 @@ class RepCounterSession:
             joint_states,
             peak_detector=rs.get("peak_detector"),
         )
+        _apply_scale_relative_range_gate(
+            rs,
+            joint_states,
+            selected_angle=selected_angle if isinstance(selected_angle, str) else None,
+            peak_detector=rs.get("peak_detector"),
+        )
         t_det = time.perf_counter()
         for ak, cfg in COMMON_ANGLES.items():
             val = tracking_angle_values.get(ak)
@@ -2633,6 +2825,9 @@ class RepCounterSession:
                 detector=active_detector,
                 now_s=now,
                 current_raw=current_raw,
+                selected_angle=selected_angle,
+                joint_states=joint_states,
+                ts_ms=int(ts),
             )
         depth_recal_state = _depth_recalibration_state(rs, current_raw)
         if depth_recal_triggered and depth_recal_state != "observing":
@@ -2752,6 +2947,10 @@ class RepCounterSession:
                 stale_reevals += 1
             rs["selected_raw_last_at_reeval"] = current_raw
             rs["selected_raw_stale_reeval_streak"] = stale_reevals
+            selected_signal_for_stale = (
+                signal_unit(selected_angle) if isinstance(selected_angle, str) else "deg"
+            )
+            stale_thresholds = _stale_switch_thresholds_for_signal_unit(selected_signal_for_stale)
             selected_score_for_reeval_gate = 0.0
             if isinstance(selected_angle, str) and selected_angle in joint_states:
                 selected_score_for_reeval_gate, _ = compute_joint_recalibration_score(
@@ -2769,8 +2968,8 @@ class RepCounterSession:
                 selected_recent_range=selected_recent_range_for_gate,
                 selected_pose_score=selected_pose_score,
                 selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
-                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
-                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                stale_switch_max_selected_recent_range_deg=float(stale_thresholds["max_recent_range"]),
+                stale_switch_min_closed_streak=int(stale_thresholds["min_closed_streak"]),
                 selected_score=float(selected_score_for_reeval_gate),
             )
             re_eval_due = bool(run_full_re_eval)
@@ -2811,8 +3010,11 @@ class RepCounterSession:
             low_score_now = _fallback_incumbent_low_score_now(
                 float(selected_score_for_fallback),
                 incumbent_recent_range,
+                max_recent_range_threshold=float(stale_thresholds["max_recent_range"]),
             )
-            unclear_motion_now = bool(selected_range_gate_closed_streak >= STALE_SWITCH_MIN_CLOSED_STREAK)
+            unclear_motion_now = bool(
+                selected_range_gate_closed_streak >= int(stale_thresholds["min_closed_streak"])
+            )
             not_recalibrating_now = bool(
                 rs.get("pending_switch_angle") is None
                 and rs.get("handoff_observation_candidate_angle") is None
@@ -2868,10 +3070,10 @@ class RepCounterSession:
                 score_by_joint, selected_angle if isinstance(selected_angle, str) else None,
                 variance_by_joint=variances,
                 stale_reevals=stale_reevals,
-                stale_switch_force_after_reevals=STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
+                stale_switch_force_after_reevals=int(stale_thresholds["force_after_stale_reevals"]),
                 selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
-                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
-                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                stale_switch_max_selected_recent_range_deg=float(stale_thresholds["max_recent_range"]),
+                stale_switch_min_closed_streak=int(stale_thresholds["min_closed_streak"]),
                 fallback_armed=fallback_armed,
                 primary_recovery_score=FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
             )
@@ -2928,15 +3130,28 @@ class RepCounterSession:
                 not isinstance(reps_at_last_switch, int)
                 or reps_since_last_switch >= JOINT_SWITCH_MIN_REPS_SINCE_LAST
             )
+            primary_recovery_cross_modality = bool(
+                isinstance(selected_angle, str)
+                and is_fallback_angle(selected_angle)
+                and isinstance(candidate, str)
+                and not is_fallback_angle(candidate)
+                and bool(candidate_sel_debug.get("primaryRecovered"))
+                and selected_signal_unit != candidate_signal_unit
+            )
+            if (
+                DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN
+                and primary_recovery_cross_modality
+            ):
+                rep_cooldown_ok = True
             cooldown_ok = time_cooldown_ok and rep_cooldown_ok
             should_switch, force_switch, switch_debug = should_switch_to_candidate(
                 cooldown_ok=cooldown_ok,
                 stale_reevals=stale_reevals,
-                stale_switch_force_after_reevals=STALE_SWITCH_FORCE_AFTER_STALE_REEVALS,
+                stale_switch_force_after_reevals=int(stale_thresholds["force_after_stale_reevals"]),
                 selected_recent_range=selected_recent_range,
-                stale_switch_max_selected_recent_range_deg=STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG,
+                stale_switch_max_selected_recent_range_deg=float(stale_thresholds["max_recent_range"]),
                 selected_range_gate_closed_streak=int(rs.get("selected_range_gate_closed_streak") or 0),
-                stale_switch_min_closed_streak=STALE_SWITCH_MIN_CLOSED_STREAK,
+                stale_switch_min_closed_streak=int(stale_thresholds["min_closed_streak"]),
                 selected_score=float(selected_score),
                 selected_pose_score=selected_pose_score,
                 candidate_score=float(candidate_score),
@@ -2951,6 +3166,17 @@ class RepCounterSession:
                 same_joint_family=same_joint_family,
                 selected_signal_unit=selected_signal_unit,
                 candidate_signal_unit=candidate_signal_unit,
+                primary_recovery_cross_modality=primary_recovery_cross_modality,
+                primary_recovery_force_after_stale_reevals=(
+                    DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS
+                ),
+                primary_recovery_skip_score_margin=(
+                    DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN
+                ),
+                primary_recovery_score=FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
+                incumbent_is_fallback=(
+                    isinstance(selected_angle, str) and is_fallback_angle(selected_angle)
+                ),
             )
             switch_debug = {
                 **switch_debug,
@@ -2969,6 +3195,8 @@ class RepCounterSession:
                 "fallbackStreakPaused": bool(fallback_streak_paused),
                 "depthRecalState": depth_recal_state,
                 "depthRecalTriggered": bool(depth_recal_triggered),
+                "depthRecalTriggerReason": rs.get("depth_recal_trigger_reason"),
+                "primaryRecoveryCrossModality": bool(primary_recovery_cross_modality),
             }
             rs["recal_instr"] = {
                 "recal_candidate_angle": candidate,
@@ -2994,7 +3222,7 @@ class RepCounterSession:
                     and candidate_pose_score >= HANDOFF_OBSERVATION_MIN_POSE_SCORE
                     and (
                         stale_reevals >= 1
-                        or selected_recent_range < STALE_SWITCH_MAX_SELECTED_RECENT_RANGE_DEG
+                        or selected_recent_range < float(stale_thresholds["max_recent_range"])
                         or selected_pose_score < HANDOFF_OBSERVATION_INCUMBENT_POSE_WEAK_SCORE
                     )
                 )

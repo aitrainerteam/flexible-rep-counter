@@ -79,6 +79,13 @@ def _toml_int(*keys: str, default: int) -> int:
     return default
 
 
+def _toml_bool(*keys: str, default: bool) -> bool:
+    v = _toml_val(*keys)
+    if isinstance(v, bool):
+        return v
+    return default
+
+
 def _vm_netloc_host_port(hostname: str, port: int) -> str:
     try:
         if ip_address(hostname).version == 6:
@@ -177,6 +184,15 @@ ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", de
 DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS = _toml_int(
     "dynamic_recalibration", "post_lock_min_raw_reps", default=5
 )
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN = _toml_bool(
+    "dynamic_recalibration", "primary_recovery_bypass_rep_cooldown", default=False
+)
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS = _toml_int(
+    "dynamic_recalibration", "primary_recovery_force_after_stale_reevals", default=8
+)
+DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN = _toml_bool(
+    "dynamic_recalibration", "primary_recovery_skip_score_margin", default=False
+)
 FALLBACK_Y_ARM_WINDOW_SEC = _toml_float("fallback_y_point", "arm_window_sec", default=1.2)
 FALLBACK_Y_LOW_SCORE_THRESHOLD = _toml_float(
     "fallback_y_point", "low_score_threshold", default=0.40
@@ -241,6 +257,18 @@ DEPTH_RECALIBRATION_COOLDOWN_SEC = _toml_float(
 DEPTH_RECALIBRATION_OBSERVATION_REPS = _toml_int(
     "depth_recalibration", "observation_reps", default=2
 )
+DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE = _toml_bool(
+    "depth_recalibration", "trigger_on_range_collapse", default=False
+)
+DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED = _toml_bool(
+    "depth_recalibration", "defer_when_primary_recovered", default=False
+)
+REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = _toml_bool(
+    "rep", "vertical_px", "scale_relative_range_gate", default=False
+)
+REP_VERTICAL_PX_MIN_SCALE_RATIO = _toml_float(
+    "rep", "vertical_px", "min_scale_ratio", default=0.75
+)
 
 LOW_FPS_SAFE_MODE_ENABLED = bool(_toml_val("low_fps_safe_mode", "enabled") is not False)
 LOW_FPS_INTERVAL_WINDOW_FRAMES = _toml_int(
@@ -298,6 +326,30 @@ def get_rep_modality_tuning_overrides(*, signal_unit: str) -> dict[str, Any]:
             else:
                 out[tp_key] = val
     return out
+
+
+def get_dynamic_recalibration_vertical_px_thresholds() -> dict[str, float]:
+    """Stale-switch and range-health thresholds for vertical_px incumbents."""
+    section_raw = _toml_val("dynamic_recalibration", "vertical_px")
+    section = section_raw if isinstance(section_raw, dict) else {}
+
+    def _local_int(key: str, default: int) -> int:
+        raw = section.get(key)
+        if raw is not None and isinstance(raw, (int, float)):
+            return int(raw)
+        return default
+
+    def _local_float(key: str, default: float) -> float:
+        raw = section.get(key)
+        if raw is not None and isinstance(raw, (int, float)):
+            return float(raw)
+        return default
+
+    return {
+        "min_closed_streak": _local_int("min_closed_streak", 10),
+        "force_after_stale_reevals": _local_int("force_after_stale_reevals", 8),
+        "max_recent_range_px": _local_float("max_recent_range_px", 14.0),
+    }
 
 
 def get_angle_selection_modality_thresholds(*, signal_unit: str) -> dict[str, float]:

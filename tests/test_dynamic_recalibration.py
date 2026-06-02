@@ -17,6 +17,7 @@ from flexible_rep_counter.core.recalibration_confidence import (
     HandoffDecision,
     JointMotionState,
     classify_handoff,
+    compute_incumbent_health,
     compute_joint_recalibration_score,
     select_recalibration_candidate,
     should_run_full_recalibration,
@@ -996,3 +997,163 @@ def test_recal_frame_instr_payload_exposes_handoff_and_rom_fields() -> None:
     assert payload["recal_candidate_angle"] == "LEFT_ELBOW"
     assert payload["selected_rom_for_dominance"] == 4.2
     assert payload["candidate_rom_dominates"] is False
+
+
+def test_scale_relative_gate_scales_with_distance() -> None:
+    from flexible_rep_counter.session import _effective_scale_relative_min_range_gate
+    import flexible_rep_counter.session as session_mod
+
+    session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = True
+    session_mod.REP_VERTICAL_PX_MIN_SCALE_RATIO = 0.75
+    try:
+        effective = _effective_scale_relative_min_range_gate(
+            5.0,
+            scale_now=212.0,
+            scale_at_lock=256.0,
+        )
+        assert abs(effective - 4.1484375) < 0.01
+    finally:
+        session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = False
+
+
+def test_depth_recal_triggers_on_range_collapse_when_enabled(monkeypatch: Any) -> None:
+    from flexible_rep_counter.session import _maybe_trigger_depth_recalibration
+    import flexible_rep_counter.session as session_mod
+
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_ENABLED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_SCALE_CHANGE_PCT", 0.18)
+
+    det = PeakDetector(min_range_gate_degrees=5.0)
+    det._last_rolling_range = 3.0
+    state = JointMotionState(
+        angle_key="SHOULDER_Y",
+        detector=det,
+        history=deque(),
+        confidence_history=deque(),
+    )
+    state.last_scale_px = 212.0
+    state.scale_at_lock_px = 256.0
+    run_state: dict[str, Any] = {"tuning_params": {"minRangeGate": 5.0}}
+    triggered = _maybe_trigger_depth_recalibration(
+        run_state=run_state,
+        state=state,
+        detector=det,
+        now_s=100.0,
+        current_raw=5,
+    )
+    assert triggered is True
+    assert run_state.get("depth_recal_trigger_reason") == "range_collapse"
+
+
+def test_vertical_px_stale_closed_streak_modality_override() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=0,
+        selected_recent_range=20.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=3,
+        stale_switch_min_closed_streak=3,
+        selected_score=0.8,
+        selected_pose_score=0.9,
+    )
+    assert health["gateClosed"] is True
+    assert health["incumbentBad"] is True
+
+
+def test_primary_recovery_bypasses_rep_cooldown() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=3.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.35,
+        selected_pose_score=0.9,
+        candidate_score=0.75,
+        candidate_activity_score=0.7,
+        candidate_pose_score=0.7,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=35.0,
+        selected_median_rom_deg=3.0,
+        median_recent_range_all=30.0,
+        same_joint_family=False,
+        selected_signal_unit="px",
+        candidate_signal_unit="deg",
+        primary_recovery_cross_modality=True,
+        primary_recovery_skip_score_margin=True,
+        primary_recovery_score=0.60,
+        incumbent_is_fallback=True,
+    )
+    assert can_switch is True
+    assert debug["primaryRecoveryCrossModality"] is True
+
+
+def test_primary_recovery_fast_force_switch() -> None:
+    _, force_switch, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=2,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=3.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.30,
+        selected_pose_score=0.9,
+        candidate_score=0.60,
+        candidate_activity_score=0.55,
+        candidate_pose_score=0.60,
+        candidate_observable=True,
+        candidate_completed_cycles=2,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=30.0,
+        selected_median_rom_deg=3.0,
+        median_recent_range_all=35.0,
+        selected_signal_unit="px",
+        candidate_signal_unit="deg",
+        primary_recovery_cross_modality=True,
+        primary_recovery_force_after_stale_reevals=2,
+        incumbent_is_fallback=True,
+    )
+    assert force_switch is True
+    assert debug["forceAfterStaleReevals"] == 2
+
+
+def test_defer_depth_recal_when_primary_recovered(monkeypatch: Any) -> None:
+    from flexible_rep_counter.session import _maybe_trigger_depth_recalibration
+    import flexible_rep_counter.session as session_mod
+
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_ENABLED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_SCALE_CHANGE_PCT", 0.10)
+    monkeypatch.setattr(
+        session_mod,
+        "_has_cross_modality_primary_recovery",
+        lambda score_by_joint, incumbent_signal_unit: incumbent_signal_unit == "px",
+    )
+
+    det = PeakDetector(min_range_gate_degrees=5.0)
+    y_state = JointMotionState(
+        angle_key="SHOULDER_Y",
+        detector=det,
+        history=deque(),
+        confidence_history=deque(),
+    )
+    y_state.last_scale_px = 212.0
+    y_state.scale_at_lock_px = 256.0
+    joint_states = {"SHOULDER_Y": y_state}
+    run_state: dict[str, Any] = {"tuning_params": {"minRangeGate": 5.0}}
+    triggered = _maybe_trigger_depth_recalibration(
+        run_state=run_state,
+        state=y_state,
+        detector=det,
+        now_s=100.0,
+        current_raw=5,
+        selected_angle="SHOULDER_Y",
+        joint_states=joint_states,
+        ts_ms=5000,
+    )
+    assert triggered is False
