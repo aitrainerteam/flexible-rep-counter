@@ -177,7 +177,7 @@ ANGLE_SELECTION_SMOOTH_WINDOW = _toml_int("angle_selection", "smooth_window", de
 DYNAMIC_RECALIBRATION_POST_LOCK_MIN_RAW_REPS = _toml_int(
     "dynamic_recalibration", "post_lock_min_raw_reps", default=5
 )
-FALLBACK_Y_ARM_WINDOW_SEC = _toml_float("fallback_y_point", "arm_window_sec", default=4.0)
+FALLBACK_Y_ARM_WINDOW_SEC = _toml_float("fallback_y_point", "arm_window_sec", default=1.2)
 FALLBACK_Y_LOW_SCORE_THRESHOLD = _toml_float(
     "fallback_y_point", "low_score_threshold", default=0.40
 )
@@ -215,6 +215,18 @@ FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC = _toml_float(
 FALLBACK_Y_BASELINE_JUMP_FRAC = _toml_float(
     "fallback_y_point", "baseline_jump_frac", default=0.25
 )
+FALLBACK_Y_MIN_CADENCE_SCORE = _toml_float(
+    "fallback_y_point", "min_cadence_score", default=0.45
+)
+FALLBACK_Y_MIN_EVIDENCE_RANGE_PX = _toml_float(
+    "fallback_y_point", "min_evidence_range_px", default=8.0
+)
+FALLBACK_Y_REQUIRE_BASELINE = bool(
+    _toml_val("fallback_y_point", "require_baseline") is not False
+)
+FALLBACK_Y_STREAK_DECAY_GRACE_SEC = _toml_float(
+    "fallback_y_point", "streak_decay_grace_sec", default=0.5
+)
 
 DEPTH_RECALIBRATION_ENABLED = bool(_toml_val("depth_recalibration", "enabled") is not False)
 DEPTH_RECALIBRATION_SCALE_CHANGE_PCT = _toml_float(
@@ -247,14 +259,23 @@ LOW_FPS_EXIT_STREAK_FRAMES = _toml_int(
 )
 
 
-def get_rep_joint_tuning_overrides(angle_key: str) -> dict[str, Any]:
-    """Per-joint peak-detector overrides from ``[rep.joints.<KEY>]`` (fallback Y joints, etc.)."""
-    joint = _toml_val("rep", "joints", angle_key)
-    if not isinstance(joint, dict):
+def _signal_modality_section(signal_unit: str) -> dict[str, Any]:
+    """Modality overrides from ``[rep.<modality>]`` or ``[angle_selection.<modality>]``."""
+    if signal_unit == "px":
+        section = _toml_val("rep", "vertical_px")
+    else:
+        section = _toml_val("rep", "angle_deg")
+    return section if isinstance(section, dict) else {}
+
+
+def get_rep_modality_tuning_overrides(*, signal_unit: str) -> dict[str, Any]:
+    """Peak-detector overrides by signal modality (``angle_deg`` or ``vertical_px``), not joint name."""
+    section = _signal_modality_section(signal_unit)
+    if not section:
         return {}
 
     def _f(key: str) -> Optional[float]:
-        raw = joint.get(key)
+        raw = section.get(key)
         if raw is not None and isinstance(raw, (int, float)):
             return float(raw)
         return None
@@ -279,14 +300,16 @@ def get_rep_joint_tuning_overrides(angle_key: str) -> dict[str, Any]:
     return out
 
 
-def get_angle_selection_joint_thresholds(angle_key: str) -> dict[str, float]:
-    """Per-joint gates from ``[angle_selection.joints.<KEY>]``, else ``[angle_selection]`` globals."""
-    joint = _toml_val("angle_selection", "joints", angle_key)
-    if not isinstance(joint, dict):
-        joint = {}
+def get_angle_selection_modality_thresholds(*, signal_unit: str) -> dict[str, float]:
+    """Selection gates by signal modality, not joint name."""
+    if signal_unit == "px":
+        section_raw = _toml_val("angle_selection", "vertical_px")
+    else:
+        section_raw = _toml_val("angle_selection", "angle_deg")
+    section = section_raw if isinstance(section_raw, dict) else {}
 
     def _local(key: str, global_val: float) -> float:
-        raw = joint.get(key)
+        raw = section.get(key)
         if raw is not None and isinstance(raw, (int, float)):
             return float(raw)
         return global_val
@@ -294,8 +317,8 @@ def get_angle_selection_joint_thresholds(angle_key: str) -> dict[str, float]:
     return {
         "min_variance": _local("min_variance", ANGLE_SELECTION_MIN_VARIANCE),
         "min_range_deg": _local("min_range_deg", ANGLE_SELECTION_MIN_RANGE_DEG),
-        "min_variance_px2": _local("min_variance_px2", ANGLE_SELECTION_MIN_VARIANCE),
-        "min_range_px": _local("min_range_px", ANGLE_SELECTION_MIN_RANGE_DEG),
+        "min_variance_px2": _local("min_variance", ANGLE_SELECTION_MIN_VARIANCE),
+        "min_range_px": _local("min_range", ANGLE_SELECTION_MIN_RANGE_DEG),
         "second_best_ratio": _local("second_best_ratio", ANGLE_SELECTION_SECOND_BEST_RATIO),
     }
 

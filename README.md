@@ -108,8 +108,8 @@ This section is the shortest "how it works" map for first-joint selection, confi
   - `smoothedRangeDeg` (effective ROM in degrees)
 - A joint is eligible only when all gates pass:
   - `activeWindowCount >= angle_selection.min_active_windows`
-  - `medianWindowVariance >= angle_selection.min_variance` (or joint override)
-  - `smoothedRangeDeg >= angle_selection.min_range_deg` (or joint override)
+  - `medianWindowVariance >= angle_selection.min_variance` (or `[angle_selection.vertical_px]` for px signals)
+  - `smoothedRangeDeg >= angle_selection.min_range_deg` (or `min_range` under `[angle_selection.vertical_px]`)
 - The top candidate must also beat runner-up ambiguity using `second_best_ratio` (with a relaxed ratio for across-body runner-ups).
 - Final lock also requires keypoint confidence:
   - `avg_confidence(selected_joint_landmarks) >= 0.5`
@@ -165,8 +165,9 @@ Sections:
 | `[vm]` | `direct_url` (required for the visualizer), `timeout_sec`, `health_timeout_sec` |
 | `[predict]` | `resize_width`, `jpeg_quality` |
 | `[rep]` | Peak detector tuning: hysteresis, margins, calibration, `min_interval_ms`, etc. |
-| `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds |
-| `[angle_selection.joints.<NAME>]` | Per-joint overrides (e.g. `LEFT_ELBOW`) for `min_variance`, `min_range_deg`, `second_best_ratio` |
+| `[rep.vertical_px]` | Peak-detector overrides for vertical displacement signals (px), not per joint |
+| `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds (`angle_deg`) |
+| `[angle_selection.vertical_px]` | Selection gates for vertical displacement candidates (`min_variance`, `min_range`, `second_best_ratio`) |
 | `[low_fps_safe_mode]` | Frame-interval thresholds and hysteresis to enable/disable low-FPS-safe handoff behavior |
 
 The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars. Response validation for `/predict` is on by default in code; use `--no-validate-response` to disable.

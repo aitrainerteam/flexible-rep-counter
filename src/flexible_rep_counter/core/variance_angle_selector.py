@@ -7,7 +7,7 @@ from flexible_rep_counter.core.settings import (
     ANGLE_SELECTION_MIN_FRAMES,
     ANGLE_SELECTION_MIN_ACTIVE_WINDOWS,
     ANGLE_SELECTION_SMOOTH_WINDOW,
-    get_angle_selection_joint_thresholds,
+    get_angle_selection_modality_thresholds,
     get_default_tuning_params,
 )
 from flexible_rep_counter.core.math_engine import (
@@ -37,7 +37,7 @@ COMMON_ANGLES: dict[str, dict[str, Any]] = {
     "RIGHT_HIP": {"type": "angle_3_point", "landmarks": [6, 12, 14], "eligibility": "primary", "modality": "angle_deg"},
     "LEFT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [13, 11, 12], "eligibility": "primary", "modality": "angle_deg"},
     "RIGHT_HIP_ACROSS": {"type": "angle_3_point", "landmarks": [14, 12, 11], "eligibility": "primary", "modality": "angle_deg"},
-    "SHOULDER_SHRUG_Y": {
+    "SHOULDER_Y": {
         "type": "absolute_y_position",
         "landmarks": [5, 6, 11, 12],
         "sample_landmarks": [5, 6],
@@ -169,11 +169,8 @@ def angle_keys_compatible(a: Optional[str], b: Optional[str]) -> bool:
 
 
 def _angle_selection_thresholds(angle_key: str) -> dict[str, float]:
-    """
-    Per-common-angle gates from env, ``rep_counter.toml`` ``[angle_selection.joints.<KEY>]``,
-    then global defaults (see ``get_angle_selection_joint_thresholds``).
-    """
-    return get_angle_selection_joint_thresholds(angle_key)
+    """Modality gates from ``rep_counter.toml`` (``angle_deg`` / ``vertical_px``), then globals."""
+    return get_angle_selection_modality_thresholds(signal_unit=angle_signal_unit(angle_key))
 
 
 def _variance_eligibility(angle_key: str, data: dict[str, Any]) -> tuple[bool, float]:

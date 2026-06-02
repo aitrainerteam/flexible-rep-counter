@@ -483,8 +483,8 @@ def test_full_reeval_when_raw_stale_even_if_range_healthy() -> None:
     assert should_run is True
 
 
-def test_post_lock_skips_full_reeval_even_when_incumbent_cannot_count() -> None:
-    """Before post_lock raw reps, skip full re-eval until the warmup threshold is met."""
+def test_post_lock_warmup_allows_full_reeval_when_incumbent_is_bad() -> None:
+    """Before post_lock threshold, bad incumbent health should still trigger full re-eval."""
     should_run = should_run_full_recalibration(
         has_pending_switch=False,
         has_handoff_observation=False,
@@ -498,6 +498,24 @@ def test_post_lock_skips_full_reeval_even_when_incumbent_cannot_count() -> None:
         stale_switch_max_selected_recent_range_deg=14.0,
         stale_switch_min_closed_streak=10,
         selected_score=0.55,
+    )
+    assert should_run is True
+
+
+def test_post_lock_warmup_still_skips_full_reeval_when_incumbent_is_healthy() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=2,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=False,
+        selected_recent_range=34.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.70,
     )
     assert should_run is False
 
@@ -793,3 +811,59 @@ def test_alternate_limb_uses_observation_start_not_pending_start() -> None:
     )
     assert shown == 19
     assert raw == 19
+
+
+def test_fallback_y_switch_credits_epoch_reps_not_zero_carry() -> None:
+    from flexible_rep_counter.session import _activate_joint_switch
+
+    run_state: dict[str, Any] = {
+        "selected_angle": "RIGHT_ELBOW",
+        "fallback_epoch_raw": {"SHOULDER_Y": 6},
+        "pending_switch_candidate_carryover_start_raw": 6,
+        "pending_switch_candidate_carryover_start_shown": 6,
+        "tracking_step_count": 0,
+        "suppress_retroactive_credit_until_step": 0,
+        "last_joint_switch_step": 0,
+        "rep_count_shown_floor": 0,
+    }
+    det = _ScriptedDetector([10] * 5, rolling_range_deg=20.0)
+    sdba: dict[str, Any] = {"SHOULDER_Y": det}
+    _activate_joint_switch(
+        run_state,
+        sdba,
+        new_angle="SHOULDER_Y",
+        detector=det,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        switched_at=0.0,
+    )
+    assert int(run_state["rep_count_offset"]) == 4
+    assert int(run_state["rep_count_offset"]) + det.get_rep_count() == 14
+
+
+def test_fallback_y_switch_credits_epoch_reps_not_zero_carry() -> None:
+    from flexible_rep_counter.session import _activate_joint_switch
+
+    run_state: dict[str, Any] = {
+        "selected_angle": "RIGHT_ELBOW",
+        "fallback_epoch_raw": {"SHOULDER_Y": 6},
+        "pending_switch_candidate_carryover_start_raw": 6,
+        "pending_switch_candidate_carryover_start_shown": 6,
+        "tracking_step_count": 0,
+        "suppress_retroactive_credit_until_step": 0,
+        "last_joint_switch_step": 0,
+        "rep_count_shown_floor": 0,
+    }
+    det = _ScriptedDetector([10] * 5, rolling_range_deg=20.0)
+    sdba: dict[str, Any] = {"SHOULDER_Y": det}
+    _activate_joint_switch(
+        run_state,
+        sdba,
+        new_angle="SHOULDER_Y",
+        detector=det,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        switched_at=0.0,
+    )
+    assert int(run_state["rep_count_offset"]) == 4
+    assert int(run_state["rep_count_offset"]) + det.get_rep_count() == 14

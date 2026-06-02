@@ -62,12 +62,16 @@ from flexible_rep_counter.core.settings import (
     FALLBACK_Y_LOW_SCORE_THRESHOLD as CFG_FALLBACK_Y_LOW_SCORE_THRESHOLD,
     FALLBACK_Y_MIN_ACTIVITY_SCORE as CFG_FALLBACK_Y_MIN_ACTIVITY_SCORE,
     FALLBACK_Y_MIN_COMPLETED_CYCLES as CFG_FALLBACK_Y_MIN_COMPLETED_CYCLES,
+    FALLBACK_Y_MIN_EVIDENCE_RANGE_PX as CFG_FALLBACK_Y_MIN_EVIDENCE_RANGE_PX,
+    FALLBACK_Y_MIN_CADENCE_SCORE as CFG_FALLBACK_Y_MIN_CADENCE_SCORE,
+    FALLBACK_Y_REQUIRE_BASELINE as CFG_FALLBACK_Y_REQUIRE_BASELINE,
+    FALLBACK_Y_STREAK_DECAY_GRACE_SEC as CFG_FALLBACK_Y_STREAK_DECAY_GRACE_SEC,
     FALLBACK_Y_MIN_EXTREMA_SCORE as CFG_FALLBACK_Y_MIN_EXTREMA_SCORE,
     FALLBACK_Y_MIN_POSE_SCORE as CFG_FALLBACK_Y_MIN_POSE_SCORE,
     FALLBACK_Y_MIN_ROM_SCORE as CFG_FALLBACK_Y_MIN_ROM_SCORE,
     FALLBACK_Y_PRIMARY_RECOVERY_SCORE as CFG_FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
     get_default_tuning_params,
-    get_rep_joint_tuning_overrides,
+    get_rep_modality_tuning_overrides,
     LOW_FPS_ENTER_P50_MS as CFG_LOW_FPS_ENTER_P50_MS,
     LOW_FPS_ENTER_P90_MS as CFG_LOW_FPS_ENTER_P90_MS,
     LOW_FPS_ENTER_STREAK_FRAMES as CFG_LOW_FPS_ENTER_STREAK_FRAMES,
@@ -81,6 +85,7 @@ from flexible_rep_counter.core.settings import (
 from flexible_rep_counter.core.variance_angle_selector import (
     COMMON_ANGLES,
     FRAME_MIN_CONFIDENCE,
+    angle_signal_unit,
     compute_angle_variances_from_buffer,
     determine_best_angle,
     dominance_conditions_met,
@@ -145,6 +150,11 @@ FALLBACK_Y_MIN_POSE_SCORE = float(CFG_FALLBACK_Y_MIN_POSE_SCORE)
 FALLBACK_Y_MIN_ROM_SCORE = float(CFG_FALLBACK_Y_MIN_ROM_SCORE)
 FALLBACK_Y_MIN_EXTREMA_SCORE = float(CFG_FALLBACK_Y_MIN_EXTREMA_SCORE)
 FALLBACK_Y_MIN_COMPLETED_CYCLES = max(1, int(CFG_FALLBACK_Y_MIN_COMPLETED_CYCLES))
+FALLBACK_Y_MIN_CADENCE_SCORE = float(CFG_FALLBACK_Y_MIN_CADENCE_SCORE)
+FALLBACK_Y_MIN_EVIDENCE_RANGE_PX = float(CFG_FALLBACK_Y_MIN_EVIDENCE_RANGE_PX)
+FALLBACK_Y_REQUIRE_BASELINE = bool(CFG_FALLBACK_Y_REQUIRE_BASELINE)
+FALLBACK_Y_STREAK_DECAY_GRACE_SEC = max(0.0, float(CFG_FALLBACK_Y_STREAK_DECAY_GRACE_SEC))
+_FALLBACK_TIEBREAK_SCORE_RATIO = 1.05
 def _diagnose_missing_angle(
     cfg: dict[str, Any], landmarks: list[dict]
 ) -> tuple[str, dict[str, Any]]:
@@ -175,7 +185,7 @@ def _peak_detector_from_tuning(
     d = DEFAULT_TUNING_PARAMS
     tp = {**DEFAULT_TUNING_PARAMS, **(tuning_params or {})}
     if angle_key:
-        tp.update(get_rep_joint_tuning_overrides(angle_key))
+        tp.update(get_rep_modality_tuning_overrides(signal_unit=angle_signal_unit(angle_key)))
     return create_peak_detector(
         smoothing_factor=float(tp.get("smoothingFactor", d["smoothingFactor"])),
         hysteresis=float(tp.get("hysteresis", d["hysteresis"])),
@@ -232,6 +242,24 @@ def _reset_fallback_streak(run_state: dict[str, Any]) -> None:
     run_state["fallback_bad_streak_started_at"] = None
     run_state["fallback_bad_streak_paused_total_s"] = 0.0
     run_state["fallback_bad_streak_pause_anchor"] = None
+    run_state["fallback_bad_streak_accumulated_s"] = 0.0
+    run_state["fallback_bad_streak_last_update_s"] = None
+    run_state["fallback_epoch_raw"] = {}
+
+
+def _snapshot_fallback_epoch_raw(run_state: dict[str, Any]) -> None:
+    sdba = run_state.get("selection_detectors_by_angle") or {}
+    epoch: dict[str, int] = {}
+    for angle_key in COMMON_ANGLES:
+        if not is_fallback_angle(angle_key):
+            continue
+        epoch[angle_key] = _detector_raw_count(sdba.get(angle_key))
+    run_state["fallback_epoch_raw"] = epoch
+
+
+def _fallback_epoch_raw_for_joint(run_state: dict[str, Any], angle_key: str) -> int:
+    epoch = run_state.get("fallback_epoch_raw") or {}
+    return int(epoch.get(angle_key, 0))
 
 
 def _update_fallback_bad_streak(
@@ -241,27 +269,40 @@ def _update_fallback_bad_streak(
     conditions_met: bool,
     paused: bool,
 ) -> float:
-    if not conditions_met:
-        _reset_fallback_streak(run_state)
-        return 0.0
-    started = run_state.get("fallback_bad_streak_started_at")
-    if not isinstance(started, (int, float)):
-        started = now_s
-        run_state["fallback_bad_streak_started_at"] = started
-    paused_total = float(run_state.get("fallback_bad_streak_paused_total_s") or 0.0)
-    pause_anchor = run_state.get("fallback_bad_streak_pause_anchor")
+    accumulated = float(run_state.get("fallback_bad_streak_accumulated_s") or 0.0)
+    last_update = run_state.get("fallback_bad_streak_last_update_s")
+    if not isinstance(last_update, (int, float)):
+        last_update = now_s
+        run_state["fallback_bad_streak_last_update_s"] = now_s
+    dt = max(0.0, now_s - float(last_update))
+    run_state["fallback_bad_streak_last_update_s"] = now_s
+
     if paused:
-        if not isinstance(pause_anchor, (int, float)):
+        if not isinstance(run_state.get("fallback_bad_streak_pause_anchor"), (int, float)):
             run_state["fallback_bad_streak_pause_anchor"] = now_s
-            pause_anchor = now_s
-    elif isinstance(pause_anchor, (int, float)):
-        paused_total += max(0.0, now_s - float(pause_anchor))
-        run_state["fallback_bad_streak_paused_total_s"] = paused_total
+        return accumulated
+
+    pause_anchor = run_state.get("fallback_bad_streak_pause_anchor")
+    if isinstance(pause_anchor, (int, float)):
         run_state["fallback_bad_streak_pause_anchor"] = None
-        pause_anchor = None
-    live_pause = max(0.0, now_s - float(pause_anchor)) if isinstance(pause_anchor, (int, float)) else 0.0
-    effective_elapsed = max(0.0, now_s - float(started) - paused_total - live_pause)
-    return effective_elapsed
+
+    if conditions_met:
+        if accumulated <= 0.0 and dt > 0.0:
+            _snapshot_fallback_epoch_raw(run_state)
+            run_state["fallback_bad_streak_started_at"] = now_s
+        accumulated += dt
+        run_state["fallback_bad_streak_accumulated_s"] = accumulated
+        return accumulated
+
+    decay_rate = 1.0
+    if FALLBACK_Y_STREAK_DECAY_GRACE_SEC > 0.0:
+        decay_rate = accumulated / FALLBACK_Y_STREAK_DECAY_GRACE_SEC if accumulated > 0.0 else 0.0
+        decay_rate = max(decay_rate, 1.0)
+    accumulated = max(0.0, accumulated - dt * decay_rate)
+    run_state["fallback_bad_streak_accumulated_s"] = accumulated
+    if accumulated <= 0.0:
+        _reset_fallback_streak(run_state)
+    return accumulated
 
 
 def _fallback_incumbent_low_score_now(
@@ -312,18 +353,39 @@ def _fallback_instr_payload(
     return payload
 
 
-def _shoulder_motion_instr_payload(landmarks: Optional[list[dict]]) -> dict[str, Any]:
-    """Shoulder/hip Y and SHOULDER_SHRUG_Y signal for VM NDJSON (px + normalized units)."""
+def _fallback_scale_kind(angle_key: str) -> str:
+    cfg = COMMON_ANGLES.get(angle_key) or {}
+    scale = cfg.get("scale")
+    if isinstance(scale, dict):
+        return str(scale.get("kind") or "").strip().lower()
+    return ""
+
+
+def _vertical_px_instr_payload(
+    landmarks: Optional[list[dict]],
+    *,
+    tracked_joint: Optional[str] = None,
+) -> dict[str, Any]:
+    """Vertical displacement debug fields for VM NDJSON (modality-based, not exercise-specific)."""
     if not landmarks or len(landmarks) < 13:
         return {}
-    cfg = COMMON_ANGLES["SHOULDER_SHRUG_Y"]
+    angle_key = tracked_joint if isinstance(tracked_joint, str) else None
+    if not angle_key or not is_fallback_angle(angle_key):
+        angle_key = None
+        for key, cfg in COMMON_ANGLES.items():
+            if is_fallback_angle(key) and str(cfg.get("type") or "") == "absolute_y_position":
+                angle_key = key
+                break
+    if not angle_key:
+        return {}
+    cfg = COMMON_ANGLES[angle_key]
     min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
     shoulder_y = _mean_y_for_indices(landmarks, [5, 6], min_conf=min_conf)
     hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
     left_x = _mean_x_for_indices(landmarks, [5], min_conf=min_conf)
     right_x = _mean_x_for_indices(landmarks, [6], min_conf=min_conf)
-    shrug_signal = calculate_from_type(cfg["type"], cfg, landmarks)
-    payload: dict[str, Any] = {}
+    y_signal = calculate_from_type(cfg["type"], cfg, landmarks)
+    payload: dict[str, Any] = {"signal_unit": "px", "y_displacement_joint": angle_key}
     if shoulder_y is not None:
         payload["shoulder_y_px"] = float(shoulder_y)
     if hip_y is not None:
@@ -332,9 +394,43 @@ def _shoulder_motion_instr_payload(landmarks: Optional[list[dict]]) -> dict[str,
         payload["shoulder_width_px"] = float(abs(right_x - left_x))
     if shoulder_y is not None and hip_y is not None:
         payload["shoulder_hip_dy_px"] = float(shoulder_y - hip_y)
-    if shrug_signal is not None:
-        payload["shrug_y_signal"] = float(shrug_signal)
+    if y_signal is not None:
+        payload["y_displacement_signal"] = float(y_signal)
     return payload
+
+
+def _is_y_displacement_ready(
+    state: JointMotionState,
+    debug: dict[str, Any],
+    variances: dict[str, dict[str, Any]],
+    *,
+    angle_key: str,
+) -> bool:
+    if not bool(debug.get("observable")):
+        return False
+    if FALLBACK_Y_REQUIRE_BASELINE and state.absolute_y_baseline_px is None:
+        return False
+    if not passes_consistent_variance_gate(variances, angle_key, fallback_armed=True):
+        return False
+    if float(debug.get("cadenceScore") or 0.0) < FALLBACK_Y_MIN_CADENCE_SCORE:
+        return False
+    recent_range = float(debug.get("recentRangePx") or debug.get("recentRange") or 0.0)
+    if float(debug.get("activityScore") or 0.0) < FALLBACK_Y_MIN_ACTIVITY_SCORE:
+        return False
+    if recent_range < FALLBACK_Y_MIN_EVIDENCE_RANGE_PX:
+        return False
+    if float(debug.get("extremaScore") or 0.0) < FALLBACK_Y_MIN_EXTREMA_SCORE:
+        return False
+    return True
+
+
+def _fallback_joint_tiebreak_rank(angle_key: str) -> int:
+    kind = _fallback_scale_kind(angle_key)
+    if kind in {"shoulder_width", "hip_width"}:
+        return 2
+    if kind == "torso_height":
+        return 1
+    return 0
 
 
 def _is_fallback_candidate_ready(
@@ -342,26 +438,45 @@ def _is_fallback_candidate_ready(
     debug: dict[str, Any],
     *,
     min_completed_cycles: Optional[int] = None,
+    angle_key: Optional[str] = None,
+    state: Optional[JointMotionState] = None,
+    variances: Optional[dict[str, dict[str, Any]]] = None,
 ) -> bool:
     cycles_required = (
         int(min_completed_cycles)
         if min_completed_cycles is not None
         else int(FALLBACK_Y_MIN_COMPLETED_CYCLES)
     )
-    return bool(
+    if not bool(
         score >= FALLBACK_Y_ARMING_MIN_SCORE
         and float(debug.get("activityScore") or 0.0) >= FALLBACK_Y_MIN_ACTIVITY_SCORE
         and float(debug.get("poseScore") or 0.0) >= FALLBACK_Y_MIN_POSE_SCORE
         and float(debug.get("romScore") or 0.0) >= FALLBACK_Y_MIN_ROM_SCORE
         and float(debug.get("extremaScore") or 0.0) >= FALLBACK_Y_MIN_EXTREMA_SCORE
         and int(debug.get("completedCycles") or 0) >= cycles_required
-    )
+    ):
+        return False
+    if variances is not None:
+        if not bool(debug.get("observable")):
+            return False
+        if float(debug.get("cadenceScore") or 0.0) < FALLBACK_Y_MIN_CADENCE_SCORE:
+            return False
+    if (
+        isinstance(angle_key, str)
+        and state is not None
+        and variances is not None
+        and not _is_y_displacement_ready(state, debug, variances, angle_key=angle_key)
+    ):
+        return False
+    return True
 
 
 def _best_fallback_candidate(
     score_by_joint: dict[str, tuple[float, dict[str, Any]]],
     *,
     min_completed_cycles: Optional[int] = None,
+    joint_states: Optional[dict[str, JointMotionState]] = None,
+    variances: Optional[dict[str, dict[str, Any]]] = None,
 ) -> tuple[Optional[str], float, dict[str, Any]]:
     best_key: Optional[str] = None
     best_score = -1.0
@@ -369,18 +484,89 @@ def _best_fallback_candidate(
     for angle_key, (score, debug) in score_by_joint.items():
         if not is_fallback_angle(angle_key):
             continue
-        if (
-            _is_fallback_candidate_ready(
-                float(score),
-                debug,
-                min_completed_cycles=min_completed_cycles,
-            )
-            and float(score) > best_score
+        state = joint_states.get(angle_key) if joint_states is not None else None
+        if not _is_fallback_candidate_ready(
+            float(score),
+            debug,
+            min_completed_cycles=min_completed_cycles,
+            angle_key=angle_key,
+            state=state,
+            variances=variances,
         ):
+            continue
+        candidate_score = float(score)
+        if best_key is None:
             best_key = angle_key
-            best_score = float(score)
+            best_score = candidate_score
             best_debug = debug
+            continue
+        if candidate_score > best_score * _FALLBACK_TIEBREAK_SCORE_RATIO:
+            best_key = angle_key
+            best_score = candidate_score
+            best_debug = debug
+        elif candidate_score >= best_score / _FALLBACK_TIEBREAK_SCORE_RATIO:
+            if _fallback_joint_tiebreak_rank(angle_key) > _fallback_joint_tiebreak_rank(best_key):
+                best_key = angle_key
+                best_score = candidate_score
+                best_debug = debug
     return best_key, best_score, best_debug
+
+
+def _any_primary_passes_variance_gate(variances: dict[str, dict[str, Any]]) -> bool:
+    for angle_key in COMMON_ANGLES:
+        if is_fallback_angle(angle_key):
+            continue
+        if passes_consistent_variance_gate(variances, angle_key, fallback_armed=False):
+            return True
+    return False
+
+
+def _fallback_rep_evidence_ready(
+    fb_key: str,
+    rep_counts: dict[str, int],
+    cal_reps_target: int,
+) -> bool:
+    raw_count = int(rep_counts.get(fb_key) or 0)
+    if raw_count >= cal_reps_target:
+        return True
+    fallback_reps = {k: int(v) for k, v in rep_counts.items() if is_fallback_angle(k)}
+    rep_dom = summarize_rep_dominance(fallback_reps)
+    return (
+        rep_dom.get("leaderKey") == fb_key
+        and int(rep_dom.get("leaderReps") or 0) >= cal_reps_target
+    )
+
+
+def _try_immediate_fallback_arm(
+    *,
+    score_by_joint: dict[str, tuple[float, dict[str, Any]]],
+    variances: dict[str, dict[str, Any]],
+    joint_states: dict[str, JointMotionState],
+    rep_counts_all: dict[str, int],
+    cal_reps_target: int,
+    best_primary_score: float,
+) -> bool:
+    if _any_primary_passes_variance_gate(variances):
+        return False
+    if float(best_primary_score) >= FALLBACK_Y_LOW_SCORE_THRESHOLD:
+        return False
+    fb_key, _, _ = _best_fallback_candidate(
+        score_by_joint,
+        min_completed_cycles=2,
+        joint_states=joint_states,
+        variances=variances,
+    )
+    if fb_key is None:
+        return False
+    return _fallback_rep_evidence_ready(fb_key, rep_counts_all, cal_reps_target)
+
+
+def _try_fast_fallback_arm(*, fb_key: Optional[str], fallback_elapsed: float) -> bool:
+    return bool(
+        fb_key is not None
+        and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
+        and FALLBACK_Y_ARM_WINDOW_SEC > 0.0
+    )
 
 
 def _has_primary_recovery_candidate(
@@ -654,9 +840,18 @@ def _apply_locked_tracking(
         if angle_seed == angle_seed:
             det.update(angle_seed)
     run_state["peak_detector"] = det
-    run_state["rep_count_offset"] = 0
-    run_state["rep_count_raw_offset"] = 0
-    run_state["tracking_raw_at_joint_lock"] = 0
+    if is_fallback_angle(selected_angle) and selection_detector is not None:
+        _trim_incomplete_extremum(selection_detector)
+        selection_raw = _detector_raw_count(selection_detector)
+        epoch_raw = _fallback_epoch_raw_for_joint(run_state, selected_angle)
+        retro_raw = max(0, selection_raw - epoch_raw)
+        run_state["rep_count_offset"] = retro_raw
+        run_state["rep_count_raw_offset"] = retro_raw
+        run_state["tracking_raw_at_joint_lock"] = 0
+    else:
+        run_state["rep_count_offset"] = 0
+        run_state["rep_count_raw_offset"] = 0
+        run_state["tracking_raw_at_joint_lock"] = 0
     _clear_pending_switch(run_state)
     run_state["selection_dominance_key"] = None
     run_state["selection_dominance_streak"] = 0
@@ -1088,36 +1283,43 @@ def _activate_joint_switch(
     candidate_delta_shown = max(0, candidate_current_raw - carryover_start_raw)
     candidate_delta_raw = max(0, candidate_current_raw - carryover_start_raw)
     rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
-    if decision.kind == "alternate_limb" and LOW_FPS_SAFE_MODE_ENABLED and bool(
-        run_state.get("low_fps_mode_active")
-    ):
-        decision = HandoffDecision(
-            kind="same_exercise",
-            rationale={
-                **rationale,
-                "low_fps_safeguard": True,
-                "original_kind": "alternate_limb",
-            },
-        )
-        rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
-    if decision.kind == "alternate_limb" and rationale.get("rule") in (
-        "forced_switch_mirrored_candidate_ready_or_delta",
-        "mirrored_incumbent_stopped",
-    ) and (
-        bool(rationale.get("candidateReadyAtStart"))
-        or rationale.get("rule") == "mirrored_incumbent_stopped"
-    ):
-        # When the mirrored candidate was already ready before pending observation
-        # started, or the incumbent stopped on a mirrored limb switch, count the
-        # candidate's full calibrated reps as alternate exercise carryover.
-        candidate_delta_shown = max(0, candidate_current_raw)
-        candidate_delta_raw = max(0, candidate_current_raw)
-    if decision.kind == "alternate_limb":
+    if is_fallback_angle(new_angle):
+        epoch_raw = _fallback_epoch_raw_for_joint(run_state, new_angle)
+        candidate_delta_shown = max(0, candidate_current_raw - epoch_raw)
+        candidate_delta_raw = max(0, candidate_current_raw - epoch_raw)
         target_display_shown = cumulative_shown + candidate_delta_shown
         target_display_raw = cumulative_raw + candidate_delta_raw
     else:
-        target_display_shown = cumulative_shown
-        target_display_raw = cumulative_raw
+        if decision.kind == "alternate_limb" and LOW_FPS_SAFE_MODE_ENABLED and bool(
+            run_state.get("low_fps_mode_active")
+        ):
+            decision = HandoffDecision(
+                kind="same_exercise",
+                rationale={
+                    **rationale,
+                    "low_fps_safeguard": True,
+                    "original_kind": "alternate_limb",
+                },
+            )
+            rationale = decision.rationale if isinstance(decision.rationale, dict) else {}
+        if decision.kind == "alternate_limb" and rationale.get("rule") in (
+            "forced_switch_mirrored_candidate_ready_or_delta",
+            "mirrored_incumbent_stopped",
+        ) and (
+            bool(rationale.get("candidateReadyAtStart"))
+            or rationale.get("rule") == "mirrored_incumbent_stopped"
+        ):
+            # When the mirrored candidate was already ready before pending observation
+            # started, or the incumbent stopped on a mirrored limb switch, count the
+            # candidate's full calibrated reps as alternate exercise carryover.
+            candidate_delta_shown = max(0, candidate_current_raw)
+            candidate_delta_raw = max(0, candidate_current_raw)
+        if decision.kind == "alternate_limb":
+            target_display_shown = cumulative_shown + candidate_delta_shown
+            target_display_raw = cumulative_raw + candidate_delta_raw
+        else:
+            target_display_shown = cumulative_shown
+            target_display_raw = cumulative_raw
 
     # Handoff must never reduce the displayed count, with or without carryover.
     target_display_shown = max(target_display_shown, cumulative_shown)
@@ -1129,7 +1331,7 @@ def _activate_joint_switch(
     after_activation_shown = candidate_current_raw + int(run_state["rep_count_offset"])
     assert after_activation_shown == target_display_shown
     assert after_activation_shown >= before_activation_shown
-    if decision.kind in ("same_exercise", "ambiguous"):
+    if decision.kind in ("same_exercise", "ambiguous") and not is_fallback_angle(new_angle):
         assert after_activation_shown == cumulative_shown
 
     run_state["pending_switch_handoff_kind"] = decision.kind
@@ -1347,6 +1549,9 @@ class RepCounterSession:
             "fallback_bad_streak_started_at": None,
             "fallback_bad_streak_paused_total_s": 0.0,
             "fallback_bad_streak_pause_anchor": None,
+            "fallback_bad_streak_accumulated_s": 0.0,
+            "fallback_bad_streak_last_update_s": None,
+            "fallback_epoch_raw": {},
             "depth_recal_state": "idle",
             "depth_recal_last_trigger_s": None,
             "depth_recal_last_scale_ratio": None,
@@ -1400,9 +1605,7 @@ class RepCounterSession:
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
         self._run_state["fallback_armed"] = False
-        self._run_state["fallback_bad_streak_started_at"] = None
-        self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
-        self._run_state["fallback_bad_streak_pause_anchor"] = None
+        _reset_fallback_streak(self._run_state)
         self._run_state["depth_recal_state"] = "idle"
         self._run_state["depth_recal_last_trigger_s"] = None
         self._run_state["depth_recal_last_scale_ratio"] = None
@@ -1453,9 +1656,7 @@ class RepCounterSession:
         self._run_state["selection_last_reevaluate_at"] = None
         self._run_state["selection_last_switch_at"] = None
         self._run_state["fallback_armed"] = False
-        self._run_state["fallback_bad_streak_started_at"] = None
-        self._run_state["fallback_bad_streak_paused_total_s"] = 0.0
-        self._run_state["fallback_bad_streak_pause_anchor"] = None
+        _reset_fallback_streak(self._run_state)
         self._run_state["depth_recal_state"] = "idle"
         self._run_state["depth_recal_last_trigger_s"] = None
         self._run_state["depth_recal_last_scale_ratio"] = None
@@ -1823,7 +2024,10 @@ class RepCounterSession:
                 "depth_recal_state": self._run_state.get("depth_recal_state"),
                 "depth_recal_scale_ratio": self._run_state.get("depth_recal_last_scale_ratio"),
                 **(self._run_state.get("fallback_instr") or {}),
-                **_shoulder_motion_instr_payload(self._last_smoothed_landmarks),
+                **_vertical_px_instr_payload(
+                    self._last_smoothed_landmarks,
+                    tracked_joint=out.tracked_joint,
+                ),
             },
         )
 
@@ -2049,15 +2253,29 @@ class RepCounterSession:
                     rs["fallback_armed"] = False
                     _reset_fallback_streak(rs)
             else:
-                fb_key, _, _ = _best_fallback_candidate(
-                    score_by_joint_all,
+                rep_counts_all = {ak: int(v) for ak, v in rep_counts_sel.items()}
+                immediate_arm = (
+                    rs.get("selected_angle") is None
+                    and elapsed >= ANGLE_SELECTION_MIN_SEC
+                    and _try_immediate_fallback_arm(
+                        score_by_joint=score_by_joint_all,
+                        variances=variances,
+                        joint_states=joint_states,
+                        rep_counts_all=rep_counts_all,
+                        cal_reps_target=cal_reps_target,
+                        best_primary_score=best_primary_selection_score,
+                    )
                 )
-                if (
-                    fb_key is not None
-                    and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
-                    and FALLBACK_Y_ARM_WINDOW_SEC > 0.0
-                ):
+                if immediate_arm:
                     rs["fallback_armed"] = True
+                else:
+                    fb_key, _, _ = _best_fallback_candidate(
+                        score_by_joint_all,
+                        joint_states=joint_states,
+                        variances=variances_all,
+                    )
+                    if _try_fast_fallback_arm(fb_key=fb_key, fallback_elapsed=fallback_elapsed):
+                        rs["fallback_armed"] = True
 
             fallback_armed = bool(rs.get("fallback_armed"))
             rs["fallback_instr"] = _fallback_instr_payload(
@@ -2566,7 +2784,7 @@ class RepCounterSession:
             elif active_detector is not None:
                 pre_calibrate_active = not _is_detector_calibrated(active_detector)
             # Do not pause the bad streak while ROM is too low to ever open the range gate
-            # (e.g. shrugs on a locked across-shoulder angle stuck at 0 calibration reps).
+            # (e.g. vertical motion on a locked across-shoulder angle stuck at 0 calibration reps).
             fallback_streak_paused = bool(pre_calibrate_active and not low_score_now)
             fallback_min_cycles: Optional[int] = None
             if low_score_now and cumulative_shown <= 0:
@@ -2586,12 +2804,10 @@ class RepCounterSession:
                 fb_key, _, _ = _best_fallback_candidate(
                     score_by_joint,
                     min_completed_cycles=fallback_min_cycles,
+                    joint_states=joint_states,
+                    variances=variances,
                 )
-                if (
-                    fb_key is not None
-                    and fallback_elapsed >= FALLBACK_Y_ARM_WINDOW_SEC
-                    and FALLBACK_Y_ARM_WINDOW_SEC > 0.0
-                ):
+                if _try_fast_fallback_arm(fb_key=fb_key, fallback_elapsed=fallback_elapsed):
                     rs["fallback_armed"] = True
                     fallback_armed = True
             rs["fallback_instr"] = _fallback_instr_payload(
@@ -2816,8 +3032,13 @@ class RepCounterSession:
                             int(obs_ts) if isinstance(obs_ts, int) else int(ts)
                         )
                     else:
-                        rs["pending_switch_candidate_carryover_start_shown"] = cand_raw
-                        rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
+                        if is_fallback_angle(candidate):
+                            epoch_raw = _fallback_epoch_raw_for_joint(rs, candidate)
+                            rs["pending_switch_candidate_carryover_start_shown"] = epoch_raw
+                            rs["pending_switch_candidate_carryover_start_raw"] = epoch_raw
+                        else:
+                            rs["pending_switch_candidate_carryover_start_shown"] = cand_raw
+                            rs["pending_switch_candidate_carryover_start_raw"] = cand_raw
                         rs["pending_switch_candidate_carryover_start_ts"] = int(ts)
                     now_ms = int(ts)
                     inc_cycles_4s = [
