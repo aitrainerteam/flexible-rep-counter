@@ -88,6 +88,7 @@ from flexible_rep_counter.core.settings import (
     LOW_FPS_EXIT_STREAK_FRAMES as CFG_LOW_FPS_EXIT_STREAK_FRAMES,
     LOW_FPS_INTERVAL_WINDOW_FRAMES as CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES,
     LOW_FPS_MIN_SAMPLES as CFG_LOW_FPS_MIN_SAMPLES,
+    LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY as CFG_LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY,
     LOW_FPS_SAFE_MODE_ENABLED as CFG_LOW_FPS_SAFE_MODE_ENABLED,
 )
 from flexible_rep_counter.core.variance_angle_selector import (
@@ -109,7 +110,7 @@ DEFAULT_TUNING_PARAMS = get_default_tuning_params()
 _MIN_KEYPOINT_CONF_FOR_ANGLE = 0.3
 # Temporary kill-switch: disable runtime variance-based joint recalibration/switching,
 # pending handoff observation, and classify_handoff carryover.
-# Also paused automatically while low-FPS safe mode is active (see _dynamic_recalibration_active).
+# Limited while low-FPS safe mode is active: one switch per entry by default (see _dynamic_recalibration_active).
 # Keep reevaluation code in place so it can be re-enabled later by flipping this.
 DYNAMIC_RECALIBRATION_ENABLED = True
 STALE_SWITCH_SELECTED_RECENT_WINDOW = 16
@@ -151,6 +152,9 @@ LOW_FPS_EXIT_P50_MS = float(CFG_LOW_FPS_EXIT_P50_MS)
 LOW_FPS_EXIT_P90_MS = float(CFG_LOW_FPS_EXIT_P90_MS)
 LOW_FPS_ENTER_STREAK = max(1, int(CFG_LOW_FPS_ENTER_STREAK_FRAMES))
 LOW_FPS_EXIT_STREAK = max(1, int(CFG_LOW_FPS_EXIT_STREAK_FRAMES))
+LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY = max(
+    0, int(CFG_LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY)
+)
 LOW_FPS_GAP_SPIKE_MS = 200.0
 JOINT_SWITCH_SUPPRESS_RETROACTIVE_STEPS = 45
 REFERENCE_FPS_FOR_PEAK_DISTANCE = 12.0
@@ -1358,11 +1362,27 @@ def _clear_handoff_observation(run_state: dict[str, Any]) -> None:
     run_state["handoff_observation_candidate_carryover_start_ts"] = 0
 
 
+def _low_fps_recalibration_attempts_remaining(run_state: dict[str, Any]) -> int:
+    return max(0, int(run_state.get("low_fps_recalibration_attempt_remaining") or 0))
+
+
+def _grant_low_fps_recalibration_attempt(run_state: dict[str, Any]) -> None:
+    if LOW_FPS_SAFE_MODE_ENABLED and LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY > 0:
+        run_state["low_fps_recalibration_attempt_remaining"] = (
+            LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY
+        )
+
+
+def _consume_low_fps_recalibration_attempt(run_state: dict[str, Any]) -> None:
+    if bool(run_state.get("low_fps_mode_active")):
+        run_state["low_fps_recalibration_attempt_remaining"] = 0
+
+
 def _dynamic_recalibration_active(run_state: dict[str, Any]) -> bool:
     if not DYNAMIC_RECALIBRATION_ENABLED:
         return False
     if LOW_FPS_SAFE_MODE_ENABLED and bool(run_state.get("low_fps_mode_active")):
-        return False
+        return _low_fps_recalibration_attempts_remaining(run_state) > 0
     if bool(run_state.get("depth_recal_observing")):
         return False
     return True
@@ -1373,6 +1393,7 @@ def _suspend_recalibration_for_low_fps(run_state: dict[str, Any]) -> None:
         return
     if not bool(run_state.get("low_fps_mode_active")):
         return
+    _grant_low_fps_recalibration_attempt(run_state)
     if (
         run_state.get("pending_switch_angle") is not None
         or run_state.get("handoff_observation_candidate_angle") is not None
@@ -1580,6 +1601,7 @@ def _activate_joint_switch(
     run_state["selection_last_switch_at"] = switched_at
     run_state["selection_reps_at_last_recal_switch"] = int(cumulative_shown)
     run_state["tracking_raw_at_joint_lock"] = candidate_current_raw
+    _consume_low_fps_recalibration_attempt(run_state)
     _clear_pending_switch(run_state)
     _clear_handoff_observation(run_state)
     _mark_joint_activation_guard(run_state)
@@ -1809,6 +1831,7 @@ class RepCounterSession:
             "low_fps_p90_ms": None,
             "low_fps_gaps_over_200ms": 0,
             "low_fps_effective_fps": None,
+            "low_fps_recalibration_attempt_remaining": 0,
             "_prev_calibration_complete": None,
         }
         _init_ledger_guard_state(self._run_state)
@@ -1862,6 +1885,7 @@ class RepCounterSession:
         self._run_state["low_fps_p90_ms"] = None
         self._run_state["low_fps_gaps_over_200ms"] = 0
         self._run_state["low_fps_effective_fps"] = None
+        self._run_state["low_fps_recalibration_attempt_remaining"] = 0
         _init_ledger_guard_state(self._run_state)
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)
@@ -1913,6 +1937,7 @@ class RepCounterSession:
         self._run_state["low_fps_p90_ms"] = None
         self._run_state["low_fps_gaps_over_200ms"] = 0
         self._run_state["low_fps_effective_fps"] = None
+        self._run_state["low_fps_recalibration_attempt_remaining"] = 0
         _init_ledger_guard_state(self._run_state)
         self._sync_detector_instrumentation_flags()
         _clear_handoff_observation(self._run_state)

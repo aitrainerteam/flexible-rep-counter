@@ -151,6 +151,8 @@ second_best_ratio = 1.10
 
 [low_fps_safe_mode]
 enabled = true
+# Joint switches allowed per safe-mode entry (alternate-limb carryover still suppressed).
+recalibration_attempts_per_entry = 1
 enter_p50_ms = 75.0
 enter_p90_ms = 200.0
 exit_p50_ms = 67.0

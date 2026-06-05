@@ -285,6 +285,9 @@ LOW_FPS_ENTER_STREAK_FRAMES = _toml_int(
 LOW_FPS_EXIT_STREAK_FRAMES = _toml_int(
     "low_fps_safe_mode", "exit_streak_frames", default=10
 )
+LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY = _toml_int(
+    "low_fps_safe_mode", "recalibration_attempts_per_entry", default=1
+)
 
 
 def _signal_modality_section(signal_unit: str) -> dict[str, Any]:

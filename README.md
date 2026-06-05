@@ -168,7 +168,7 @@ Sections:
 | `[rep.vertical_px]` | Peak-detector overrides for vertical displacement signals (px), not per joint |
 | `[angle_selection]` | Selection window, dominance, `variance_fallback_sec`, global variance/range thresholds (`angle_deg`) |
 | `[angle_selection.vertical_px]` | Selection gates for vertical displacement candidates (`min_variance`, `min_range`, `second_best_ratio`) |
-| `[low_fps_safe_mode]` | Frame-interval thresholds and hysteresis to enable/disable low-FPS-safe handoff behavior |
+| `[low_fps_safe_mode]` | Frame-interval thresholds, hysteresis, and `recalibration_attempts_per_entry` (joint switches allowed per safe-mode entry; alternate-limb carryover still suppressed) |
 
 The root `.env` is loaded for compatibility (e.g. `FLEXIBLE_REP_COUNTER_CONFIG`); tuning keys live in TOML, not duplicate env vars. Response validation for `/predict` is on by default in code; use `--no-validate-response` to disable.
 

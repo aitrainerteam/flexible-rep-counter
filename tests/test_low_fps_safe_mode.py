@@ -16,9 +16,11 @@ from flexible_rep_counter.session import (
     LOW_FPS_ENTER_STREAK,
     LOW_FPS_EXIT_STREAK,
     LOW_FPS_INTERVAL_WINDOW_FRAMES,
+    LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY,
     _activate_joint_switch,
     _clear_pending_switch,
     _dynamic_recalibration_active,
+    _grant_low_fps_recalibration_attempt,
     _suspend_recalibration_for_low_fps,
     _update_low_fps_health,
 )
@@ -181,12 +183,46 @@ def test_alternate_limb_carryover_remains_when_safe_mode_inactive() -> None:
     assert int(run_state["rep_count_offset"]) == 10
 
 
-def test_dynamic_recalibration_is_inactive_during_low_fps_safe_mode() -> None:
+def test_dynamic_recalibration_allows_one_attempt_during_low_fps_safe_mode() -> None:
     rs = _new_health_state()
     rs["low_fps_mode_active"] = True
+    rs["low_fps_recalibration_attempt_remaining"] = 0
     assert _dynamic_recalibration_active(rs) is False
+    _grant_low_fps_recalibration_attempt(rs)
+    assert rs["low_fps_recalibration_attempt_remaining"] == LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY
+    assert _dynamic_recalibration_active(rs) is True
     rs["low_fps_mode_active"] = False
     assert _dynamic_recalibration_active(rs) is True
+
+
+def test_low_fps_safe_mode_entry_grants_recalibration_attempt() -> None:
+    rs = _new_health_state()
+    rs["pending_switch_angle"] = "LEFT_ELBOW"
+    rs["low_fps_mode_active"] = True
+    rs["low_fps_mode_changed_pulse"] = True
+    rs["low_fps_recalibration_attempt_remaining"] = 0
+    _suspend_recalibration_for_low_fps(rs)
+    assert rs.get("pending_switch_angle") is None
+    assert rs["low_fps_recalibration_attempt_remaining"] == LOW_FPS_RECALIBRATION_ATTEMPTS_PER_ENTRY
+    assert _dynamic_recalibration_active(rs) is True
+
+
+def test_joint_switch_in_safe_mode_consumes_recalibration_attempt() -> None:
+    detectors: dict[str, Any] = {}
+    detector = _StubDetector(rep_count=2)
+    run_state = _new_pending_run_state(low_fps_mode_active=True)
+    run_state["low_fps_recalibration_attempt_remaining"] = 1
+    _activate_joint_switch(
+        run_state,
+        detectors,
+        new_angle="LEFT_ELBOW",
+        detector=detector,
+        cumulative_shown=3,
+        cumulative_raw=3,
+        switched_at=1.0,
+    )
+    assert run_state["low_fps_recalibration_attempt_remaining"] == 0
+    assert _dynamic_recalibration_active(run_state) is False
 
 
 def test_pending_recalibration_state_is_cleared_when_safe_mode_enters() -> None:
