@@ -67,7 +67,8 @@ reevaluate_every_sec = 0.75
 # After a switch, wait at least this many seconds before allowing another switch. Higher = stabler lock, lower = more reactive.
 switch_min_sec = 1.5
 # Minimum displayed reps on the current joint before another runtime recalibration switch is allowed.
-switch_min_reps = 10
+# Collapsed-ROM recovery bypasses this cooldown (see range_collapse_ratio).
+switch_min_reps = 3
 # Candidate variance must beat current tracked joint by this ratio to switch (unless current fails gate). Higher = stricter switching.
 # switch_variance_ratio = 1.2  # Temporarily disabled along with runtime recalibration/switching.
 # Min median window variance for a joint to qualify. Higher = only very active angles pass; lower = weaker motion can win.
@@ -84,7 +85,11 @@ smooth_window = 5
 [dynamic_recalibration]
 # Skip full runtime re-evaluation until this many raw reps have been counted after
 # a joint lock/switch. Helps avoid early noisy candidate scans.
+# Bypassed when the incumbent ROM has collapsed (see range_collapse_ratio).
 post_lock_min_raw_reps = 5
+# Recent ROM below this fraction of calibrated ROM is treated as collapsed so
+# recalibration can switch joints. Applies to every tracked signal, not a family.
+range_collapse_ratio = 0.50
 # Live tuning (Issue 2 — primary takes leadership from vertical_px fallback):
 # primary_recovery_bypass_rep_cooldown = true
 # primary_recovery_force_after_stale_reevals = 2
@@ -137,9 +142,9 @@ scale_change_pct = 0.18
 baseline_jump_frac = 0.25
 cooldown_sec = 2.0
 observation_reps = 2
+trigger_on_range_collapse = true
 # Live tuning (Issue 1 — react to distance / dead Y signal):
 # scale_change_pct = 0.14
-# trigger_on_range_collapse = true
 # defer_when_primary_recovered = true
 
 # Selection gates by signal modality. Angle joints use [angle_selection] globals above.

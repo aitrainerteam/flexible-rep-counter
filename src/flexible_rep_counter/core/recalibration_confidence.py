@@ -59,6 +59,10 @@ SAME_FAMILY_SCORE_RATIO = 1.35
 CROSS_FAMILY_SCORE_RATIO = 1.45
 CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE = 6.0
 PRIMARY_RECOVERY_SCORE = 0.60
+# Recent ROM below this fraction of calibrated ROM is collapsed (any joint/modality).
+INCUMBENT_RANGE_COLLAPSE_RATIO = 0.50
+# When ROM has collapsed, force a switch after this many stale re-evals instead of 8.
+RANGE_COLLAPSE_FORCE_AFTER_STALE_REEVALS = 2
 
 
 @dataclass
@@ -436,6 +440,23 @@ def compute_joint_recalibration_score(
     return score, debug
 
 
+def incumbent_range_collapsed(
+    *,
+    selected_recent_range: float,
+    stale_switch_max_selected_recent_range_deg: float,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
+) -> bool:
+    """True when live ROM is below the absolute stale floor or a fraction of calibrated ROM."""
+    if selected_recent_range < stale_switch_max_selected_recent_range_deg:
+        return True
+    cal = float(calibrated_rom or 0.0)
+    ratio = float(range_collapse_ratio or 0.0)
+    if cal > 0.0 and ratio > 0.0 and selected_recent_range < cal * ratio:
+        return True
+    return False
+
+
 def compute_incumbent_health(
     *,
     stale_reevals: int,
@@ -445,8 +466,17 @@ def compute_incumbent_health(
     stale_switch_min_closed_streak: int,
     selected_score: float,
     selected_pose_score: float,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> dict[str, Any]:
-    low_range = selected_recent_range < stale_switch_max_selected_recent_range_deg
+    absolute_low = selected_recent_range < stale_switch_max_selected_recent_range_deg
+    low_range = incumbent_range_collapsed(
+        selected_recent_range=selected_recent_range,
+        stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
+    )
+    relative_collapse = bool(low_range and not absolute_low)
     gate_closed = selected_range_gate_closed_streak >= stale_switch_min_closed_streak
     low_score = selected_score < 0.35
     low_pose = selected_pose_score < UNOBSERVABLE_POSE_SCORE
@@ -470,6 +500,7 @@ def compute_incumbent_health(
         "staleThreshold": int(stale_threshold),
         "staleIncumbentBad": bool(stale_incumbent_bad),
         "lowRange": bool(low_range),
+        "relativeRomCollapse": bool(relative_collapse),
         "gateClosed": bool(gate_closed),
         "lowScore": bool(low_score),
         "lowPose": bool(low_pose),
@@ -507,6 +538,8 @@ def should_run_full_recalibration(
     stale_switch_max_selected_recent_range_deg: float,
     stale_switch_min_closed_streak: int,
     selected_score: float = 1.0,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> bool:
     if has_pending_switch or has_handoff_observation:
         return True
@@ -518,6 +551,8 @@ def should_run_full_recalibration(
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
         selected_score=float(selected_score),
         selected_pose_score=selected_pose_score,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
     # Keep post-lock warmup for healthy incumbents, but do not block re-evals when
     # the currently tracked joint is already stale/bad (low ROM, closed range gate,
@@ -544,6 +579,8 @@ def select_recalibration_candidate(
     stale_switch_min_closed_streak: int = 10,
     fallback_armed: bool = False,
     primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> tuple[str | None, dict[str, Any]]:
     variance_by_joint = variance_by_joint or {}
     selected_unit = (
@@ -577,6 +614,8 @@ def select_recalibration_candidate(
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
         selected_score=float(selected_score),
         selected_pose_score=float(selected_debug.get("poseScore") or 0.0),
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
     allow_cross_family = allow_cross_family_rescue(
         incumbent_health=selected_health,
@@ -685,6 +724,8 @@ def should_switch_to_candidate(
     primary_recovery_skip_score_margin: bool = False,
     primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
     incumbent_is_fallback: bool = False,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> tuple[bool, bool, dict[str, Any]]:
     incumbent_health = compute_incumbent_health(
         stale_reevals=stale_reevals,
@@ -694,6 +735,8 @@ def should_switch_to_candidate(
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
         selected_score=selected_score,
         selected_pose_score=selected_pose_score,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
     incumbent_bad = bool(incumbent_health.get("incumbentBad"))
 
@@ -769,6 +812,10 @@ def should_switch_to_candidate(
         and candidate_score >= float(primary_recovery_score)
     ):
         candidate_clearly_better = True
+    # Collapsed live ROM is enough evidence to drop the extra "clearly better"
+    # score margin; any modality/family candidate that is independently good may switch.
+    if incumbent_range_stale and candidate_good:
+        candidate_clearly_better = True
     should_switch = cooldown_ok and incumbent_bad and candidate_good and candidate_clearly_better
 
     force_after = (
@@ -776,6 +823,8 @@ def should_switch_to_candidate(
         if primary_recovery_cross_modality
         else int(stale_switch_force_after_reevals)
     )
+    if incumbent_range_stale:
+        force_after = min(force_after, RANGE_COLLAPSE_FORCE_AFTER_STALE_REEVALS)
     force_switch = (
         stale_reevals >= force_after
         and candidate_score >= FORCE_SWITCH_MIN_SCORE
@@ -794,6 +843,7 @@ def should_switch_to_candidate(
         "candidateRangeVsField": bool(candidate_range_vs_field),
         "candidateRomDominates": bool(candidate_rom_dominates),
         "incumbentRangeStale": bool(incumbent_range_stale),
+        "relativeRomCollapse": bool(incumbent_health.get("relativeRomCollapse")),
         "selectedRomForDominance": float(selected_rom_for_dominance),
         "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),

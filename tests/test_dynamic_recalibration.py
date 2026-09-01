@@ -19,6 +19,7 @@ from flexible_rep_counter.core.recalibration_confidence import (
     classify_handoff,
     compute_incumbent_health,
     compute_joint_recalibration_score,
+    incumbent_range_collapsed,
     select_recalibration_candidate,
     should_run_full_recalibration,
     should_switch_to_candidate,
@@ -578,6 +579,129 @@ def test_post_lock_warmup_still_skips_full_reeval_when_incumbent_is_healthy() ->
         selected_score=0.70,
     )
     assert should_run is False
+
+
+def test_relative_rom_collapse_marks_incumbent_bad() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        calibrated_rom=61.0,
+    )
+    assert health["lowRange"] is True
+    assert health["relativeRomCollapse"] is True
+    assert health["incumbentBad"] is True
+    assert health["incumbentRangeHealthy"] is False
+    assert incumbent_range_collapsed(
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        calibrated_rom=61.0,
+    )
+
+
+def test_recent_rom_near_calibrated_is_not_collapsed() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=58.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        calibrated_rom=61.0,
+    )
+    assert health["lowRange"] is False
+    assert health["relativeRomCollapse"] is False
+    assert health["incumbentRangeHealthy"] is True
+
+
+def test_recent_range_above_absolute_floor_is_healthy_without_calibrated_rom() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+    )
+    assert health["lowRange"] is False
+    assert health["relativeRomCollapse"] is False
+    assert health["incumbentRangeHealthy"] is True
+
+
+def test_post_lock_warmup_reevals_when_rom_collapsed_relative_to_calibrated() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=2,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=True,
+        selected_recent_range=18.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        calibrated_rom=61.0,
+    )
+    assert should_run is True
+
+
+def test_collapsed_rom_allows_cross_family_switch_without_score_margin() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        candidate_score=0.75,
+        candidate_activity_score=0.80,
+        candidate_pose_score=0.95,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=48.0,
+        candidate_median_rom_deg=46.0,
+        selected_median_rom_deg=61.0,
+        median_recent_range_all=30.0,
+        same_joint_family=False,
+        calibrated_rom=61.0,
+    )
+    assert can_switch is True
+    assert debug["relativeRomCollapse"] is True
+    assert debug["incumbentRangeStale"] is True
+    assert debug["candidateClearlyBetter"] is True
+    assert debug["candidateMotionOk"] is True
+
+
+def test_cross_family_allowed_when_rom_collapsed_relative_to_calibrated() -> None:
+    scores = {
+        "LEFT_ELBOW": (0.88, {"poseScore": 0.95, "recentRange": 18.0}),
+        "RIGHT_KNEE": (0.75, {"poseScore": 0.95, "recentRange": 48.0}),
+        "RIGHT_ELBOW": (0.40, {"poseScore": 0.95, "recentRange": 16.0}),
+    }
+    candidate, selector_debug = select_recalibration_candidate(
+        scores,
+        "LEFT_ELBOW",
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        calibrated_rom=61.0,
+    )
+    assert selector_debug["allowCrossFamily"] is True
+    assert selector_debug["incumbentHealth"]["relativeRomCollapse"] is True
+    assert candidate == "RIGHT_KNEE"
 
 
 def test_cross_family_excluded_when_incumbent_healthy() -> None:

@@ -35,6 +35,7 @@ from flexible_rep_counter.core.recalibration_confidence import (
     select_recalibration_candidate,
     signal_unit,
     should_switch_to_candidate,
+    incumbent_range_collapsed,
     update_joint_motion_state,
 )
 from flexible_rep_counter.core.pose_filters import PoseFilterPipeline
@@ -55,6 +56,7 @@ from flexible_rep_counter.core.settings import (
     DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_BYPASS_REP_COOLDOWN,
     DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS,
     DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN as CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN,
+    DYNAMIC_RECALIBRATION_RANGE_COLLAPSE_RATIO as CFG_DYNAMIC_RECALIBRATION_RANGE_COLLAPSE_RATIO,
     DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC as CFG_DEPTH_RECALIBRATION_BASELINE_JUMP_FRAC,
     DEPTH_RECALIBRATION_COOLDOWN_SEC as CFG_DEPTH_RECALIBRATION_COOLDOWN_SEC,
     DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED as CFG_DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED,
@@ -143,6 +145,7 @@ DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS = max(
 DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN = bool(
     CFG_DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN
 )
+RANGE_COLLAPSE_RATIO = max(0.0, float(CFG_DYNAMIC_RECALIBRATION_RANGE_COLLAPSE_RATIO))
 LOW_FPS_SAFE_MODE_ENABLED = CFG_LOW_FPS_SAFE_MODE_ENABLED
 LOW_FPS_INTERVAL_WINDOW_FRAMES = max(1, int(CFG_LOW_FPS_INTERVAL_WINDOW_FRAMES))
 LOW_FPS_MIN_SAMPLES = max(2, int(CFG_LOW_FPS_MIN_SAMPLES))
@@ -885,6 +888,24 @@ def _maybe_trigger_depth_recalibration(
         run_state["depth_recal_state"] = "complete"
     run_state["depth_recal_last_scale_ratio"] = float(scale_ratio) if isinstance(scale_ratio, (int, float)) else None
     return True
+
+
+def _selection_variance_fallback_ready(*, ready: bool, elapsed_s: float) -> bool:
+    """Variance lock is the timeout path only.
+
+    Reaching calibration-rep counts on a leader is not enough to leave selecting
+    while dominance is still unsatisfied.
+    """
+    return bool(ready and elapsed_s >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC)
+
+
+def _detector_calibrated_rom(detector: Optional[Any]) -> float:
+    if detector is None or not hasattr(detector, "_calibrated_rom"):
+        return 0.0
+    try:
+        return float(detector._calibrated_rom() or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _selection_relax_progress(elapsed_s: float) -> float:
@@ -2605,11 +2626,11 @@ class RepCounterSession:
                 and (dom_ok_joint or selected_from_family)
                 and streak >= dominance_streak_required
             )
-            # If we already observe enough reps during selection, allow earlier variance lock
-            # instead of waiting the full fallback timeout.
-            variance_fallback_ready = ready and (
-                elapsed >= ANGLE_SELECTION_VARIANCE_FALLBACK_SEC
-                or total_selection_reps >= cal_reps_target
+            # Variance lock is the timeout path only. Calibration-rep counts must not
+            # skip dominance and jump tracking onto an undominated leader.
+            variance_fallback_ready = _selection_variance_fallback_ready(
+                ready=ready,
+                elapsed_s=elapsed,
             )
             locked_this_frame = False
             t_sel = time.perf_counter()
@@ -2874,6 +2895,7 @@ class RepCounterSession:
             rolling_range = selected_output_for_eval.get("rollingRange")
             if isinstance(rolling_range, (int, float)):
                 selected_recent_range_for_gate = max(selected_recent_range_for_gate, float(rolling_range))
+        calibrated_rom = _detector_calibrated_rom(active_detector)
         if isinstance(selected_output_for_eval, dict):
             if bool(selected_output_for_eval.get("rangeGateOpen", True)):
                 rs["selected_range_gate_closed_streak"] = 0
@@ -2996,6 +3018,8 @@ class RepCounterSession:
                 stale_switch_max_selected_recent_range_deg=float(stale_thresholds["max_recent_range"]),
                 stale_switch_min_closed_streak=int(stale_thresholds["min_closed_streak"]),
                 selected_score=float(selected_score_for_reeval_gate),
+                calibrated_rom=calibrated_rom,
+                range_collapse_ratio=RANGE_COLLAPSE_RATIO,
             )
             re_eval_due = bool(run_full_re_eval)
         if re_eval_due:
@@ -3101,6 +3125,8 @@ class RepCounterSession:
                 stale_switch_min_closed_streak=int(stale_thresholds["min_closed_streak"]),
                 fallback_armed=fallback_armed,
                 primary_recovery_score=FALLBACK_Y_PRIMARY_RECOVERY_SCORE,
+                calibrated_rom=calibrated_rom,
+                range_collapse_ratio=RANGE_COLLAPSE_RATIO,
             )
 
             selected_score = 0.0
@@ -3168,6 +3194,16 @@ class RepCounterSession:
                 and primary_recovery_cross_modality
             ):
                 rep_cooldown_ok = True
+            range_collapsed = incumbent_range_collapsed(
+                selected_recent_range=selected_recent_range,
+                stale_switch_max_selected_recent_range_deg=float(
+                    stale_thresholds["max_recent_range"]
+                ),
+                calibrated_rom=calibrated_rom,
+                range_collapse_ratio=RANGE_COLLAPSE_RATIO,
+            )
+            if range_collapsed:
+                rep_cooldown_ok = True
             cooldown_ok = time_cooldown_ok and rep_cooldown_ok
             should_switch, force_switch, switch_debug = should_switch_to_candidate(
                 cooldown_ok=cooldown_ok,
@@ -3202,6 +3238,8 @@ class RepCounterSession:
                 incumbent_is_fallback=(
                     isinstance(selected_angle, str) and is_fallback_angle(selected_angle)
                 ),
+                calibrated_rom=calibrated_rom,
+                range_collapse_ratio=RANGE_COLLAPSE_RATIO,
             )
             switch_debug = {
                 **switch_debug,
@@ -3209,6 +3247,8 @@ class RepCounterSession:
                 "repCooldownOk": bool(rep_cooldown_ok),
                 "repsSinceLastSwitch": int(reps_since_last_switch),
                 "minRepsSinceLastSwitch": int(JOINT_SWITCH_MIN_REPS_SINCE_LAST),
+                "rangeCollapsed": bool(range_collapsed),
+                "calibratedRom": float(calibrated_rom),
                 "fallbackArmed": bool(fallback_armed),
                 "fallbackElapsedSec": float(fallback_elapsed),
                 "fallbackPrimaryRecovered": bool(primary_recovered),

@@ -193,6 +193,10 @@ DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_FORCE_AFTER_STALE_REEVALS = _toml_int(
 DYNAMIC_RECALIBRATION_PRIMARY_RECOVERY_SKIP_SCORE_MARGIN = _toml_bool(
     "dynamic_recalibration", "primary_recovery_skip_score_margin", default=False
 )
+# Recent ROM below this fraction of calibrated ROM marks the tracked joint collapsed.
+DYNAMIC_RECALIBRATION_RANGE_COLLAPSE_RATIO = _toml_float(
+    "dynamic_recalibration", "range_collapse_ratio", default=0.50
+)
 FALLBACK_Y_ARM_WINDOW_SEC = _toml_float("fallback_y_point", "arm_window_sec", default=1.2)
 FALLBACK_Y_LOW_SCORE_THRESHOLD = _toml_float(
     "fallback_y_point", "low_score_threshold", default=0.40
@@ -258,7 +262,7 @@ DEPTH_RECALIBRATION_OBSERVATION_REPS = _toml_int(
     "depth_recalibration", "observation_reps", default=2
 )
 DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE = _toml_bool(
-    "depth_recalibration", "trigger_on_range_collapse", default=False
+    "depth_recalibration", "trigger_on_range_collapse", default=True
 )
 DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED = _toml_bool(
     "depth_recalibration", "defer_when_primary_recovered", default=False
