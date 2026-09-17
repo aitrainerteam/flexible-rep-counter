@@ -30,6 +30,17 @@ pip install /path/to/flexible-rep-counter/dist/flexible_rep_counter-*-py3-none-a
 pip install -e "/path/to/flexible-rep-counter[viz]"
 ```
 
+## 3D XYZ session (occlusion pilots)
+
+`AngleRepCounterSession` on branch `3d` counts eight named 3-point angles from raw XYZ (`calculate_angle_3d`). Config is `rep_counter_3d.toml` only (`[rep]` + `[angle_selection]`). The 2D `RepCounterSession` API remains for the live OpenCV app and is unused by the pilots.
+
+```python
+from flexible_rep_counter import AngleRepCounterSession, AngleSample, calculate_angle_3d
+
+session = AngleRepCounterSession()
+result = session.process_frame({... eight AngleSample values ...}, timestamp_ms=t)
+```
+
 **`requirements.txt`** (PEP 508 direct URL or path):
 
 ```text

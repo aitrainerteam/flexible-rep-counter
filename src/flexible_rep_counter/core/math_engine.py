@@ -23,6 +23,38 @@ def _get_xy(p: dict) -> tuple[float, float]:
     return (float(p["x"]), float(p["y"]))
 
 
+def _xyz_tuple(p: dict | Sequence[float]) -> tuple[float, float, float]:
+    if isinstance(p, dict):
+        raw = (p.get("x"), p.get("y"), p.get("z"))
+    else:
+        if len(p) < 3:
+            raise ValueError(f"3D point requires 3 coordinates, got {len(p)}")
+        raw = (p[0], p[1], p[2])
+    try:
+        x, y, z = float(raw[0]), float(raw[1]), float(raw[2])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"3D point coordinates must be finite numbers, got {raw!r}") from exc
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        raise ValueError(f"3D point coordinates must be finite, got {(x, y, z)!r}")
+    return x, y, z
+
+
+def calculate_angle_3d(a: dict | Sequence[float], b: dict | Sequence[float], c: dict | Sequence[float]) -> float:
+    """Inner angle at B for A-B-C in 3D, 0-180 degrees. Raises on invalid or degenerate input."""
+    ax, ay, az = _xyz_tuple(a)
+    bx, by, bz = _xyz_tuple(b)
+    cx, cy, cz = _xyz_tuple(c)
+    bax, bay, baz = ax - bx, ay - by, az - bz
+    bcx, bcy, bcz = cx - bx, cy - by, cz - bz
+    mag_ba = math.sqrt(bax * bax + bay * bay + baz * baz)
+    mag_bc = math.sqrt(bcx * bcx + bcy * bcy + bcz * bcz)
+    if mag_ba < 1e-12 or mag_bc < 1e-12:
+        raise ValueError("3D angle requires non-zero BA and BC vectors")
+    dot = bax * bcx + bay * bcy + baz * bcz
+    cos_angle = max(-1.0, min(1.0, dot / (mag_ba * mag_bc)))
+    return math.degrees(math.acos(cos_angle))
+
+
 def calculate_angle(a: dict, b: dict, c: dict) -> Optional[float]:
     """Inner angle at B for A-B-C, 0-180 degrees."""
     if not a or not b or not c:

@@ -43,7 +43,7 @@ def test_min_rep_interval_commits_instead_of_blocking() -> None:
     det.frame_count = 100
     det.last_peak_frame = 0
 
-    peak, completed = det._record_peak_on_reversal()
+    peak, completed, _, _ = det._record_peak_on_reversal()
 
     assert peak == 101.0
     assert completed is True

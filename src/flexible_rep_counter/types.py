@@ -48,3 +48,39 @@ class StepResult:
 
     leader_key: Optional[str] = None
     selection_debug: dict[str, Any] = field(default_factory=dict)
+
+
+AngleEvidence = Literal["observed", "predicted", "unknown"]
+
+
+@dataclass(frozen=True)
+class AngleSample:
+    """One frame of a named 3-point angle. ``value`` is None when the triple is unusable."""
+
+    value: Optional[float]
+    evidence: AngleEvidence
+
+
+@dataclass
+class AngleStepResult:
+    """Per-frame output of :class:`flexible_rep_counter.angle_session.AngleRepCounterSession`."""
+
+    reps: int
+    tracked_joint: Optional[str]
+    angle_3d_value: Optional[float]
+    calibration_complete: bool
+    peak_detector_state: str
+    smoothed_value: Optional[float]
+    range_gate_open: bool
+    rolling_range: Optional[float]
+    calibration_target_reps: int
+    calibration_certainty: float
+    calibration_certainty_target: float
+    phase: Literal["idle", "selecting", "tracking"]
+    status_message: str
+    tracked_joint_changed: bool = False
+    calibration_started: bool = False
+    calibration_locked: bool = False
+    leader_key: Optional[str] = None
+    avg_peak: Optional[float] = None
+    avg_valley: Optional[float] = None

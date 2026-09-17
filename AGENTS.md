@@ -24,6 +24,10 @@ When fixing bugs (missed reps, late lock, margin_fail, handoff loss), fix the **
 | `[angle_selection.vertical_px]` | Selection gates for vertical_px candidates |
 | `[fallback_y_point]` | Fallback arming thresholds (modality-level) |
 
+## 3D XYZ session (branch `3d`)
+
+The occlusion pilots use `AngleRepCounterSession` + `rep_counter_3d.toml` (`[rep]` and `[angle_selection]` only). No `vertical_px` sections. Product labels are `left_elbow` … `right_hip` scalars, not landmark indices.
+
 ## Tests
 
 Prefer modality-based assertions (`vertical_px`, `angle_deg`, `detector_label.endswith("_Y")`) over exercise names or a single joint constant.

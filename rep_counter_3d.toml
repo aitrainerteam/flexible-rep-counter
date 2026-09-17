@@ -1,0 +1,33 @@
+# 3D XYZ angle-session tuning. One shared set for coco19 and smpl24.
+# Set FLEXIBLE_REP_COUNTER_3D_CONFIG to use another file.
+
+[rep]
+peak_margin_pct = 0.50
+valley_margin_pct = 0.50
+hysteresis = 16
+min_peak_distance = 4
+min_range_gate = 15
+range_window_frames = 90
+range_min_samples = 12
+angle_delta_deadband = 0
+calibration_reps = 2
+calibration_certainty = 0.2
+calibration_force_extra_reps = 0
+min_interval_ms = 300
+smoothing_factor = 0.70
+
+[angle_selection]
+min_sec = 1.6
+min_frames = 24
+max_buffer_frames = 400
+retry_interval_sec = 2.0
+dominance_fraction = 0.6666666666666666
+min_leading_reps = 2
+dominance_streak_frames = 18
+variance_fallback_sec = 10.0
+min_variance = 6.0
+min_range_deg = 16.0
+second_best_ratio = 1.15
+min_active_windows = 3
+smooth_window = 5
+min_observed_fraction = 0.5
