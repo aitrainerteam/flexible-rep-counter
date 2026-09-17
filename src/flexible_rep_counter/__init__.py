@@ -1,6 +1,6 @@
 """Importable rep-counter engine and types."""
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 from flexible_rep_counter.angle_session import AngleRepCounterSession
 from flexible_rep_counter.core.math_engine import calculate_angle_3d

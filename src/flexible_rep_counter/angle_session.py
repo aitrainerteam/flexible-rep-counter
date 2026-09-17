@@ -23,6 +23,10 @@ class AngleRepCounterSession:
     ``process_frame`` takes exactly eight product :class:`AngleSample` values.
     ``None``/unknown frames hold detector state. Predicted values may continue
     tracking after lock but do not count toward selection evidence.
+
+    On limb lock the winning selection detector is carried into tracking. Displayed
+    reps stay 0 until that detector completes one more validated cycle, then jump
+    to the full raw count (pre-lock cycles plus the new one).
     """
 
     def __init__(self, config: Angle3dConfig | None = None, *, fps_hint: float = 30.0) -> None:
@@ -39,6 +43,10 @@ class AngleRepCounterSession:
             k: PeakDetector(**self.cfg.peak_detector_kwargs()) for k in PRODUCT_ANGLE_KEYS
         }
         self._count_detector: Optional[PeakDetector] = None
+        # Raw detector count at limb lock. Display stays 0 until the carried
+        # detector completes one more validated cycle, then exposes the full raw count.
+        self._raw_at_lock: Optional[int] = None
+        self._credit_revealed: bool = False
         self._select_started_ms: Optional[float] = None
         self._select_frames: int = 0
         self._dominance_streak: int = 0
@@ -56,8 +64,17 @@ class AngleRepCounterSession:
     def reset(self) -> None:
         self._reset_state()
 
-    def _new_detector(self) -> PeakDetector:
-        return PeakDetector(**self.cfg.peak_detector_kwargs())
+    def _displayed_reps(self, detector: PeakDetector) -> int:
+        """Hide pre-lock selection cycles until the next completed post-lock rep."""
+        raw = int(detector.rep_count)
+        if self._credit_revealed:
+            return raw
+        if self._raw_at_lock is None:
+            return raw
+        if raw > int(self._raw_at_lock):
+            self._credit_revealed = True
+            return raw
+        return 0
 
     def _trim(self) -> None:
         cap = self.cfg.max_buffer_frames
@@ -118,11 +135,17 @@ class AngleRepCounterSession:
             raise ValueError(f"cannot lock unknown angle {joint!r}")
         self.tracked_joint = joint
         self.phase = "tracking"
-        self._count_detector = self._new_detector()
+        # Carry the winning selection detector so ROM / calibration / cycles survive lock.
+        carried = self._select_detectors[joint]
+        self._count_detector = carried
+        self._raw_at_lock = int(carried.rep_count)
+        self._credit_revealed = False
         sample_value = None
         if self._histories[joint]:
             sample_value = self._histories[joint][-1]
         status = f"locked {joint}"
+        # Truthful calibration metadata from the carried detector. Display stays 0.
+        already_calibrated = bool(carried._calibrated)
         result = self._result(
             reps=0,
             tracked_joint=joint,
@@ -132,6 +155,7 @@ class AngleRepCounterSession:
             status_message=status,
             tracked_joint_changed=True,
             calibration_started=True,
+            calibration_locked=already_calibrated,
             leader_key=joint,
         )
         self._last_result = result
@@ -216,8 +240,9 @@ class AngleRepCounterSession:
         self._count_detector.update(sample.value)
         cal_locked = (not prev_cal) and self._count_detector._calibrated
         cal_started = False
+        displayed = self._displayed_reps(self._count_detector)
         result = self._result(
-            reps=self._count_detector.rep_count,
+            reps=displayed,
             tracked_joint=joint,
             angle_3d_value=sample.value,
             detector=self._count_detector,
