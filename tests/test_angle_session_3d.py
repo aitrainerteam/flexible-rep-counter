@@ -398,7 +398,379 @@ def test_predicted_evidence_does_not_lock_until_observed(fast_cfg):
     assert last.tracked_joint == "left_shoulder"
 
 
-def test_tracked_joint_immutable_after_lock(fast_cfg):
+def test_mirror_offset_adds_full_raw_and_never_drops():
+    from flexible_rep_counter.angle_session import mirror_display_offset
+
+    offset = mirror_display_offset(
+        incumbent_displayed=5,
+        candidate_raw=4,
+        candidate_raw_at_new_lock=4,
+        credited_raw=0,
+    )
+    assert offset == 5
+    assert 4 + offset == 5 + 4
+
+    # Reps already on the display are not added again.
+    offset_back = mirror_display_offset(
+        incumbent_displayed=9,
+        candidate_raw=6,
+        candidate_raw_at_new_lock=6,
+        credited_raw=4,
+    )
+    assert 6 + offset_back == 9 + 2
+
+    clamped = mirror_display_offset(
+        incumbent_displayed=5,
+        candidate_raw=0,
+        candidate_raw_at_new_lock=0,
+        credited_raw=0,
+    )
+    assert 0 + clamped == 5
+
+
+def test_classify_mirrored_handoff_guards():
+    from flexible_rep_counter.angle_session import classify_mirrored_handoff
+
+    kind, rule = classify_mirrored_handoff(
+        incumbent_motion_span_deg=4.0,
+        candidate_rom_deg=50.0,
+        incumbent_completed_gated_cycle=False,
+        candidate_raw=5,
+        candidate_active=True,
+        cycle_sync_score_last_4s=0.2,
+        incumbent_cycles_last_4s=0,
+        candidate_cycles_last_4s=2,
+    )
+    assert kind == "alternate_limb"
+    assert rule == "mirrored_incumbent_stopped"
+
+    kind, rule = classify_mirrored_handoff(
+        incumbent_motion_span_deg=40.0,
+        candidate_rom_deg=50.0,
+        incumbent_completed_gated_cycle=True,
+        candidate_raw=5,
+        candidate_active=True,
+        cycle_sync_score_last_4s=0.2,
+        incumbent_cycles_last_4s=1,
+        candidate_cycles_last_4s=2,
+    )
+    assert kind == "same_exercise"
+    assert rule == "incumbent_active_during_pending"
+
+    kind, rule = classify_mirrored_handoff(
+        incumbent_motion_span_deg=30.0,
+        candidate_rom_deg=50.0,
+        incumbent_completed_gated_cycle=False,
+        candidate_raw=5,
+        candidate_active=True,
+        cycle_sync_score_last_4s=0.8,
+        incumbent_cycles_last_4s=3,
+        candidate_cycles_last_4s=3,
+    )
+    assert kind == "same_exercise"
+    assert rule == "prior_synchronized_same_exercise"
+
+
+def _quiet() -> dict[str, AngleSample]:
+    return {k: _obs(90.0) for k in PRODUCT_ANGLE_KEYS}
+
+
+def _drive_elbows(
+    session: AngleRepCounterSession,
+    i: int,
+    *,
+    left: float | None,
+    right: float | None,
+    left_evidence: str = "observed",
+    right_evidence: str = "observed",
+):
+    samples = _quiet()
+    if left is None:
+        samples["left_elbow"] = _unknown()
+    else:
+        samples["left_elbow"] = AngleSample(value=left, evidence=left_evidence)  # type: ignore[arg-type]
+    if right is None:
+        samples["right_elbow"] = _unknown()
+    else:
+        samples["right_elbow"] = AngleSample(value=right, evidence=right_evidence)  # type: ignore[arg-type]
+    return session.process_frame(samples, timestamp_ms=i * (1000 / 30))
+
+
+def test_mirrored_limb_stop_adds_full_raw_then_increments(fast_cfg):
+    """Left locks and counts, then stops. Right's already-counted reps are added once."""
+    session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
+    lock_i = None
+    last = None
+    for i in range(500):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i + 2, amp=48.0, period=28),
+        )
+        if last.tracked_joint_changed:
+            lock_i = i
+            assert last.tracked_joint == "left_elbow"
+            assert last.reps == 0
+            assert last.phase == "tracking"
+            break
+    assert lock_i is not None and last is not None
+
+    shown = 0
+    primed_i = lock_i
+    for i in range(lock_i + 1, lock_i + 400):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i + 2, amp=48.0, period=28),
+        )
+        assert last.tracked_joint == "left_elbow"
+        assert last.reps >= shown
+        shown = last.reps
+        primed_i = i
+        if shown >= 2 and session._select_detectors["right_elbow"].rep_count >= 2:
+            break
+    assert shown >= 2
+    assert session._select_detectors["right_elbow"].rep_count >= 2
+    assert session._count_detector is session._select_detectors["left_elbow"]
+
+    switched_at = None
+    prev_shown = shown
+    for i in range(primed_i + 1, primed_i + 500):
+        last = _drive_elbows(
+            session,
+            i,
+            left=100.0,
+            right=_sine(i, amp=55.0, period=12),
+        )
+        assert last.reps >= prev_shown
+        if last.tracked_joint == "right_elbow":
+            switched_at = i
+            right_raw = int(session._select_detectors["right_elbow"].rep_count)
+            assert session._count_detector is session._select_detectors["right_elbow"]
+            assert last.reps == prev_shown + right_raw
+            assert last.tracked_joint_changed is True
+            assert session._last_handoff_rule == "mirrored_incumbent_stopped"
+            break
+        assert last.tracked_joint == "left_elbow"
+        prev_shown = last.reps
+    assert switched_at is not None
+
+    base = last.reps
+    raw_at = int(session._count_detector.rep_count)  # type: ignore[union-attr]
+    grew = False
+    for i in range(switched_at + 1, switched_at + 160):
+        last = _drive_elbows(
+            session,
+            i,
+            left=100.0,
+            right=_sine(i, amp=55.0, period=12),
+        )
+        assert last.tracked_joint == "right_elbow"
+        assert last.reps >= base
+        raw_now = int(session._count_detector.rep_count)  # type: ignore[union-attr]
+        if raw_now > raw_at:
+            assert last.reps == base + (raw_now - raw_at)
+            grew = True
+            break
+    assert grew
+
+
+def test_return_to_first_limb_adds_only_new_reps(fast_cfg):
+    """Switching back must not add reps that were already on the display."""
+    session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
+    lock_i = None
+    for i in range(500):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i + 2, amp=48.0, period=28),
+        )
+        if last.tracked_joint_changed:
+            lock_i = i
+            assert last.tracked_joint == "left_elbow"
+            break
+    assert lock_i is not None
+
+    primed_i = lock_i
+    shown = 0
+    for i in range(lock_i + 1, lock_i + 400):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i + 2, amp=48.0, period=28),
+        )
+        shown = last.reps
+        primed_i = i
+        if shown >= 2 and session._select_detectors["right_elbow"].rep_count >= 2:
+            break
+    assert shown >= 2
+
+    first_switch = None
+    prev_shown = shown
+    for i in range(primed_i + 1, primed_i + 500):
+        last = _drive_elbows(session, i, left=100.0, right=_sine(i, amp=55.0, period=12))
+        if last.tracked_joint == "right_elbow":
+            first_switch = i
+            break
+        prev_shown = last.reps
+    assert first_switch is not None
+
+    grew_i = None
+    for i in range(first_switch + 1, first_switch + 160):
+        last = _drive_elbows(session, i, left=100.0, right=_sine(i, amp=55.0, period=12))
+        if last.reps > prev_shown:
+            grew_i = i
+            break
+    assert grew_i is not None
+    display_on_right = last.reps
+    left_raw_banked = int(session._select_detectors["left_elbow"].rep_count)
+
+    returned = None
+    prev_shown = display_on_right
+    for i in range(grew_i + 1, grew_i + 500):
+        last = _drive_elbows(session, i, left=_sine(i, amp=60.0, period=10), right=100.0)
+        assert last.reps >= prev_shown
+        if last.tracked_joint == "left_elbow":
+            returned = i
+            left_raw = int(session._select_detectors["left_elbow"].rep_count)
+            new_reps = left_raw - left_raw_banked
+            assert new_reps > 0
+            assert last.reps == prev_shown + new_reps
+            assert last.reps < prev_shown + left_raw
+            break
+        prev_shown = last.reps
+        assert last.tracked_joint == "right_elbow"
+    assert returned is not None
+
+
+def test_still_moving_incumbent_does_not_add_mirror_count(fast_cfg):
+    """A locked limb that keeps cycling must not take the mirror's raw count."""
+    session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
+    lock_i = None
+    for i in range(300):
+        last = session.process_frame(_frame("left_elbow", _sine(i, amp=60.0, period=10)), timestamp_ms=i * (1000 / 30))
+        if last.tracked_joint_changed:
+            lock_i = i
+            assert last.tracked_joint == "left_elbow"
+            break
+    assert lock_i is not None
+
+    revealed_i = None
+    for i in range(lock_i + 1, lock_i + 160):
+        last = session.process_frame(_frame("left_elbow", _sine(i, amp=60.0, period=10)), timestamp_ms=i * (1000 / 30))
+        if last.reps > 0:
+            revealed_i = i
+            break
+    assert revealed_i is not None
+
+    saw_mirror_reps = False
+    prev = last.reps
+    for i in range(revealed_i + 1, revealed_i + 350):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i, amp=55.0, period=12),
+        )
+        assert last.tracked_joint == "left_elbow"
+        assert last.tracked_joint_changed is False
+        assert last.reps >= prev
+        prev = last.reps
+        left_raw = int(session._select_detectors["left_elbow"].rep_count)
+        right_raw = int(session._select_detectors["right_elbow"].rep_count)
+        assert last.reps == left_raw
+        if right_raw > 0:
+            saw_mirror_reps = True
+            assert last.reps < left_raw + right_raw
+    assert saw_mirror_reps
+    assert session._last_handoff_kind == "same_exercise"
+    assert session._last_handoff_rule in (
+        "incumbent_active_during_pending",
+        "prior_synchronized_same_exercise",
+    )
+    assert session._rep_offset is None
+
+
+def test_unknown_mirror_does_not_invent_reps(fast_cfg):
+    session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
+    lock_i = None
+    for i in range(200):
+        last = session.process_frame(_frame("left_elbow", _sine(i)), timestamp_ms=i * (1000 / 30))
+        if last.tracked_joint_changed:
+            lock_i = i
+            break
+    assert lock_i is not None
+    right_raw = int(session._select_detectors["right_elbow"].rep_count)
+    for i in range(lock_i + 1, lock_i + 40):
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=55.0),
+            right=None,
+        )
+        assert last.tracked_joint == "left_elbow"
+        assert session._histories["right_elbow"][-1] is None
+        assert int(session._select_detectors["right_elbow"].rep_count) == right_raw
+
+
+def test_missing_frame_does_not_expire_mirror_window(fast_cfg):
+    session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
+    lock_i = None
+    for i in range(250):
+        last = session.process_frame(
+            _frame("left_elbow", _sine(i, amp=60.0, period=10)),
+            timestamp_ms=i * (1000 / 30),
+        )
+        if last.tracked_joint_changed:
+            lock_i = i
+            break
+    assert lock_i is not None
+    revealed_i = None
+    for i in range(lock_i + 1, lock_i + 160):
+        last = session.process_frame(
+            _frame("left_elbow", _sine(i, amp=60.0, period=10)),
+            timestamp_ms=i * (1000 / 30),
+        )
+        if last.reps > 0:
+            revealed_i = i
+            break
+    assert revealed_i is not None
+
+    opened_at = None
+    started = None
+    for i in range(revealed_i + 1, revealed_i + 200):
+        ts = i * (1000 / 30)
+        last = _drive_elbows(
+            session,
+            i,
+            left=_sine(i, amp=60.0, period=10),
+            right=_sine(i, amp=55.0, period=12),
+        )
+        if session._pending is not None:
+            opened_at = ts
+            started = session._pending.started_ms
+            break
+        assert last.tracked_joint == "left_elbow"
+    assert opened_at is not None and started is not None
+    held = session.process_frame(_all_unknown(), timestamp_ms=opened_at + 5000.0)
+    assert held.tracked_joint == "left_elbow"
+    assert held.reps == last.reps
+    assert session._pending is not None
+    assert session._pending.started_ms == pytest.approx(started + 5000.0)
+    samples = _quiet()
+    samples["left_elbow"] = _obs(_sine(0, amp=60.0, period=10))
+    samples["right_elbow"] = _obs(_sine(1, amp=55.0, period=12))
+    resume = session.process_frame(samples, timestamp_ms=opened_at + 5000.0 + (1000 / 30))
+    assert resume.tracked_joint == "left_elbow"
+    assert resume.tracked_joint_changed is False
+    assert session._pending is not None
+
+
+def test_tracked_joint_immutable_for_other_families(fast_cfg):
     session = AngleRepCounterSession(fast_cfg, fps_hint=30.0)
     last = None
     for i in range(70):
