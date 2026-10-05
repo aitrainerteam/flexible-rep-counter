@@ -338,8 +338,12 @@ class PeakDetector:
         self.neutral_frame_count = 0
         self.peaks: list[float] = []
         self.valleys: list[float] = []
+        self.peak_frame_ids: list[Optional[str]] = []
+        self.valley_frame_ids: list[Optional[str]] = []
         self.current_peak_value: Optional[float] = None
         self.current_valley_value: Optional[float] = None
+        self.current_peak_frame_id: Optional[str] = None
+        self.current_valley_frame_id: Optional[str] = None
         self._last_debanded_pass: Optional[float] = None
         # True after calibration_reps reps: locked baselines for strict margin checks
         self._calibrated: bool = False
@@ -518,6 +522,7 @@ class PeakDetector:
             return None, False, reversal_peak, reason
         detected_peak = self.current_peak_value
         self.peaks.append(self.current_peak_value)
+        self.peak_frame_ids.append(self.current_peak_frame_id)
         self.last_peak_frame = self.frame_count
         new_rep_count = min(len(self.peaks), len(self.valleys))
         rep_completed = False
@@ -634,6 +639,7 @@ class PeakDetector:
             return None, False, reversal_valley, reason
         detected_valley = self.current_valley_value
         self.valleys.append(self.current_valley_value)
+        self.valley_frame_ids.append(self.current_valley_frame_id)
         self.last_peak_frame = self.frame_count
         new_rep_count = min(len(self.peaks), len(self.valleys))
         rep_completed = False
@@ -690,7 +696,13 @@ class PeakDetector:
         self._maybe_lock_calibration()
         return detected_valley, rep_completed, detected_valley, None
 
-    def update(self, raw_value: Optional[float]) -> dict[str, Any]:
+    def update(
+        self,
+        raw_value: Optional[float],
+        *,
+        frame_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        fid = (frame_id or "").strip() or None
         if raw_value is None:
             self._last_debanded_pass = None
             stats = self._calibration_stats()
@@ -734,6 +746,8 @@ class PeakDetector:
             if self.current_peak_value is None or self.current_valley_value is None:
                 self.current_peak_value = self.smoothed_value
                 self.current_valley_value = self.smoothed_value
+                self.current_peak_frame_id = fid
+                self.current_valley_frame_id = fid
             self.neutral_frame_count += 1
             if self.neutral_frame_count > 30:
                 drift = 0.05
@@ -742,15 +756,18 @@ class PeakDetector:
             if self.smoothed_value > self.current_peak_value + self.hysteresis:
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
                 self.neutral_frame_count = 0
             elif self.smoothed_value < self.current_valley_value - self.hysteresis:
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
                 self.neutral_frame_count = 0
 
         elif self.state == PEAK_STATE_GOING_UP:
             if self.smoothed_value > self.current_peak_value:
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
             elif self.smoothed_value < self.current_peak_value - self.hysteresis:
                 dp, rc, rp, block_reason = self._record_peak_on_reversal()
                 if dp is not None:
@@ -763,10 +780,12 @@ class PeakDetector:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
 
         elif self.state == PEAK_STATE_GOING_DOWN:
             if self.smoothed_value < self.current_valley_value:
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
             elif self.smoothed_value > self.current_valley_value + self.hysteresis:
                 dv, rc, rv, block_reason = self._record_valley_on_reversal()
                 if dv is not None:
@@ -779,6 +798,7 @@ class PeakDetector:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
 
         if prev_state != self.state:
             self._instr_emit(
@@ -837,8 +857,12 @@ class PeakDetector:
         self.neutral_frame_count = 0
         self.peaks.clear()
         self.valleys.clear()
+        self.peak_frame_ids.clear()
+        self.valley_frame_ids.clear()
         self.current_peak_value = None
         self.current_valley_value = None
+        self.current_peak_frame_id = None
+        self.current_valley_frame_id = None
         self._value_window.clear()
         self._last_rolling_range = 0.0
         self._last_range_gate_open = self.min_range_gate_degrees <= 0
@@ -856,8 +880,12 @@ class PeakDetector:
         self.neutral_frame_count = 0
         self.peaks.clear()
         self.valleys.clear()
+        self.peak_frame_ids.clear()
+        self.valley_frame_ids.clear()
         self.current_peak_value = None
         self.current_valley_value = None
+        self.current_peak_frame_id = None
+        self.current_valley_frame_id = None
         self._value_window.clear()
         self._last_rolling_range = 0.0
         self._last_range_gate_open = self.min_range_gate_degrees <= 0
@@ -875,6 +903,10 @@ class PeakDetector:
             "repCount": self.rep_count,
             "currentPeakValue": self.current_peak_value,
             "currentValleyValue": self.current_valley_value,
+            "currentPeakFrameId": self.current_peak_frame_id,
+            "currentValleyFrameId": self.current_valley_frame_id,
+            "peakFrameIds": list(self.peak_frame_ids),
+            "valleyFrameIds": list(self.valley_frame_ids),
             "calibrationComplete": self._calibrated,
             "calibrationTargetReps": self.calibration_reps,
             "calibrationCertainty": float(self._calibration_stats().get("certainty") or 0.0),

@@ -272,12 +272,17 @@ def update_joint_motion_state(
     timestamp_ms: int,
     min_confidence: float = FRAME_MIN_CONFIDENCE,
     scale_px: Optional[float] = None,
+    frame_id: Optional[str] = None,
 ) -> dict[str, Any]:
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.0
     state.confidence_history.append((timestamp_ms, confidence))
     if val is None or conf is None or conf < float(min_confidence):
         state.history.append(None)
-        return {"advanced": False, "detectorOutput": state.detector.update(None), "gatedCycle": False}
+        return {
+            "advanced": False,
+            "detectorOutput": state.detector.update(None, frame_id=frame_id),
+            "gatedCycle": False,
+        }
 
     raw_value = float(val)
     value = raw_value
@@ -294,7 +299,7 @@ def update_joint_motion_state(
     state.last_observed_timestamp_ms = timestamp_ms
 
     prev_raw = int(state.detector.get_rep_count() or 0)
-    detector_output = state.detector.update(value)
+    detector_output = state.detector.update(value, frame_id=frame_id)
     new_raw = int(state.detector.get_rep_count() or 0)
     advanced = new_raw > prev_raw
     gated_cycle = False

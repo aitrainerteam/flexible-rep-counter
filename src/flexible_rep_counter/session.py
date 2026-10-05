@@ -1084,7 +1084,10 @@ def _apply_locked_tracking(
     if isinstance(initial_angle_value, (int, float)):
         angle_seed = float(initial_angle_value)
         if angle_seed == angle_seed:
-            det.update(angle_seed)
+            det.update(
+                angle_seed,
+                frame_id=run_state.get("_current_frame_id"),
+            )
     run_state["peak_detector"] = det
     if is_fallback_angle(selected_angle) and selection_detector is not None:
         _trim_incomplete_extremum(selection_detector)
@@ -1170,10 +1173,16 @@ def _trim_incomplete_extremum(detector: Optional[Any]) -> None:
         return
     if not peaks or not valleys:
         return
+    peak_frame_ids = getattr(detector, "peak_frame_ids", None)
+    valley_frame_ids = getattr(detector, "valley_frame_ids", None)
     if len(peaks) > len(valleys):
         peaks.pop()
+        if isinstance(peak_frame_ids, list) and peak_frame_ids:
+            peak_frame_ids.pop()
     elif len(valleys) > len(peaks):
         valleys.pop()
+        if isinstance(valley_frame_ids, list) and valley_frame_ids:
+            valley_frame_ids.pop()
 
 
 def _retroactive_credit_eligible(detector: Optional[Any], run_state: dict[str, Any]) -> bool:
@@ -2311,11 +2320,13 @@ class RepCounterSession:
         timestamp_ms: Optional[float] = None,
         wall_time_s: Optional[float] = None,
         trace_context: Optional[dict[str, Any]] = None,
+        frame_id: Optional[str] = None,
     ) -> StepResult:
         """
         Process one frame of 17 COCO landmarks (after any resolution scaling).
 
         ``landmarks`` may be None when no pose is detected.
+        ``frame_id`` is an optional caller-owned image id stamped onto accepted extrema.
         """
         if not self._run_state.get("started"):
             return _idle_result()
@@ -2323,6 +2334,8 @@ class RepCounterSession:
         now = wall_time_s if wall_time_s is not None else time.time()
         ts = timestamp_ms if timestamp_ms is not None else now * 1000.0
         t_step_start = time.perf_counter()
+        step_frame_id = (frame_id or "").strip() or None
+        self._run_state["_current_frame_id"] = step_frame_id
 
         rs = self._run_state
         tuning_params = rs["tuning_params"]
@@ -2438,6 +2451,7 @@ class RepCounterSession:
                     int(ts),
                     min_confidence=_angle_confidence_threshold(cfg),
                     scale_px=scale_px,
+                    frame_id=step_frame_id,
                 )
                 selecting_detector_outputs[ak] = upd.get("detectorOutput") or {}
             _update_angle_histories_for_frame(
@@ -2817,6 +2831,7 @@ class RepCounterSession:
                 int(ts),
                 min_confidence=_angle_confidence_threshold(cfg),
                 scale_px=scale_px,
+                frame_id=step_frame_id,
             )
             detector_outputs[ak] = upd.get("detectorOutput") or {}
             angle_values[ak] = val
@@ -3461,7 +3476,14 @@ class RepCounterSession:
         avg_valley: Optional[float] = None
 
         if peak_detector is not None:
-            out = detector_output if detector_output is not None else peak_detector.update(angle_value)
+            out = (
+                detector_output
+                if detector_output is not None
+                else peak_detector.update(
+                    angle_value,
+                    frame_id=rs.get("_current_frame_id"),
+                )
+            )
             rep_count = int(out.get("repCount", 0) or 0)
             primary_rep_count = rep_count
             state_str = str(out.get("state", "—"))
