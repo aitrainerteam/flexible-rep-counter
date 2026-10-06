@@ -18,12 +18,12 @@ smoothing_factor = 0.70
 
 [angle_selection]
 min_sec = 1.6
-min_frames = 24
+min_frames = 16
 max_buffer_frames = 400
 retry_interval_sec = 2.0
 dominance_fraction = 0.6666666666666666
-min_leading_reps = 2
-dominance_streak_frames = 18
+min_leading_reps = 1
+dominance_streak_frames = 10
 variance_fallback_sec = 10.0
 min_variance = 6.0
 min_range_deg = 16.0
