@@ -19,3 +19,5 @@ The low-FPS safeguard adds these fields to `rep_counter` and `frame_snapshot` in
 - `low_fps_safe_mode_changed` (`bool`): one-frame pulse when safe mode toggles.
 
 When `low_fps_safe_mode_active` is true, alternate-limb carryover is suppressed so handoff does not batch-add reps.
+
+Dynamic joint recalibration is limited to **`recalibration_attempts_per_entry`** switches per safe-mode entry (default `1` in `[low_fps_safe_mode]`). Each time safe mode turns on, that budget is restored; completing a joint switch while safe mode is active consumes it. Further switches wait until safe mode exits or another entry.

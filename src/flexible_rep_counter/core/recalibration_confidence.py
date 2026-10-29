@@ -7,7 +7,17 @@ from statistics import mean, median
 from typing import Any, Literal, Optional
 
 from flexible_rep_counter.core.math_engine import PeakDetector
-from flexible_rep_counter.core.variance_angle_selector import FRAME_MIN_CONFIDENCE
+from flexible_rep_counter.core.settings import (
+    FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC,
+    FALLBACK_Y_BASELINE_MIN_SAMPLES,
+    FALLBACK_Y_BASELINE_SHORT_WINDOW_FRAMES,
+    FALLBACK_Y_BASELINE_WINDOW_FRAMES,
+)
+from flexible_rep_counter.core.variance_angle_selector import (
+    FRAME_MIN_CONFIDENCE,
+    angle_signal_unit,
+    is_fallback_angle,
+)
 
 _RECENT_RANGE_WINDOW = 45
 _POSE_WINDOW = 30
@@ -17,6 +27,10 @@ MIN_EVIDENCE_ROM_DEG = 12.0
 MIN_EVIDENCE_RANGE_DEG = 12.0
 GOOD_RANGE_DEG = 35.0
 MIN_RANGE_DEG = 12.0
+MIN_EVIDENCE_ROM_PX = 8.0
+MIN_EVIDENCE_RANGE_PX = 8.0
+GOOD_RANGE_PX = 24.0
+MIN_RANGE_PX = 8.0
 
 UNOBSERVABLE_POSE_SCORE = 0.30
 INCUMBENT_ACTIVE_MOTION_MIN_SPAN_DEG = 18.0
@@ -44,6 +58,11 @@ CROSS_FAMILY_SCORE_MARGIN = 0.25
 SAME_FAMILY_SCORE_RATIO = 1.35
 CROSS_FAMILY_SCORE_RATIO = 1.45
 CANDIDATE_MIN_MEDIAN_WINDOW_VARIANCE = 6.0
+PRIMARY_RECOVERY_SCORE = 0.60
+# Recent ROM below this fraction of calibrated ROM is collapsed (any joint/modality).
+INCUMBENT_RANGE_COLLAPSE_RATIO = 0.50
+# When ROM has collapsed, force a switch after this many stale re-evals instead of 8.
+RANGE_COLLAPSE_FORCE_AFTER_STALE_REEVALS = 2
 
 
 @dataclass
@@ -62,6 +81,19 @@ class JointMotionState:
     recent_valleys: deque[float] = field(default_factory=lambda: deque(maxlen=8))
     recent_intervals_ms: deque[int] = field(default_factory=lambda: deque(maxlen=8))
     cycle_log: deque[tuple[int, float]] = field(default_factory=lambda: deque(maxlen=16))
+    absolute_y_long_window: deque[float] = field(
+        default_factory=lambda: deque(maxlen=max(8, int(FALLBACK_Y_BASELINE_WINDOW_FRAMES)))
+    )
+    absolute_y_short_window: deque[float] = field(
+        default_factory=lambda: deque(maxlen=max(4, int(FALLBACK_Y_BASELINE_SHORT_WINDOW_FRAMES)))
+    )
+    absolute_y_baseline_px: float | None = None
+    absolute_y_last_baseline_update_ms: int | None = None
+    last_raw_y_px: float | None = None
+    last_baseline_px: float | None = None
+    last_oscillation_px: float | None = None
+    last_scale_px: float | None = None
+    scale_at_lock_px: float | None = None
 
     last_score: float = 0.0
     last_score_debug: dict[str, float] = field(default_factory=dict)
@@ -121,7 +153,7 @@ def robust_cv(values: list[float]) -> float:
     return robust_std(values) / max(abs(med), 1e-6)
 
 
-def _recent_range_deg(state: JointMotionState) -> float:
+def _recent_range(state: JointMotionState) -> float:
     recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
     if len(recent_values) < 8:
         return 0.0
@@ -130,11 +162,14 @@ def _recent_range_deg(state: JointMotionState) -> float:
 
 def median_recent_range_from_score_debug(
     scores: dict[str, tuple[float, dict[str, Any]]],
+    *,
+    signal_unit: Optional[str] = None,
 ) -> float:
     ranges = [
         float(debug.get("recentRange") or 0.0)
-        for _, (_, debug) in scores.items()
+        for angle_key, (_, debug) in scores.items()
         if float(debug.get("recentRange") or 0.0) > 0.0
+        and (signal_unit is None or angle_signal_unit(angle_key) == signal_unit)
     ]
     return float(median(ranges)) if ranges else 0.0
 
@@ -144,11 +179,73 @@ def median_cycle_rom_deg(state: JointMotionState) -> float:
     return float(median(roms)) if roms else 0.0
 
 
+def signal_unit(angle_key: str) -> str:
+    return angle_signal_unit(angle_key)
+
+
+def _activity_thresholds(unit: str) -> tuple[float, float]:
+    if unit == "px":
+        return MIN_RANGE_PX, GOOD_RANGE_PX
+    return MIN_RANGE_DEG, GOOD_RANGE_DEG
+
+
+def _evidence_thresholds(unit: str) -> tuple[float, float]:
+    if unit == "px":
+        return MIN_EVIDENCE_ROM_PX, MIN_EVIDENCE_RANGE_PX
+    return MIN_EVIDENCE_ROM_DEG, MIN_EVIDENCE_RANGE_DEG
+
+
+def _apply_absolute_y_baseline(
+    state: JointMotionState,
+    *,
+    raw_value: float,
+    timestamp_ms: int,
+) -> float:
+    state.absolute_y_long_window.append(raw_value)
+    state.absolute_y_short_window.append(raw_value)
+    state.last_raw_y_px = float(raw_value)
+    long_values = list(state.absolute_y_long_window)
+    if state.absolute_y_baseline_px is None:
+        if len(long_values) >= max(3, int(FALLBACK_Y_BASELINE_MIN_SAMPLES)):
+            state.absolute_y_baseline_px = float(median(long_values))
+            state.absolute_y_last_baseline_update_ms = int(timestamp_ms)
+        state.last_baseline_px = state.absolute_y_baseline_px
+        state.last_oscillation_px = 0.0
+        return 0.0
+
+    target_baseline = float(median(long_values)) if long_values else float(state.absolute_y_baseline_px)
+    last_update = (
+        int(state.absolute_y_last_baseline_update_ms)
+        if isinstance(state.absolute_y_last_baseline_update_ms, int)
+        else int(timestamp_ms)
+    )
+    dt_s = max(0.0, float(timestamp_ms - last_update) / 1000.0)
+    max_slew = max(0.0, float(FALLBACK_Y_BASELINE_MAX_SLEW_PX_PER_SEC)) * dt_s
+    delta = target_baseline - float(state.absolute_y_baseline_px)
+    if max_slew <= 0.0:
+        adjusted_baseline = float(state.absolute_y_baseline_px)
+    else:
+        adjusted_baseline = float(state.absolute_y_baseline_px) + max(-max_slew, min(max_slew, delta))
+    state.absolute_y_baseline_px = adjusted_baseline
+    state.absolute_y_last_baseline_update_ms = int(timestamp_ms)
+    state.last_baseline_px = adjusted_baseline
+    state.last_oscillation_px = float(raw_value - adjusted_baseline)
+    return float(raw_value - adjusted_baseline)
+
+
 def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, Any]) -> float:
-    peak = detector_output.get("peak")
-    valley = detector_output.get("valley")
+    peak = detector_output.get("reversalPeak")
+    valley = detector_output.get("reversalValley")
+    if not isinstance(peak, (int, float)):
+        peak = detector_output.get("peak")
+    if not isinstance(valley, (int, float)):
+        valley = detector_output.get("valley")
     if isinstance(peak, (int, float)) and isinstance(valley, (int, float)):
         return abs(float(peak) - float(valley))
+    recent_peaks = list(state.recent_peaks)
+    recent_valleys = list(state.recent_valleys)
+    if recent_peaks and recent_valleys:
+        return abs(float(recent_peaks[-1]) - float(recent_valleys[-1]))
     peaks = list(getattr(state.detector, "peaks", []) or [])
     valleys = list(getattr(state.detector, "valleys", []) or [])
     if peaks and valleys:
@@ -159,10 +256,11 @@ def _latest_cycle_rom_deg(state: JointMotionState, detector_output: dict[str, An
     return 0.0
 
 
-def cycle_is_evidence(state: JointMotionState, rom: float, recent_range_deg: float) -> bool:
+def cycle_is_evidence(state: JointMotionState, rom: float, recent_range: float) -> bool:
+    min_rom, min_range = _evidence_thresholds(signal_unit(state.angle_key))
     return (
-        rom >= MIN_EVIDENCE_ROM_DEG
-        and recent_range_deg >= MIN_EVIDENCE_RANGE_DEG
+        rom >= min_rom
+        and recent_range >= min_range
         and state.last_observed_timestamp_ms is not None
     )
 
@@ -172,40 +270,67 @@ def update_joint_motion_state(
     val: Optional[float],
     conf: Optional[float],
     timestamp_ms: int,
+    min_confidence: float = FRAME_MIN_CONFIDENCE,
+    scale_px: Optional[float] = None,
+    frame_id: Optional[str] = None,
 ) -> dict[str, Any]:
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.0
     state.confidence_history.append((timestamp_ms, confidence))
-    if val is None or conf is None or conf < FRAME_MIN_CONFIDENCE:
+    if val is None or conf is None or conf < float(min_confidence):
         state.history.append(None)
-        return {"advanced": False, "detectorOutput": state.detector.update(None), "gatedCycle": False}
+        return {
+            "advanced": False,
+            "detectorOutput": state.detector.update(None, frame_id=frame_id),
+            "gatedCycle": False,
+        }
 
-    value = float(val)
+    raw_value = float(val)
+    value = raw_value
+    if signal_unit(state.angle_key) == "px":
+        value = _apply_absolute_y_baseline(
+            state,
+            raw_value=raw_value,
+            timestamp_ms=timestamp_ms,
+        )
     state.history.append(value)
+    state.last_scale_px = float(scale_px) if isinstance(scale_px, (int, float)) else None
+    if state.scale_at_lock_px is None and state.last_scale_px is not None:
+        state.scale_at_lock_px = float(state.last_scale_px)
     state.last_observed_timestamp_ms = timestamp_ms
 
     prev_raw = int(state.detector.get_rep_count() or 0)
-    detector_output = state.detector.update(value)
+    detector_output = state.detector.update(value, frame_id=frame_id)
     new_raw = int(state.detector.get_rep_count() or 0)
     advanced = new_raw > prev_raw
     gated_cycle = False
 
     peak = detector_output.get("peak")
     valley = detector_output.get("valley")
-    if isinstance(peak, (int, float)):
-        state.recent_peaks.append(float(peak))
-    if isinstance(valley, (int, float)):
-        state.recent_valleys.append(float(valley))
+    reversal_peak = detector_output.get("reversalPeak")
+    reversal_valley = detector_output.get("reversalValley")
+    score_peak = peak if isinstance(peak, (int, float)) else reversal_peak
+    score_valley = valley if isinstance(valley, (int, float)) else reversal_valley
+    if isinstance(score_peak, (int, float)):
+        state.recent_peaks.append(float(score_peak))
+    if isinstance(score_valley, (int, float)):
+        state.recent_valleys.append(float(score_valley))
 
-    if advanced:
-        if state.last_rep_timestamp_ms is not None:
+    reversal_observed = isinstance(score_peak, (int, float)) or isinstance(score_valley, (int, float))
+    if advanced or reversal_observed:
+        if advanced and state.last_rep_timestamp_ms is not None:
             state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
-        state.last_rep_timestamp_ms = timestamp_ms
+        if advanced:
+            state.last_rep_timestamp_ms = timestamp_ms
         rom = _latest_cycle_rom_deg(state, detector_output)
-        range_deg = _recent_range_deg(state)
-        if cycle_is_evidence(state, rom, range_deg):
+        recent_range = _recent_range(state)
+        if cycle_is_evidence(state, rom, recent_range):
+            if not advanced and state.last_rep_timestamp_ms is not None:
+                state.recent_intervals_ms.append(max(1, timestamp_ms - state.last_rep_timestamp_ms))
             state.recent_roms.append(float(rom))
             state.cycle_log.append((timestamp_ms, float(rom)))
             gated_cycle = True
+            if not advanced:
+                state.last_rep_timestamp_ms = timestamp_ms
 
     state.last_raw_rep_count = new_raw
     return {"advanced": advanced, "detectorOutput": detector_output, "gatedCycle": gated_cycle}
@@ -213,12 +338,15 @@ def update_joint_motion_state(
 
 def normalize_variance_prior(variance_data: Optional[dict[str, Any]]) -> float:
     data = variance_data or {}
+    unit = str(data.get("signalUnit") or "deg")
     variance = float(data.get("medianWindowVariance") or 0.0)
     active_windows = float(data.get("activeWindowCount") or 0.0)
-    smoothed_range = float(data.get("smoothedRangeDeg") or 0.0)
+    range_raw = data.get("smoothedRangePx") if unit == "px" else data.get("smoothedRangeDeg")
+    smoothed_range = float(range_raw or 0.0)
+    min_range, good_range = _activity_thresholds(unit)
     variance_score = clamp(variance / 120.0, 0.0, 1.0)
     active_score = clamp(active_windows / 4.0, 0.0, 1.0)
-    range_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, smoothed_range)
+    range_score = smoothstep(min_range, good_range, smoothed_range)
     return 0.45 * variance_score + 0.20 * active_score + 0.35 * range_score
 
 
@@ -227,6 +355,7 @@ def compute_joint_recalibration_score(
     variance_data: Optional[dict[str, Any]],
     now_ms: int,
 ) -> tuple[float, dict[str, Any]]:
+    unit = signal_unit(state.angle_key)
     recent_values = [v for v in list(state.history)[-_RECENT_RANGE_WINDOW:] if v is not None]
     recent_range = (
         _percentile(recent_values, 95.0) - _percentile(recent_values, 5.0)
@@ -235,7 +364,8 @@ def compute_joint_recalibration_score(
     )
 
     variance_prior = normalize_variance_prior(variance_data)
-    activity_score = smoothstep(MIN_RANGE_DEG, GOOD_RANGE_DEG, recent_range)
+    min_range, good_range = _activity_thresholds(unit)
+    activity_score = smoothstep(min_range, good_range, recent_range)
 
     roms = list(state.recent_roms)
     peaks = list(state.recent_peaks)
@@ -286,6 +416,7 @@ def compute_joint_recalibration_score(
     score = evidence * cycle_quality + (1.0 - evidence) * variance_prior
     debug = {
         "score": score,
+        "signalUnit": unit,
         "evidence": evidence,
         "completedCycles": completed_cycles,
         "activityScore": activity_score,
@@ -299,6 +430,8 @@ def compute_joint_recalibration_score(
         "poseScore": pose_score,
         "visibleFraction": visible_fraction,
         "recentRange": recent_range,
+        "recentRangePx": recent_range if unit == "px" else None,
+        "recentRangeDeg": recent_range if unit == "deg" else None,
         "observable": observable,
     }
     state.last_score = float(score)
@@ -312,6 +445,23 @@ def compute_joint_recalibration_score(
     return score, debug
 
 
+def incumbent_range_collapsed(
+    *,
+    selected_recent_range: float,
+    stale_switch_max_selected_recent_range_deg: float,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
+) -> bool:
+    """True when live ROM is below the absolute stale floor or a fraction of calibrated ROM."""
+    if selected_recent_range < stale_switch_max_selected_recent_range_deg:
+        return True
+    cal = float(calibrated_rom or 0.0)
+    ratio = float(range_collapse_ratio or 0.0)
+    if cal > 0.0 and ratio > 0.0 and selected_recent_range < cal * ratio:
+        return True
+    return False
+
+
 def compute_incumbent_health(
     *,
     stale_reevals: int,
@@ -321,8 +471,17 @@ def compute_incumbent_health(
     stale_switch_min_closed_streak: int,
     selected_score: float,
     selected_pose_score: float,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> dict[str, Any]:
-    low_range = selected_recent_range < stale_switch_max_selected_recent_range_deg
+    absolute_low = selected_recent_range < stale_switch_max_selected_recent_range_deg
+    low_range = incumbent_range_collapsed(
+        selected_recent_range=selected_recent_range,
+        stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
+    )
+    relative_collapse = bool(low_range and not absolute_low)
     gate_closed = selected_range_gate_closed_streak >= stale_switch_min_closed_streak
     low_score = selected_score < 0.35
     low_pose = selected_pose_score < UNOBSERVABLE_POSE_SCORE
@@ -346,6 +505,7 @@ def compute_incumbent_health(
         "staleThreshold": int(stale_threshold),
         "staleIncumbentBad": bool(stale_incumbent_bad),
         "lowRange": bool(low_range),
+        "relativeRomCollapse": bool(relative_collapse),
         "gateClosed": bool(gate_closed),
         "lowScore": bool(low_score),
         "lowPose": bool(low_pose),
@@ -382,20 +542,31 @@ def should_run_full_recalibration(
     selected_range_gate_closed_streak: int,
     stale_switch_max_selected_recent_range_deg: float,
     stale_switch_min_closed_streak: int,
+    selected_score: float = 1.0,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> bool:
     if has_pending_switch or has_handoff_observation:
         return True
-    if current_raw < tracking_raw_at_joint_lock + max(0, int(post_lock_min_raw_reps)):
-        return False
     incumbent_health = compute_incumbent_health(
         stale_reevals=0,
         selected_recent_range=selected_recent_range,
         stale_switch_max_selected_recent_range_deg=stale_switch_max_selected_recent_range_deg,
         selected_range_gate_closed_streak=selected_range_gate_closed_streak,
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
-        selected_score=1.0,
+        selected_score=float(selected_score),
         selected_pose_score=selected_pose_score,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
+    # Keep post-lock warmup for healthy incumbents, but do not block re-evals when
+    # the currently tracked joint is already stale/bad (low ROM, closed range gate,
+    # weak score, or weak pose). This allows generic fallback recovery across joints.
+    within_post_lock_warmup = (
+        current_raw < tracking_raw_at_joint_lock + max(0, int(post_lock_min_raw_reps))
+    )
+    if within_post_lock_warmup and bool(incumbent_health.get("incumbentRangeHealthy")):
+        return False
     if raw_advanced_since_last_eval and bool(incumbent_health.get("incumbentRangeHealthy")):
         return False
     return True
@@ -411,9 +582,19 @@ def select_recalibration_candidate(
     selected_range_gate_closed_streak: int = 0,
     stale_switch_max_selected_recent_range_deg: float = 14.0,
     stale_switch_min_closed_streak: int = 10,
+    fallback_armed: bool = False,
+    primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> tuple[str | None, dict[str, Any]]:
     variance_by_joint = variance_by_joint or {}
-    field_median_range = median_recent_range_from_score_debug(scores)
+    selected_unit = (
+        signal_unit(selected_angle) if isinstance(selected_angle, str) else None
+    )
+    field_median_range = median_recent_range_from_score_debug(
+        scores,
+        signal_unit=selected_unit,
+    )
     variance_values = [
         float((variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0)
         for angle_key in scores
@@ -438,6 +619,8 @@ def select_recalibration_candidate(
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
         selected_score=float(selected_score),
         selected_pose_score=float(selected_debug.get("poseScore") or 0.0),
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
     allow_cross_family = allow_cross_family_rescue(
         incumbent_health=selected_health,
@@ -448,8 +631,13 @@ def select_recalibration_candidate(
     best_key: Optional[str] = None
     best_score = -1.0
     best_debug: dict[str, Any] = {}
+    best_primary_key: Optional[str] = None
+    best_primary_score = -1.0
+    best_primary_debug: dict[str, Any] = {}
     for angle_key, (score, debug) in scores.items():
         if angle_key == selected_angle:
+            continue
+        if is_fallback_angle(angle_key) and not fallback_armed:
             continue
         if (
             isinstance(selected_angle, str)
@@ -459,8 +647,12 @@ def select_recalibration_candidate(
             continue
         if float(debug.get("poseScore") or 0.0) < UNOBSERVABLE_POSE_SCORE:
             continue
+        candidate_unit = signal_unit(angle_key)
+        range_floor = min_range
+        if candidate_unit != selected_unit:
+            range_floor = 0.0
         recent_range = float(debug.get("recentRange") or 0.0)
-        if min_range > 0.0 and recent_range < min_range:
+        if range_floor > 0.0 and recent_range < range_floor:
             continue
         joint_variance = float(
             (variance_by_joint.get(angle_key) or {}).get("medianWindowVariance") or 0.0
@@ -471,9 +663,37 @@ def select_recalibration_candidate(
             best_key = angle_key
             best_score = float(score)
             best_debug = debug
+        if (not is_fallback_angle(angle_key)) and score > best_primary_score:
+            best_primary_key = angle_key
+            best_primary_score = float(score)
+            best_primary_debug = debug
+
+    primary_recovered = bool(
+        best_primary_key
+        and best_primary_score >= float(primary_recovery_score)
+        and float(best_primary_debug.get("poseScore") or 0.0) >= CANDIDATE_MIN_POSE_SCORE
+        and float(best_primary_debug.get("activityScore") or 0.0) >= CANDIDATE_MIN_ACTIVITY
+        and int(best_primary_debug.get("completedCycles") or 0) >= CANDIDATE_MIN_COMPLETED_CYCLES
+    )
+    if (
+        fallback_armed
+        and isinstance(best_key, str)
+        and is_fallback_angle(best_key)
+        and primary_recovered
+        and isinstance(best_primary_key, str)
+    ):
+        best_key = best_primary_key
+        best_score = best_primary_score
+        best_debug = best_primary_debug
+
     return best_key, {
         "candidateScore": best_score,
         "candidateDebug": best_debug,
+        "bestPrimaryCandidate": best_primary_key,
+        "bestPrimaryScore": best_primary_score,
+        "primaryRecovered": primary_recovered,
+        "fallbackArmed": bool(fallback_armed),
+        "fieldMedianRangeUnit": selected_unit,
         "fieldMedianRange": field_median_range,
         "fieldMedianVariance": field_median_variance,
         "allowCrossFamily": bool(allow_cross_family),
@@ -502,6 +722,15 @@ def should_switch_to_candidate(
     selected_median_rom_deg: float = 0.0,
     median_recent_range_all: float = 0.0,
     same_joint_family: bool = False,
+    selected_signal_unit: str = "deg",
+    candidate_signal_unit: str = "deg",
+    primary_recovery_cross_modality: bool = False,
+    primary_recovery_force_after_stale_reevals: int = 8,
+    primary_recovery_skip_score_margin: bool = False,
+    primary_recovery_score: float = PRIMARY_RECOVERY_SCORE,
+    incumbent_is_fallback: bool = False,
+    calibrated_rom: float = 0.0,
+    range_collapse_ratio: float = INCUMBENT_RANGE_COLLAPSE_RATIO,
 ) -> tuple[bool, bool, dict[str, Any]]:
     incumbent_health = compute_incumbent_health(
         stale_reevals=stale_reevals,
@@ -511,6 +740,8 @@ def should_switch_to_candidate(
         stale_switch_min_closed_streak=stale_switch_min_closed_streak,
         selected_score=selected_score,
         selected_pose_score=selected_pose_score,
+        calibrated_rom=calibrated_rom,
+        range_collapse_ratio=range_collapse_ratio,
     )
     incumbent_bad = bool(incumbent_health.get("incumbentBad"))
 
@@ -519,20 +750,34 @@ def should_switch_to_candidate(
     score_margin = SAME_FAMILY_SCORE_MARGIN if same_joint_family else CROSS_FAMILY_SCORE_MARGIN
     score_ratio = SAME_FAMILY_SCORE_RATIO if same_joint_family else CROSS_FAMILY_SCORE_RATIO
 
+    compare_motion_ranges = selected_signal_unit == candidate_signal_unit
     candidate_range_vs_incumbent = (
-        candidate_recent_range <= 0.0
+        not compare_motion_ranges
+        or candidate_recent_range <= 0.0
         or selected_recent_range <= 0.0
         or candidate_recent_range >= selected_recent_range * range_ratio
     )
     candidate_range_vs_field = (
-        median_recent_range_all <= 0.0
+        not compare_motion_ranges
+        or median_recent_range_all <= 0.0
         or candidate_recent_range <= 0.0
         or candidate_recent_range >= median_recent_range_all * CANDIDATE_MIN_MEDIAN_RANGE_RATIO
     )
+    incumbent_range_stale = bool(
+        incumbent_health.get("lowRange") or incumbent_health.get("gateClosed")
+    )
+    # When the tracked joint's recent ROM has collapsed, compare against its live
+    # sliding-window range—not peak cycle ROM from before the limb went quiet.
+    selected_rom_for_dominance = (
+        selected_recent_range
+        if incumbent_range_stale and selected_recent_range > 0.0
+        else selected_median_rom_deg
+    )
     candidate_rom_dominates = (
-        candidate_median_rom_deg <= 0.0
-        or selected_median_rom_deg <= 0.0
-        or candidate_median_rom_deg >= selected_median_rom_deg * rom_ratio
+        not compare_motion_ranges
+        or candidate_median_rom_deg <= 0.0
+        or selected_rom_for_dominance <= 0.0
+        or candidate_median_rom_deg >= selected_rom_for_dominance * rom_ratio
     )
     candidate_motion_ok = (
         candidate_range_vs_incumbent and candidate_range_vs_field and candidate_rom_dominates
@@ -546,14 +791,47 @@ def should_switch_to_candidate(
         and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
         and candidate_motion_ok
     )
+    if (
+        primary_recovery_cross_modality
+        and incumbent_is_fallback
+        and incumbent_bad
+        and candidate_score >= float(primary_recovery_score)
+        and candidate_score >= FORCE_SWITCH_MIN_SCORE
+        and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
+        and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
+        and candidate_observable
+        and candidate_completed_cycles >= CANDIDATE_MIN_COMPLETED_CYCLES
+        and candidate_motion_ok
+    ):
+        candidate_good = True
     candidate_clearly_better = (
         candidate_score >= selected_score + score_margin
         or candidate_score >= selected_score * score_ratio
     )
+    if (
+        primary_recovery_skip_score_margin
+        and primary_recovery_cross_modality
+        and incumbent_is_fallback
+        and incumbent_bad
+        and candidate_good
+        and candidate_score >= float(primary_recovery_score)
+    ):
+        candidate_clearly_better = True
+    # Collapsed live ROM is enough evidence to drop the extra "clearly better"
+    # score margin; any modality/family candidate that is independently good may switch.
+    if incumbent_range_stale and candidate_good:
+        candidate_clearly_better = True
     should_switch = cooldown_ok and incumbent_bad and candidate_good and candidate_clearly_better
 
+    force_after = (
+        int(primary_recovery_force_after_stale_reevals)
+        if primary_recovery_cross_modality
+        else int(stale_switch_force_after_reevals)
+    )
+    if incumbent_range_stale:
+        force_after = min(force_after, RANGE_COLLAPSE_FORCE_AFTER_STALE_REEVALS)
     force_switch = (
-        stale_reevals >= stale_switch_force_after_reevals
+        stale_reevals >= force_after
         and candidate_score >= FORCE_SWITCH_MIN_SCORE
         and candidate_activity_score >= FORCE_SWITCH_MIN_ACTIVITY
         and candidate_pose_score >= FORCE_SWITCH_MIN_POSE_SCORE
@@ -569,23 +847,37 @@ def should_switch_to_candidate(
         "candidateRangeVsIncumbent": bool(candidate_range_vs_incumbent),
         "candidateRangeVsField": bool(candidate_range_vs_field),
         "candidateRomDominates": bool(candidate_rom_dominates),
+        "incumbentRangeStale": bool(incumbent_range_stale),
+        "relativeRomCollapse": bool(incumbent_health.get("relativeRomCollapse")),
+        "selectedRomForDominance": float(selected_rom_for_dominance),
         "candidateObservable": bool(candidate_observable),
         "candidateClearlyBetter": bool(candidate_clearly_better),
+        "compareMotionRanges": bool(compare_motion_ranges),
+        "selectedSignalUnit": selected_signal_unit,
+        "candidateSignalUnit": candidate_signal_unit,
         "sameJointFamily": bool(same_joint_family),
         "shouldSwitch": bool(should_switch),
         "forceSwitch": bool(force_switch),
+        "primaryRecoveryCrossModality": bool(primary_recovery_cross_modality),
+        "forceAfterStaleReevals": int(force_after),
     }
 
 
 def is_same_joint_family(a: Optional[str], b: Optional[str]) -> bool:
     if not isinstance(a, str) or not isinstance(b, str):
         return False
+    if is_fallback_angle(a) or is_fallback_angle(b):
+        return a == b
     base_a = a[5:] if a.startswith("LEFT_") else a[6:] if a.startswith("RIGHT_") else a
     base_b = b[5:] if b.startswith("LEFT_") else b[6:] if b.startswith("RIGHT_") else b
     return base_a == base_b
 
 
 def is_mirrored_pair(a: Optional[str], b: Optional[str]) -> bool:
+    if isinstance(a, str) and is_fallback_angle(a):
+        return False
+    if isinstance(b, str) and is_fallback_angle(b):
+        return False
     if not is_same_joint_family(a, b):
         return False
     if not isinstance(a, str) or not isinstance(b, str):
@@ -612,6 +904,14 @@ def cycle_sync_score_last_4s(
 
 
 def classify_handoff(pending_state: dict[str, Any]) -> HandoffDecision:
+    incumbent_angle = pending_state.get("incumbent_angle")
+    candidate_angle = pending_state.get("candidate_angle")
+    if isinstance(incumbent_angle, str) and isinstance(candidate_angle, str):
+        if is_fallback_angle(incumbent_angle) or is_fallback_angle(candidate_angle):
+            return HandoffDecision(
+                kind="same_exercise",
+                rationale={"rule": "fallback_joint_transition"},
+            )
     incumbent_motion_span = float(pending_state.get("incumbent_motion_span_deg") or 0.0)
     candidate_pending_rom = float(pending_state.get("candidate_pending_rom_estimate_deg") or 0.0)
     incumbent_active_motion_threshold = max(

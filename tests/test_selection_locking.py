@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from flexible_rep_counter.session import (
+    ANGLE_SELECTION_VARIANCE_FALLBACK_SEC,
     _adaptive_variance_gate,
     _apply_locked_tracking,
     _family_rep_dominance,
     _peak_detector_from_tuning,
     _select_family_joint_candidate,
     _selection_dominance_thresholds,
+    _selection_variance_fallback_ready,
 )
 
 
@@ -103,3 +105,17 @@ def test_selection_thresholds_relax_over_time() -> None:
     assert late["joint_fraction"] < early["joint_fraction"]
     assert late["family_fraction"] < early["family_fraction"]
     assert late["streak_required"] < early["streak_required"]
+
+
+def test_variance_fallback_waits_for_timeout_even_when_ready() -> None:
+    """Calibration-rep counts must not skip dominance via the variance lock path."""
+    before_timeout = max(0.1, float(ANGLE_SELECTION_VARIANCE_FALLBACK_SEC) - 1.0)
+    assert _selection_variance_fallback_ready(ready=True, elapsed_s=before_timeout) is False
+    assert _selection_variance_fallback_ready(
+        ready=True,
+        elapsed_s=float(ANGLE_SELECTION_VARIANCE_FALLBACK_SEC),
+    ) is True
+    assert _selection_variance_fallback_ready(
+        ready=False,
+        elapsed_s=float(ANGLE_SELECTION_VARIANCE_FALLBACK_SEC),
+    ) is False

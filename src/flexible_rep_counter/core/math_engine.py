@@ -101,14 +101,145 @@ def calculate_body_scale(landmarks: list) -> float:
     return abs(height) or 1.0
 
 
-def calculate_from_type(
-    calc_type: str,
-    target_landmarks: list[int],
+def _landmark_if_confident(
+    landmarks: list[dict],
+    index: int,
+    *,
+    min_conf: float,
+) -> Optional[dict]:
+    if index < 0 or index >= len(landmarks):
+        return None
+    point = landmarks[index]
+    conf = float(point.get("confidence", 0.0)) if isinstance(point, dict) else 0.0
+    if conf < min_conf:
+        return None
+    return point
+
+
+def _mean_y_for_indices(
+    landmarks: list[dict],
+    indices: list[int],
+    *,
+    min_conf: float,
+) -> Optional[float]:
+    if not indices:
+        return None
+    ys: list[float] = []
+    for idx in indices:
+        point = _landmark_if_confident(landmarks, int(idx), min_conf=min_conf)
+        if point is None:
+            return None
+        _, y = _get_xy(point)
+        ys.append(y)
+    return sum(ys) / len(ys) if ys else None
+
+
+def _mean_x_for_indices(
+    landmarks: list[dict],
+    indices: list[int],
+    *,
+    min_conf: float,
+) -> Optional[float]:
+    if not indices:
+        return None
+    xs: list[float] = []
+    for idx in indices:
+        point = _landmark_if_confident(landmarks, int(idx), min_conf=min_conf)
+        if point is None:
+            return None
+        x, _ = _get_xy(point)
+        xs.append(x)
+    return sum(xs) / len(xs) if xs else None
+
+
+def _relational_scale_px(
+    landmarks: list[dict],
+    *,
+    scale_kind: str,
+    min_conf: float,
+) -> Optional[float]:
+    kind = scale_kind.strip().lower()
+    if kind == "shoulder_width":
+        left_x = _mean_x_for_indices(landmarks, [5], min_conf=min_conf)
+        right_x = _mean_x_for_indices(landmarks, [6], min_conf=min_conf)
+        if left_x is None or right_x is None:
+            return None
+        return abs(left_x - right_x)
+    if kind == "hip_width":
+        left_x = _mean_x_for_indices(landmarks, [11], min_conf=min_conf)
+        right_x = _mean_x_for_indices(landmarks, [12], min_conf=min_conf)
+        if left_x is None or right_x is None:
+            return None
+        return abs(left_x - right_x)
+    if kind == "torso_height":
+        shoulder_y = _mean_y_for_indices(landmarks, [5, 6], min_conf=min_conf)
+        hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
+        if shoulder_y is None or hip_y is None:
+            return None
+        return abs(hip_y - shoulder_y)
+    if kind == "leg_length":
+        hip_y = _mean_y_for_indices(landmarks, [11, 12], min_conf=min_conf)
+        ankle_y = _mean_y_for_indices(landmarks, [15, 16], min_conf=min_conf)
+        if hip_y is None or ankle_y is None:
+            return None
+        return abs(ankle_y - hip_y)
+    # Fallback keeps backward compatibility for unknown values.
+    return calculate_body_scale(landmarks)
+
+
+def calculate_scale_px_for_cfg(
+    cfg: dict[str, Any],
     landmarks: list[dict],
 ) -> Optional[float]:
-    if not landmarks or not target_landmarks:
+    min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
+    scale_cfg = cfg.get("scale") or {}
+    scale_kind = (
+        str(scale_cfg.get("kind")).strip()
+        if isinstance(scale_cfg, dict) and scale_cfg.get("kind")
+        else "torso_height"
+    )
+    scale_px = _relational_scale_px(
+        landmarks,
+        scale_kind=scale_kind,
+        min_conf=min_conf,
+    )
+    if scale_px is None:
         return None
-    points = [landmarks[i] if i < len(landmarks) else None for i in target_landmarks]
+    return max(abs(float(scale_px)), 1e-6)
+
+
+def calculate_absolute_y_position(
+    cfg: dict[str, Any],
+    landmarks: list[dict],
+) -> Optional[float]:
+    indices = [int(i) for i in (cfg.get("sample_landmarks") or cfg.get("landmarks") or [])]
+    if not indices:
+        return None
+    min_conf = float(cfg.get("min_conf", 0.4) or 0.4)
+    return _mean_y_for_indices(landmarks, indices, min_conf=min_conf)
+
+
+def calculate_from_type(
+    calc_type: str,
+    target_landmarks: Any,
+    landmarks: list[dict],
+) -> Optional[float]:
+    if not landmarks or target_landmarks is None:
+        return None
+    cfg: dict[str, Any]
+    if isinstance(target_landmarks, dict):
+        cfg = target_landmarks
+        indices = list(cfg.get("landmarks") or [])
+    else:
+        indices = list(target_landmarks or [])
+        cfg = {"landmarks": indices}
+
+    if calc_type == "absolute_y_position":
+        return calculate_absolute_y_position(cfg, landmarks)
+
+    if not indices:
+        return None
+    points = [landmarks[i] if i < len(landmarks) else None for i in indices]
     if any(p is None for p in points):
         return None
     if calc_type == "angle_3_point" and len(points) >= 3:
@@ -207,8 +338,12 @@ class PeakDetector:
         self.neutral_frame_count = 0
         self.peaks: list[float] = []
         self.valleys: list[float] = []
+        self.peak_frame_ids: list[Optional[str]] = []
+        self.valley_frame_ids: list[Optional[str]] = []
         self.current_peak_value: Optional[float] = None
         self.current_valley_value: Optional[float] = None
+        self.current_peak_frame_id: Optional[str] = None
+        self.current_valley_frame_id: Optional[str] = None
         self._last_debanded_pass: Optional[float] = None
         # True after calibration_reps reps: locked baselines for strict margin checks
         self._calibrated: bool = False
@@ -327,8 +462,13 @@ class PeakDetector:
     def _range_gate_allows_rep_recording(self) -> bool:
         return self._last_range_gate_open
 
-    def _record_peak_on_reversal(self) -> tuple[Optional[float], bool]:
-        """Append a peak at end of GOING_UP; may increment rep_count. Returns (detected_peak, rep_completed)."""
+    def _record_peak_on_reversal(self) -> tuple[Optional[float], bool, Optional[float], Optional[str]]:
+        """Append a peak at end of GOING_UP; may increment rep_count.
+
+        Returns (counted_peak, rep_completed, reversal_peak, block_reason). The
+        reversal value is exposed even when old calibration margins reject the
+        rep, so recalibration can still see strong new motion.
+        """
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
             self._instr_emit(
                 {
@@ -340,7 +480,7 @@ class PeakDetector:
                     "min_peak_distance": self.min_peak_distance,
                 }
             )
-            return None, False
+            return None, False, None, "min_peak_distance_block"
         if not self._calibrated:
             within_margin = True
         else:
@@ -378,9 +518,11 @@ class PeakDetector:
                     "rolling_range": self._last_rolling_range,
                 }
             )
-            return None, False
+            reversal_peak = self.current_peak_value if reason == "margin_fail" and gate_ok else None
+            return None, False, reversal_peak, reason
         detected_peak = self.current_peak_value
         self.peaks.append(self.current_peak_value)
+        self.peak_frame_ids.append(self.current_peak_frame_id)
         self.last_peak_frame = self.frame_count
         new_rep_count = min(len(self.peaks), len(self.valleys))
         rep_completed = False
@@ -437,10 +579,13 @@ class PeakDetector:
                 }
             )
         self._maybe_lock_calibration()
-        return detected_peak, rep_completed
+        return detected_peak, rep_completed, detected_peak, None
 
-    def _record_valley_on_reversal(self) -> tuple[Optional[float], bool]:
-        """Append a valley at end of GOING_DOWN; may increment rep_count. Returns (detected_valley, rep_completed)."""
+    def _record_valley_on_reversal(self) -> tuple[Optional[float], bool, Optional[float], Optional[str]]:
+        """Append a valley at end of GOING_DOWN; may increment rep_count.
+
+        Returns (counted_valley, rep_completed, reversal_valley, block_reason).
+        """
         if self.frame_count - self.last_peak_frame < self.min_peak_distance:
             self._instr_emit(
                 {
@@ -452,7 +597,7 @@ class PeakDetector:
                     "min_peak_distance": self.min_peak_distance,
                 }
             )
-            return None, False
+            return None, False, None, "min_peak_distance_block"
         if not self._calibrated:
             within_margin = True
         else:
@@ -490,9 +635,11 @@ class PeakDetector:
                     "rolling_range": self._last_rolling_range,
                 }
             )
-            return None, False
+            reversal_valley = self.current_valley_value if reason == "margin_fail" and gate_ok else None
+            return None, False, reversal_valley, reason
         detected_valley = self.current_valley_value
         self.valleys.append(self.current_valley_value)
+        self.valley_frame_ids.append(self.current_valley_frame_id)
         self.last_peak_frame = self.frame_count
         new_rep_count = min(len(self.peaks), len(self.valleys))
         rep_completed = False
@@ -547,9 +694,15 @@ class PeakDetector:
                 }
             )
         self._maybe_lock_calibration()
-        return detected_valley, rep_completed
+        return detected_valley, rep_completed, detected_valley, None
 
-    def update(self, raw_value: Optional[float]) -> dict[str, Any]:
+    def update(
+        self,
+        raw_value: Optional[float],
+        *,
+        frame_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        fid = (frame_id or "").strip() or None
         if raw_value is None:
             self._last_debanded_pass = None
             stats = self._calibration_stats()
@@ -585,11 +738,16 @@ class PeakDetector:
         rep_completed = False
         detected_peak = None
         detected_valley = None
+        reversal_peak = None
+        reversal_valley = None
+        reversal_block_reason = None
 
         if self.state == PEAK_STATE_NEUTRAL:
             if self.current_peak_value is None or self.current_valley_value is None:
                 self.current_peak_value = self.smoothed_value
                 self.current_valley_value = self.smoothed_value
+                self.current_peak_frame_id = fid
+                self.current_valley_frame_id = fid
             self.neutral_frame_count += 1
             if self.neutral_frame_count > 30:
                 drift = 0.05
@@ -598,35 +756,49 @@ class PeakDetector:
             if self.smoothed_value > self.current_peak_value + self.hysteresis:
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
                 self.neutral_frame_count = 0
             elif self.smoothed_value < self.current_valley_value - self.hysteresis:
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
                 self.neutral_frame_count = 0
 
         elif self.state == PEAK_STATE_GOING_UP:
             if self.smoothed_value > self.current_peak_value:
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
             elif self.smoothed_value < self.current_peak_value - self.hysteresis:
-                dp, rc = self._record_peak_on_reversal()
+                dp, rc, rp, block_reason = self._record_peak_on_reversal()
                 if dp is not None:
                     detected_peak = dp
+                if rp is not None:
+                    reversal_peak = rp
+                if block_reason is not None:
+                    reversal_block_reason = block_reason
                 if rc:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_DOWN
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
 
         elif self.state == PEAK_STATE_GOING_DOWN:
             if self.smoothed_value < self.current_valley_value:
                 self.current_valley_value = self.smoothed_value
+                self.current_valley_frame_id = fid
             elif self.smoothed_value > self.current_valley_value + self.hysteresis:
-                dv, rc = self._record_valley_on_reversal()
+                dv, rc, rv, block_reason = self._record_valley_on_reversal()
                 if dv is not None:
                     detected_valley = dv
+                if rv is not None:
+                    reversal_valley = rv
+                if block_reason is not None:
+                    reversal_block_reason = block_reason
                 if rc:
                     rep_completed = True
                 self.state = PEAK_STATE_GOING_UP
                 self.current_peak_value = self.smoothed_value
+                self.current_peak_frame_id = fid
 
         if prev_state != self.state:
             self._instr_emit(
@@ -643,6 +815,9 @@ class PeakDetector:
             "repCompleted": rep_completed,
             "peak": detected_peak,
             "valley": detected_valley,
+            "reversalPeak": reversal_peak,
+            "reversalValley": reversal_valley,
+            "reversalBlockReason": reversal_block_reason,
             "rawValue": float(raw_value),
             "feedValue": float(feed),
             "smoothedValue": self.smoothed_value,
@@ -682,8 +857,12 @@ class PeakDetector:
         self.neutral_frame_count = 0
         self.peaks.clear()
         self.valleys.clear()
+        self.peak_frame_ids.clear()
+        self.valley_frame_ids.clear()
         self.current_peak_value = None
         self.current_valley_value = None
+        self.current_peak_frame_id = None
+        self.current_valley_frame_id = None
         self._value_window.clear()
         self._last_rolling_range = 0.0
         self._last_range_gate_open = self.min_range_gate_degrees <= 0
@@ -694,6 +873,28 @@ class PeakDetector:
         self._last_rep_time_ms = None
         self._instrumentation_events.clear()
 
+    def reset_calibration_preserve_reps(self) -> None:
+        self.state = PEAK_STATE_NEUTRAL
+        self.smoothed_value = None
+        self.last_peak_frame = -self.min_peak_distance
+        self.neutral_frame_count = 0
+        self.peaks.clear()
+        self.valleys.clear()
+        self.peak_frame_ids.clear()
+        self.valley_frame_ids.clear()
+        self.current_peak_value = None
+        self.current_valley_value = None
+        self.current_peak_frame_id = None
+        self.current_valley_frame_id = None
+        self._value_window.clear()
+        self._last_rolling_range = 0.0
+        self._last_range_gate_open = self.min_range_gate_degrees <= 0
+        self._last_debanded_pass = None
+        self._calibrated = False
+        self._calibrated_avg_peak = None
+        self._calibrated_avg_valley = None
+        self._instrumentation_events.clear()
+
     def get_state(self) -> dict[str, Any]:
         return {
             "state": self.state,
@@ -702,6 +903,10 @@ class PeakDetector:
             "repCount": self.rep_count,
             "currentPeakValue": self.current_peak_value,
             "currentValleyValue": self.current_valley_value,
+            "currentPeakFrameId": self.current_peak_frame_id,
+            "currentValleyFrameId": self.current_valley_frame_id,
+            "peakFrameIds": list(self.peak_frame_ids),
+            "valleyFrameIds": list(self.valley_frame_ids),
             "calibrationComplete": self._calibrated,
             "calibrationTargetReps": self.calibration_reps,
             "calibrationCertainty": float(self._calibration_stats().get("certainty") or 0.0),

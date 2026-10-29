@@ -1,0 +1,22 @@
+---
+description: Exercise-agnostic rep counter — no per-joint or exercise-specific code
+alwaysApply: true
+---
+
+# Exercise-agnostic rep counter
+
+This repo detects reps from **motion patterns** (angle variance or vertical Y displacement), not named exercises.
+
+## Never add
+
+- Exercise-named joints or fields (`SHRUG`, `CURL`, `shrug_y_signal`, etc.)
+- Per-joint TOML sections (`[rep.joints.*]`, `[angle_selection.joints.*]`)
+- Hardcoded joint lists for behavior (use `modality`, `eligibility`, or `scale.kind`)
+
+## Always use
+
+- **Modality-based config**: `[rep.vertical_px]`, `[angle_selection.vertical_px]` vs global `[rep]` / `[angle_selection]`
+- **Anatomical signal keys** in `COMMON_ANGLES` (e.g. `SHOULDER_Y`, `LEFT_ELBOW`), not exercise names
+- **Generic fixes** to selection, handoff, margins, and fallback — not one-limb special cases
+
+See `AGENTS.md` for full guidelines.

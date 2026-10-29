@@ -17,7 +17,9 @@ from flexible_rep_counter.core.recalibration_confidence import (
     HandoffDecision,
     JointMotionState,
     classify_handoff,
+    compute_incumbent_health,
     compute_joint_recalibration_score,
+    incumbent_range_collapsed,
     select_recalibration_candidate,
     should_run_full_recalibration,
     should_switch_to_candidate,
@@ -63,9 +65,39 @@ class _ScriptedDetector:
         return self.rep_count
 
 
+class _ReversalOnlyDetector:
+    def __init__(self, outputs: list[dict[str, Any]]) -> None:
+        self._outputs = list(outputs)
+        self._idx = 0
+        self.rep_count = 0
+        self.peaks: list[float] = []
+        self.valleys: list[float] = []
+
+    def update(self, value: float | None) -> dict[str, Any]:
+        i = min(self._idx, len(self._outputs) - 1)
+        self._idx += 1
+        output = {
+            "repCount": self.rep_count,
+            "peak": None,
+            "valley": None,
+            "reversalPeak": None,
+            "reversalValley": None,
+            "rollingRange": 60.0,
+            "rangeGateOpen": True,
+            "calibrationComplete": True,
+            "smoothedValue": value,
+            "state": "GOING_DOWN",
+        }
+        output.update(self._outputs[i])
+        return output
+
+    def get_rep_count(self) -> int:
+        return self.rep_count
+
+
 def _make_state(
     angle_key: str,
-    detector: _ScriptedDetector | None = None,
+    detector: Any | None = None,
     history_values: list[float] | None = None,
     confidence: float = 0.99,
 ) -> JointMotionState:
@@ -375,6 +407,35 @@ def test_cycle_gating_rejects_low_range_cycles() -> None:
     assert score < 0.62
 
 
+def test_margin_blocked_reversals_count_as_recalibration_evidence() -> None:
+    detector = _ReversalOnlyDetector(
+        [
+            {"reversalPeak": 150.0},
+            {"reversalValley": 55.0},
+            {"reversalPeak": 148.0},
+            {"reversalValley": 57.0},
+        ]
+    )
+    state = _make_state(
+        "RIGHT_ELBOW",
+        detector=cast(PeakDetector, detector),
+        history_values=[55.0, 80.0, 110.0, 140.0, 150.0, 120.0, 90.0, 60.0] * 6,
+    )
+
+    for i, value in enumerate([150.0, 55.0, 148.0, 57.0]):
+        update_joint_motion_state(state, value, 0.99, 2000 + i * 500)
+
+    score, debug = compute_joint_recalibration_score(
+        state,
+        {"medianWindowVariance": 80.0, "activeWindowCount": 4, "smoothedRangeDeg": 95.0},
+        now_ms=4000,
+    )
+    assert detector.get_rep_count() == 0
+    assert debug["completedCycles"] >= 2
+    assert debug["activityScore"] == 1.0
+    assert score >= 0.62
+
+
 def test_force_stale_requires_two_gated_cycles() -> None:
     can_switch, force_switch, _ = should_switch_to_candidate(
         cooldown_ok=True,
@@ -483,7 +544,8 @@ def test_full_reeval_when_raw_stale_even_if_range_healthy() -> None:
     assert should_run is True
 
 
-def test_post_lock_grace_skips_full_reeval() -> None:
+def test_post_lock_warmup_allows_full_reeval_when_incumbent_is_bad() -> None:
+    """Before post_lock threshold, bad incumbent health should still trigger full re-eval."""
     should_run = should_run_full_recalibration(
         has_pending_switch=False,
         has_handoff_observation=False,
@@ -492,12 +554,154 @@ def test_post_lock_grace_skips_full_reeval() -> None:
         post_lock_min_raw_reps=5,
         raw_advanced_since_last_eval=False,
         selected_recent_range=4.0,
-        selected_pose_score=0.1,
+        selected_pose_score=0.9,
         selected_range_gate_closed_streak=12,
         stale_switch_max_selected_recent_range_deg=14.0,
         stale_switch_min_closed_streak=10,
+        selected_score=0.55,
+    )
+    assert should_run is True
+
+
+def test_post_lock_warmup_still_skips_full_reeval_when_incumbent_is_healthy() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=2,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=False,
+        selected_recent_range=34.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.70,
     )
     assert should_run is False
+
+
+def test_relative_rom_collapse_marks_incumbent_bad() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        calibrated_rom=61.0,
+    )
+    assert health["lowRange"] is True
+    assert health["relativeRomCollapse"] is True
+    assert health["incumbentBad"] is True
+    assert health["incumbentRangeHealthy"] is False
+    assert incumbent_range_collapsed(
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        calibrated_rom=61.0,
+    )
+
+
+def test_recent_rom_near_calibrated_is_not_collapsed() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=58.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        calibrated_rom=61.0,
+    )
+    assert health["lowRange"] is False
+    assert health["relativeRomCollapse"] is False
+    assert health["incumbentRangeHealthy"] is True
+
+
+def test_recent_range_above_absolute_floor_is_healthy_without_calibrated_rom() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=1,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+    )
+    assert health["lowRange"] is False
+    assert health["relativeRomCollapse"] is False
+    assert health["incumbentRangeHealthy"] is True
+
+
+def test_post_lock_warmup_reevals_when_rom_collapsed_relative_to_calibrated() -> None:
+    should_run = should_run_full_recalibration(
+        has_pending_switch=False,
+        has_handoff_observation=False,
+        current_raw=2,
+        tracking_raw_at_joint_lock=0,
+        post_lock_min_raw_reps=5,
+        raw_advanced_since_last_eval=True,
+        selected_recent_range=18.0,
+        selected_pose_score=0.9,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        calibrated_rom=61.0,
+    )
+    assert should_run is True
+
+
+def test_collapsed_rom_allows_cross_family_switch_without_score_margin() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=18.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=0,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.88,
+        selected_pose_score=0.95,
+        candidate_score=0.75,
+        candidate_activity_score=0.80,
+        candidate_pose_score=0.95,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=48.0,
+        candidate_median_rom_deg=46.0,
+        selected_median_rom_deg=61.0,
+        median_recent_range_all=30.0,
+        same_joint_family=False,
+        calibrated_rom=61.0,
+    )
+    assert can_switch is True
+    assert debug["relativeRomCollapse"] is True
+    assert debug["incumbentRangeStale"] is True
+    assert debug["candidateClearlyBetter"] is True
+    assert debug["candidateMotionOk"] is True
+
+
+def test_cross_family_allowed_when_rom_collapsed_relative_to_calibrated() -> None:
+    scores = {
+        "LEFT_ELBOW": (0.88, {"poseScore": 0.95, "recentRange": 18.0}),
+        "RIGHT_KNEE": (0.75, {"poseScore": 0.95, "recentRange": 48.0}),
+        "RIGHT_ELBOW": (0.40, {"poseScore": 0.95, "recentRange": 16.0}),
+    }
+    candidate, selector_debug = select_recalibration_candidate(
+        scores,
+        "LEFT_ELBOW",
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_range_gate_closed_streak=0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        stale_switch_min_closed_streak=10,
+        calibrated_rom=61.0,
+    )
+    assert selector_debug["allowCrossFamily"] is True
+    assert selector_debug["incumbentHealth"]["relativeRomCollapse"] is True
+    assert candidate == "RIGHT_KNEE"
 
 
 def test_cross_family_excluded_when_incumbent_healthy() -> None:
@@ -632,6 +836,37 @@ def test_same_family_mirrored_switch_still_allowed_with_strong_motion() -> None:
         median_recent_range_all=35.0,
         same_joint_family=True,
     )
+    assert can_switch
+    assert debug["shouldSwitch"] is True
+
+
+def test_stale_incumbent_rom_dominance_uses_recent_range_not_cycle_median() -> None:
+    """Mirrored limb handoff: incumbent quiet but historical cycle ROM still high."""
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=4.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.68,
+        selected_pose_score=0.95,
+        candidate_score=0.93,
+        candidate_activity_score=1.0,
+        candidate_pose_score=1.0,
+        candidate_observable=True,
+        candidate_completed_cycles=6,
+        candidate_recent_range=57.0,
+        candidate_median_rom_deg=55.0,
+        selected_median_rom_deg=65.0,
+        median_recent_range_all=4.0,
+        same_joint_family=True,
+    )
+    assert debug["incumbentRangeStale"] is True
+    assert debug["selectedRomForDominance"] == 4.0
+    assert debug["candidateRomDominates"] is True
+    assert debug["candidateMotionOk"] is True
     assert can_switch
     assert debug["shouldSwitch"] is True
 
@@ -791,3 +1026,258 @@ def test_alternate_limb_uses_observation_start_not_pending_start() -> None:
     )
     assert shown == 19
     assert raw == 19
+
+
+def test_fallback_y_switch_credits_epoch_reps_not_zero_carry() -> None:
+    from flexible_rep_counter.session import _activate_joint_switch
+
+    run_state: dict[str, Any] = {
+        "selected_angle": "RIGHT_ELBOW",
+        "fallback_epoch_raw": {"SHOULDER_Y": 6},
+        "pending_switch_candidate_carryover_start_raw": 6,
+        "pending_switch_candidate_carryover_start_shown": 6,
+        "tracking_step_count": 0,
+        "suppress_retroactive_credit_until_step": 0,
+        "last_joint_switch_step": 0,
+        "rep_count_shown_floor": 0,
+    }
+    det = _ScriptedDetector([10] * 5, rolling_range_deg=20.0)
+    sdba: dict[str, Any] = {"SHOULDER_Y": det}
+    _activate_joint_switch(
+        run_state,
+        sdba,
+        new_angle="SHOULDER_Y",
+        detector=det,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        switched_at=0.0,
+    )
+    assert int(run_state["rep_count_offset"]) == 4
+    assert int(run_state["rep_count_offset"]) + det.get_rep_count() == 14
+
+
+def test_fallback_y_switch_credits_epoch_reps_not_zero_carry() -> None:
+    from flexible_rep_counter.session import _activate_joint_switch
+
+    run_state: dict[str, Any] = {
+        "selected_angle": "RIGHT_ELBOW",
+        "fallback_epoch_raw": {"SHOULDER_Y": 6},
+        "pending_switch_candidate_carryover_start_raw": 6,
+        "pending_switch_candidate_carryover_start_shown": 6,
+        "tracking_step_count": 0,
+        "suppress_retroactive_credit_until_step": 0,
+        "last_joint_switch_step": 0,
+        "rep_count_shown_floor": 0,
+    }
+    det = _ScriptedDetector([10] * 5, rolling_range_deg=20.0)
+    sdba: dict[str, Any] = {"SHOULDER_Y": det}
+    _activate_joint_switch(
+        run_state,
+        sdba,
+        new_angle="SHOULDER_Y",
+        detector=det,
+        cumulative_shown=10,
+        cumulative_raw=10,
+        switched_at=0.0,
+    )
+    assert int(run_state["rep_count_offset"]) == 4
+    assert int(run_state["rep_count_offset"]) + det.get_rep_count() == 14
+
+
+def test_recal_frame_instr_payload_exposes_handoff_and_rom_fields() -> None:
+    from flexible_rep_counter.session import _recal_frame_instr_payload
+
+    right = JointMotionState(
+        angle_key="RIGHT_ELBOW",
+        detector=PeakDetector(),
+        history=deque(),
+        confidence_history=deque(),
+    )
+    left = JointMotionState(
+        angle_key="LEFT_ELBOW",
+        detector=PeakDetector(),
+        history=deque(),
+        confidence_history=deque(),
+    )
+    right.recent_roms.extend([62.0, 64.0, 66.0])
+    left.recent_roms.extend([54.0, 56.0, 58.0])
+    run_state: dict[str, Any] = {
+        "handoff_observation_candidate_angle": "LEFT_ELBOW",
+        "handoff_observation_selected_angle": "RIGHT_ELBOW",
+        "joint_motion_states": {"RIGHT_ELBOW": right, "LEFT_ELBOW": left},
+        "recal_instr": {
+            "recal_candidate_angle": "LEFT_ELBOW",
+            "selected_rom_for_dominance": 4.2,
+            "candidate_rom_dominates": False,
+        },
+    }
+
+    payload = _recal_frame_instr_payload(run_state, selected_angle="RIGHT_ELBOW")
+
+    assert payload["handoff_observation_candidate_angle"] == "LEFT_ELBOW"
+    assert payload["handoff_observation_selected_angle"] == "RIGHT_ELBOW"
+    assert payload["selected_median_rom_deg"] == 64.0
+    assert payload["candidate_median_rom_deg"] == 56.0
+    assert payload["recal_candidate_angle"] == "LEFT_ELBOW"
+    assert payload["selected_rom_for_dominance"] == 4.2
+    assert payload["candidate_rom_dominates"] is False
+
+
+def test_scale_relative_gate_scales_with_distance() -> None:
+    from flexible_rep_counter.session import _effective_scale_relative_min_range_gate
+    import flexible_rep_counter.session as session_mod
+
+    session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = True
+    session_mod.REP_VERTICAL_PX_MIN_SCALE_RATIO = 0.75
+    try:
+        effective = _effective_scale_relative_min_range_gate(
+            5.0,
+            scale_now=212.0,
+            scale_at_lock=256.0,
+        )
+        assert abs(effective - 4.1484375) < 0.01
+    finally:
+        session_mod.REP_VERTICAL_PX_SCALE_RELATIVE_RANGE_GATE = False
+
+
+def test_depth_recal_triggers_on_range_collapse_when_enabled(monkeypatch: Any) -> None:
+    from flexible_rep_counter.session import _maybe_trigger_depth_recalibration
+    import flexible_rep_counter.session as session_mod
+
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_TRIGGER_ON_RANGE_COLLAPSE", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_ENABLED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_SCALE_CHANGE_PCT", 0.18)
+
+    det = PeakDetector(min_range_gate_degrees=5.0)
+    det._last_rolling_range = 3.0
+    state = JointMotionState(
+        angle_key="SHOULDER_Y",
+        detector=det,
+        history=deque(),
+        confidence_history=deque(),
+    )
+    state.last_scale_px = 212.0
+    state.scale_at_lock_px = 256.0
+    run_state: dict[str, Any] = {"tuning_params": {"minRangeGate": 5.0}}
+    triggered = _maybe_trigger_depth_recalibration(
+        run_state=run_state,
+        state=state,
+        detector=det,
+        now_s=100.0,
+        current_raw=5,
+    )
+    assert triggered is True
+    assert run_state.get("depth_recal_trigger_reason") == "range_collapse"
+
+
+def test_vertical_px_stale_closed_streak_modality_override() -> None:
+    health = compute_incumbent_health(
+        stale_reevals=0,
+        selected_recent_range=20.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=3,
+        stale_switch_min_closed_streak=3,
+        selected_score=0.8,
+        selected_pose_score=0.9,
+    )
+    assert health["gateClosed"] is True
+    assert health["incumbentBad"] is True
+
+
+def test_primary_recovery_bypasses_rep_cooldown() -> None:
+    can_switch, _, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=1,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=3.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.35,
+        selected_pose_score=0.9,
+        candidate_score=0.75,
+        candidate_activity_score=0.7,
+        candidate_pose_score=0.7,
+        candidate_observable=True,
+        candidate_completed_cycles=3,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=35.0,
+        selected_median_rom_deg=3.0,
+        median_recent_range_all=30.0,
+        same_joint_family=False,
+        selected_signal_unit="px",
+        candidate_signal_unit="deg",
+        primary_recovery_cross_modality=True,
+        primary_recovery_skip_score_margin=True,
+        primary_recovery_score=0.60,
+        incumbent_is_fallback=True,
+    )
+    assert can_switch is True
+    assert debug["primaryRecoveryCrossModality"] is True
+
+
+def test_primary_recovery_fast_force_switch() -> None:
+    _, force_switch, debug = should_switch_to_candidate(
+        cooldown_ok=True,
+        stale_reevals=2,
+        stale_switch_force_after_reevals=8,
+        selected_recent_range=3.0,
+        stale_switch_max_selected_recent_range_deg=14.0,
+        selected_range_gate_closed_streak=10,
+        stale_switch_min_closed_streak=10,
+        selected_score=0.30,
+        selected_pose_score=0.9,
+        candidate_score=0.60,
+        candidate_activity_score=0.55,
+        candidate_pose_score=0.60,
+        candidate_observable=True,
+        candidate_completed_cycles=2,
+        candidate_recent_range=40.0,
+        candidate_median_rom_deg=30.0,
+        selected_median_rom_deg=3.0,
+        median_recent_range_all=35.0,
+        selected_signal_unit="px",
+        candidate_signal_unit="deg",
+        primary_recovery_cross_modality=True,
+        primary_recovery_force_after_stale_reevals=2,
+        incumbent_is_fallback=True,
+    )
+    assert force_switch is True
+    assert debug["forceAfterStaleReevals"] == 2
+
+
+def test_defer_depth_recal_when_primary_recovered(monkeypatch: Any) -> None:
+    from flexible_rep_counter.session import _maybe_trigger_depth_recalibration
+    import flexible_rep_counter.session as session_mod
+
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_DEFER_WHEN_PRIMARY_RECOVERED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_ENABLED", True)
+    monkeypatch.setattr(session_mod, "DEPTH_RECALIBRATION_SCALE_CHANGE_PCT", 0.10)
+    monkeypatch.setattr(
+        session_mod,
+        "_has_cross_modality_primary_recovery",
+        lambda score_by_joint, incumbent_signal_unit: incumbent_signal_unit == "px",
+    )
+
+    det = PeakDetector(min_range_gate_degrees=5.0)
+    y_state = JointMotionState(
+        angle_key="SHOULDER_Y",
+        detector=det,
+        history=deque(),
+        confidence_history=deque(),
+    )
+    y_state.last_scale_px = 212.0
+    y_state.scale_at_lock_px = 256.0
+    joint_states = {"SHOULDER_Y": y_state}
+    run_state: dict[str, Any] = {"tuning_params": {"minRangeGate": 5.0}}
+    triggered = _maybe_trigger_depth_recalibration(
+        run_state=run_state,
+        state=y_state,
+        detector=det,
+        now_s=100.0,
+        current_raw=5,
+        selected_angle="SHOULDER_Y",
+        joint_states=joint_states,
+        ts_ms=5000,
+    )
+    assert triggered is False
