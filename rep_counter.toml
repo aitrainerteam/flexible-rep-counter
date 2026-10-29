@@ -9,7 +9,7 @@ log_level = "INFO"
 
 [vm]
 # YOLO pose API base URL (fixed; no env URL fallbacks).
-direct_url = "http://34.95.128.222:8000"
+direct_url = "http://3.233.17.46:8000"
 timeout_sec = 5.0
 health_timeout_sec = 5.0
 
@@ -68,7 +68,7 @@ reevaluate_every_sec = 0.75
 switch_min_sec = 1.5
 # Minimum displayed reps on the current joint before another runtime recalibration switch is allowed.
 # Collapsed-ROM recovery bypasses this cooldown (see range_collapse_ratio).
-switch_min_reps = 3
+switch_min_reps = 10
 # Candidate variance must beat current tracked joint by this ratio to switch (unless current fails gate). Higher = stricter switching.
 # switch_variance_ratio = 1.2  # Temporarily disabled along with runtime recalibration/switching.
 # Min median window variance for a joint to qualify. Higher = only very active angles pass; lower = weaker motion can win.
